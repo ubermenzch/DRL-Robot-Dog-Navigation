@@ -1,4 +1,3 @@
-<!-- X形障碍 (外接圆直径4米) -->
 <?xml version='1.0'?>
 <sdf version='1.6'>
   <model name='obstacle13'>
@@ -6,20 +5,15 @@
       <inertial>
         <mass>1000</mass>
         <inertia>
-          <ixx>1000</ixx>
-          <ixy>0</ixy>
-          <ixz>0</ixz>
-          <iyy>1000</iyy>
-          <iyz>0</iyz>
-          <izz>1000</izz>
+          <ixx>1000</ixx> <ixy>0</ixy> <ixz>0</ixz>
+          <iyy>1000</iyy> <iyz>0</iyz> <izz>1000</izz>
         </inertia>
       </inertial>
       
-      <!-- 尺寸缩放比例: 4/4.0 = 1.0 (已满足要求) -->
       <collision name='collision1'>
         <geometry>
           <box>
-            <size>4.0 0.25 1</size>
+            <size>2.0 0.125 0.5</size>
           </box>
         </geometry>
         <pose>0 0 0 0 0 0.5236</pose>
@@ -27,7 +21,7 @@
       <visual name='visual1'>
         <geometry>
           <box>
-            <size>4.0 0.25 1</size>
+            <size>2.0 0.125 0.5</size>
           </box>
         </geometry>
         <pose>0 0 0 0 0 0.5236</pose>
@@ -42,7 +36,7 @@
       <collision name='collision2'>
         <geometry>
           <box>
-            <size>4.0 0.25 1</size>
+            <size>2.0 0.125 0.5</size>
           </box>
         </geometry>
         <pose>0 0 0 0 0 -0.5236</pose>
@@ -50,7 +44,7 @@
       <visual name='visual2'>
         <geometry>
           <box>
-            <size>4.0 0.25 1</size>
+            <size>2.0 0.125 0.5</size>
           </box>
         </geometry>
         <pose>0 0 0 0 0 -0.5236</pose>

@@ -1,9 +1,8 @@
-<!-- U形障碍 (外接圆直径4米) -->
 <?xml version='1.0'?>
 <sdf version='1.6'>
   <model name='obstacle24'>
     <static>false</static>
-    <pose>0 0 0.25 0 0 0</pose> 
+    <pose>0 0 0.125 0 0 0</pose>
     <link name='link'>
       <inertial>
         <mass>100</mass>
@@ -13,12 +12,11 @@
         </inertia>
       </inertial>
 
-      <!-- 尺寸缩放比例: 4/2.72 ≈ 1.47 -->
       <visual name='visual_base'>
-        <pose>0 -1.470 0 0 0 0</pose>
+        <pose>0 -0.735 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>2.352 0.294 1.0</size>
+            <size>1.176 0.147 0.5</size>
           </box>
         </geometry>
         <material>
@@ -31,10 +29,10 @@
       </visual>
 
       <visual name='visual_left_arm'>
-        <pose>-1.029 0.147 0 0 0 0</pose>
+        <pose>-0.5145 0.0735 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.294 2.940 1.0</size>
+            <size>0.147 1.47 0.5</size>
           </box>
         </geometry>
         <material>
@@ -47,10 +45,10 @@
       </visual>
 
       <visual name='visual_right_arm'>
-        <pose>1.029 0.147 0 0 0 0</pose>
+        <pose>0.5145 0.0735 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.294 2.940 1.0</size>
+            <size>0.147 1.47 0.5</size>
           </box>
         </geometry>
         <material>
@@ -63,28 +61,28 @@
       </visual>
 
       <collision name='collision_base'>
-        <pose>0 -1.470 0 0 0 0</pose>
+        <pose>0 -0.735 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>2.352 0.294 1.0</size>
+            <size>1.176 0.147 0.5</size>
           </box>
         </geometry>
       </collision>
 
       <collision name='collision_left_arm'>
-        <pose>-1.029 0.147 0 0 0 0</pose>
+        <pose>-0.5145 0.0735 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.294 2.940 1.0</size>
+            <size>0.147 1.47 0.5</size>
           </box>
         </geometry>
       </collision>
 
       <collision name='collision_right_arm'>
-        <pose>1.029 0.147 0 0 0 0</pose>
+        <pose>0.5145 0.0735 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.294 2.940 1.0</size>
+            <size>0.147 1.47 0.5</size>
           </box>
         </geometry>
       </collision>

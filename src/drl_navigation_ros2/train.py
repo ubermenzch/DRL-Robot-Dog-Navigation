@@ -1,3 +1,7 @@
+
+
+
+
 from pathlib import Path
 
 from TD3.TD3 import TD3
@@ -12,9 +16,9 @@ from pretrain_utils import Pretraining
 from datetime import datetime
 
 max_velocity = 1.0 # 最大速度
-neglect_angle = 30 # 前方视野左右两边忽略的角度（单位：度）
-max_yawrate = 45.0 # 最大偏航率（单位：度/秒）
-scan_range = 4.5 
+neglect_angle = 0 # 前方视野左右两边忽略的角度（单位：度）
+max_yawrate = 20.0 # 最大偏航率（单位：度/秒）
+scan_range = 5
 is_code_debug = False  # 是否为调试代码
 is_eval = False  # whether to run evaluation after training
 def main(args=None):
@@ -43,11 +47,11 @@ def main(args=None):
     # train and update network parameters every n episodes
     train_every_n = 2  # 每train_every_n个回合后执行一次训练。默认值为2.
     # how many batches to use for single training cycle
-    training_iterations = 500  # 每次执行训练时，用随机抽取的批次数据更新模型training_iterations次。默认值为500.
+    training_iterations = 200  # 每次执行训练时，用随机抽取的批次数据更新模型training_iterations次。默认值为500.
     # batch size for each training iteration
     batch_size = 40  # 从经验池中随机抽取batch_size条经验作为一个训练批次来对模型参数进行更新。默认值为40.
     # maximum number of steps in single episode
-    max_steps = 1500  # 限制每个回合最多执行max_steps步操作，超过会强制结束回合。默认值为300.
+    max_steps = 3000  # 限制每个回合最多执行max_steps步操作，超过会强制结束回合。默认值为300.
     # starting step number
     steps = 0  # 当前回合的步数。默认值为0.
     # whether to load experiences from assets/data.yml
@@ -92,6 +96,8 @@ def main(args=None):
     ros = ROS_env(neglect_angle = neglect_angle,
     scan_range = scan_range,
     max_steps = max_steps,
+    max_target_dist = 15.0,
+    init_target_distance = 2.0,
     )  # instantiate ROS environment
     print("ROS Environment Initialized")
     eval_scenarios = record_eval_positions(
@@ -125,6 +131,7 @@ def main(args=None):
     latest_scan, distance, cos, sin, collision, goal, a, reward = ros.step(
         lin_velocity=0.0, ang_velocity=0.0
     )  # get the initial step state
+    #print("latest_scan_len:",len(latest_scan))
     print("="*20+f"Epoch 0"+"="*20)
     total_reward = 0.0
     episode_reward = 0.0

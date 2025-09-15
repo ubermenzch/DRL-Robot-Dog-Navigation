@@ -1,8 +1,7 @@
-<!-- U形障碍2 (外接圆直径4米) -->
 <?xml version='1.0'?>
 <sdf version='1.6'>
   <model name='obstacle10'>
-    <pose>5.0 5.0 0.5 0 0 0</pose> 
+    <pose>2.5 2.5 0.25 0 0 0</pose>
     <link name='link'>
       <inertial>
         <mass>15</mass>
@@ -12,12 +11,11 @@
         </inertia>
       </inertial>
 
-      <!-- 尺寸缩放比例: 4/2.0 = 2.0 -->
       <visual name='visual_base'>
-        <pose>0 -1.0 0 0 0 0</pose>
+        <pose>0 -0.5 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>3.2 0.4 1.0</size>
+            <size>1.6 0.2 0.5</size>
           </box>
         </geometry>
         <material>
@@ -29,10 +27,10 @@
       </visual>
 
       <visual name='visual_left_arm'>
-        <pose>-1.4 0.2 0 0 0 0</pose>
+        <pose>-0.7 0.1 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.4 2.0 1.0</size>
+            <size>0.2 1.0 0.5</size>
           </box>
         </geometry>
         <material>
@@ -44,10 +42,10 @@
       </visual>
 
       <visual name='visual_right_arm'>
-        <pose>1.4 0.2 0 0 0 0</pose>
+        <pose>0.7 0.1 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.4 2.0 1.0</size>
+            <size>0.2 1.0 0.5</size>
           </box>
         </geometry>
         <material>
@@ -59,28 +57,28 @@
       </visual>
 
       <collision name='collision_base'>
-        <pose>0 -1.0 0 0 0 0</pose>
+        <pose>0 -0.5 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>3.2 0.4 1.0</size>
+            <size>1.6 0.2 0.5</size>
           </box>
         </geometry>
       </collision>
 
       <collision name='collision_left_arm'>
-        <pose>-1.4 0.2 0 0 0 0</pose>
+        <pose>-0.7 0.1 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.4 2.0 1.0</size>
+            <size>0.2 1.0 0.5</size>
           </box>
         </geometry>
       </collision>
 
       <collision name='collision_right_arm'>
-        <pose>1.4 0.2 0 0 0 0</pose>
+        <pose>0.7 0.1 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.4 2.0 1.0</size>
+            <size>0.2 1.0 0.5</size>
           </box>
         </geometry>
       </collision>

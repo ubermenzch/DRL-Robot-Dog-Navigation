@@ -257,7 +257,7 @@ class SAC(object):
 
     def prepare_state(self, latest_scan, distance, cos, sin, collision, goal, action):
         # update the returned data from ROS into a form used for learning in the current model
-        latest_scan = np.array(latest_scan) #latest_scan为180度中540个激光扫描点离智能体的距离
+        latest_scan = np.array(latest_scan) #latest_scan为180度方向激光扫描点离智能体的距离
 
         # inf_mask = np.isinf(latest_scan) # 得到距离为无限的扫描点的下标
         # latest_scan[inf_mask] = self.scan_range # 将所有距离为无限的扫描点的距离设置为scan_range（最大有效距离）
@@ -277,7 +277,7 @@ class SAC(object):
             # Find the minimum value in the current bin and append it to the min_obs_distance list
             min_obs_distance.append(min(bin))
         state = min_obs_distance + [distance, cos, sin] + [action[0], action[1]]
-        assert len(state) == self.state_dim
+        assert len(state) == self.state_dim, f"len(state) must be {self.state_dim}, but got {len(state)}"
         terminal = 1 if collision or goal else 0
 
         return state, terminal

@@ -162,7 +162,7 @@
     <include>
       <uri>model://obstacle20</uri>
     </include>
-    <include>
+    <!-- <include>
       <uri>model://obstacle21</uri>
     </include>
     <include>
@@ -176,7 +176,7 @@
     </include>
     <include>
       <uri>model://obstacle25</uri>
-    </include>
+    </include> -->
     <!-- <include>
       <uri>model://obstacle26</uri>
     </include>

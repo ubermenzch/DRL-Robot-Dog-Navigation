@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
 <sdf version='1.6'>
   <model name='obstacle6'>
-    <pose>-5 -5 0.25 0 0 0</pose> 
+    <pose>-2.5 -2.5 0.125 0 0 0</pose> <!-- 位置缩放0.5 -->
     <link name='link'>
       <inertial>
         <mass>200</mass>
@@ -10,15 +10,13 @@
           <iyy>50</iyy> <iyz>0</iyz> <izz>100</izz>
         </inertia>
       </inertial>
-
-      <!-- 放大比例: 4.0/3.535 ≈ 1.131 -->
       
-      <!-- 顶部横向墙壁 -->
+      <!-- 所有尺寸和位置乘以0.5 -->
       <visual name='visual_top_wall'>
-        <pose>0 0.685 0 0 0 0</pose> <!-- y: 0.606×1.131≈0.685 -->
+        <pose>0 0.3425 0 0 0 0</pose> 
         <geometry>
           <box>
-            <size>3.198 0.228 0.5</size> <!-- 2.828×1.131≈3.198, 0.202×1.131≈0.228 -->
+            <size>1.599 0.114 0.25</size> 
           </box>
         </geometry>
         <material>
@@ -29,20 +27,19 @@
         </material>
       </visual>
       <collision name='collision_top_wall'>
-        <pose>0 0.685 0 0 0 0</pose>
+        <pose>0 0.3425 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>3.198 0.228 0.5</size>
+            <size>1.599 0.114 0.25</size>
           </box>
         </geometry>
       </collision>
 
-      <!-- 左侧墙壁 -->
       <visual name='visual_stem_left_wall'>
-        <pose>-0.685 -1.086 0 0 0 0</pose> <!-- x: -0.606×1.131≈-0.685, y: -0.960×1.131≈-1.086 -->
+        <pose>-0.3425 -0.543 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.228 1.028 0.5</size> <!-- 0.202×1.131≈0.228, 0.909×1.131≈1.028 -->
+            <size>0.114 0.514 0.25</size>
           </box>
         </geometry>
         <material>
@@ -53,20 +50,19 @@
         </material>
       </visual>
       <collision name='collision_stem_left_wall'>
-        <pose>-0.685 -1.086 0 0 0 0</pose>
+        <pose>-0.3425 -0.543 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.228 1.028 0.5</size>
+            <size>0.114 0.514 0.25</size>
           </box>
         </geometry>
       </collision>
 
-      <!-- 右侧墙壁 -->
       <visual name='visual_stem_right_wall'>
-        <pose>0.685 -1.086 0 0 0 0</pose> <!-- x: 0.606×1.131≈0.685, y: -0.960×1.131≈-1.086 -->
+        <pose>0.3425 -0.543 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.228 1.028 0.5</size>
+            <size>0.114 0.514 0.25</size>
           </box>
         </geometry>
         <material>
@@ -77,20 +73,19 @@
         </material>
       </visual>
       <collision name='collision_stem_right_wall'>
-        <pose>0.685 -1.086 0 0 0 0</pose>
+        <pose>0.3425 -0.543 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.228 1.028 0.5</size>
+            <size>0.114 0.514 0.25</size>
           </box>
         </geometry>
       </collision>
 
-      <!-- 左下方墙壁 -->
       <visual name='visual_bottom_left_wall'>
-        <pose>-1.142 -0.685 0 0 0 0</pose> <!-- x: -1.010×1.131≈-1.142, y: -0.606×1.131≈-0.685 -->
+        <pose>-0.571 -0.3425 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.914 0.228 0.5</size> <!-- 0.808×1.131≈0.914, 0.202×1.131≈0.228 -->
+            <size>0.457 0.114 0.25</size>
           </box>
         </geometry>
         <material>
@@ -101,20 +96,19 @@
         </material>
       </visual>
       <collision name='collision_bottom_left_wall'>
-        <pose>-1.142 -0.685 0 0 0 0</pose>
+        <pose>-0.571 -0.3425 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.914 0.228 0.5</size>
+            <size>0.457 0.114 0.25</size>
           </box>
         </geometry>
       </collision>
 
-      <!-- 右下方墙壁 -->
       <visual name='visual_bottom_right_wall'>
-        <pose>1.142 -0.685 0 0 0 0</pose> <!-- x: 1.010×1.131≈1.142, y: -0.606×1.131≈-0.685 -->
+        <pose>0.571 -0.3425 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.914 0.228 0.5</size>
+            <size>0.457 0.114 0.25</size>
           </box>
         </geometry>
         <material>
@@ -125,10 +119,10 @@
         </material>
       </visual>
       <collision name='collision_bottom_right_wall'>
-        <pose>1.142 -0.685 0 0 0 0</pose>
+        <pose>0.571 -0.3425 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.914 0.228 0.5</size>
+            <size>0.457 0.114 0.25</size>
           </box>
         </geometry>
       </collision>
