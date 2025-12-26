@@ -1,199 +1,56 @@
 <?xml version='1.0'?>
 <sdf version='1.6'>
   <model name='obstacle7'>
-    <pose>0 -2.5 0.25 0 0 0</pose>
-    <link name='link'>
-      <inertial>
-        <mass>100</mass>
-        <inertia>
-          <ixx>25</ixx> <ixy>0</ixy> <ixz>0</ixz>
-          <iyy>25</iyy> <iyz>0</iyz> <izz>50</izz>
-        </inertia>
-      </inertial>
-
-      <visual name='visual_segment_1'>
-        <pose>0.707 0.707 0 0 0 0.7852</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5</size>
-          </box>
-        </geometry>
-        <material>
-          <script>
-            <name>Gazebo/Orange</name>
-            <uri>file://media/materials/scripts/gazebo.material</uri>
-          </script>
-        </material>
-      </visual>
-      <collision name='collision_segment_1'>
-        <pose>0.707 0.707 0 0 0 0.7852</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5</size>
-          </box>
-        </geometry>
-      </collision>
-
-      <visual name='visual_segment_2'>
-        <pose>0.259 0.9665 0 0 0 1.3092</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5</size>
-          </box>
-        </geometry>
-        <material>
-          <script>
-            <name>Gazebo/Orange</name>
-            <uri>file://media/materials/scripts/gazebo.material</uri>
-          </script>
-        </material>
-      </visual>
-      <collision name='collision_segment_2'>
-        <pose>0.259 0.9665 0 0 0 1.3092</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5极速</size>
-          </box>
-        </geometry>
-      </collision>
-
-      <visual name='visual_segment_3'>
-        <pose>-0.259 0.9665 0 0 0 1.8322</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5</size>
-          </box>
-        </geometry>
-        <material>
-          <script>
-            <name>Gazebo/Orange</name>
-            <uri>file://media/materials/scripts/gazebo.material</uri>
-          </script>
-        </material>
-      </visual>
-      <collision name='collision_segment_3'>
-        <pose>-0.259 0.9665 0 0 0 1.8322</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5</size>
-          </box>
-        </geometry>
-      </collision>
-
-      <visual name='visual_segment_4'>
-        <pose>-0.707 0.707 0 0 0 2.3562</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5</size>
-          </box>
-        </geometry>
-        <material>
-          <script>
-            <name>Gazebo/Orange</name>
-            <uri>file://media/materials/scripts/gazebo.material</uri>
-          </script>
-        </material>
-      </visual>
-      <collision name='collision_segment_4'>
-        <pose>-0.707 0.707 0 0 0 2.3562</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5</size>
-          </box>
-        </geometry>
-      </collision>
-
-      <visual name='visual_segment_5'>
-        <pose>-0.9665 0.259 0 0 0 2.8792</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5</size>
-          </box>
-        </geometry>
-        <material>
-          <script>
-            <name>Gazebo/Orange</name>
-            <uri>file://media/materials/scripts/gazebo.material</uri>
-          </script>
-        </material>
-      </visual>
-      <collision name='collision_segment_5'>
-        <pose>-0.9665 0.259 0 0 0 2.8792</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5</size>
-          </box>
-        </geometry>
-      </collision>
-
-      <visual name='visual_segment_6'>
-        <pose>-0.9665 -0.259 0 0 0 3.4022</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5</size>
-          </box>
-        </geometry>
-        <material>
-          <script>
-            <name>Gazebo/Orange</name>
-            <uri>file://media/materials/scripts/gazebo.material极速</uri>
-          </script>
-        </material>
-      </visual>
-      <collision name='collision_segment_6'>
-        <pose>-0.9665 -0.259 0 0 0 3.4022</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5</size>
-          </box>
-        </geometry>
-      </collision>
-
-      <visual name='visual_segment_7'>
-        <pose>-0.707 -0.707 0 0 0 3.9252</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5</size>
-          </box>
-        </geometry>
-        <material>
-          <script>
-            <name>Gazebo/Orange</name>
-            <uri>file://media/materials/scripts/gazebo.material</uri>
-          </script>
-        </material>
-      </visual>
-      <collision name='collision_segment_7'>
-        <pose>-0.707 -0.707 0 0 0 3.9252</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5</size>
-          </box>
-        </geometry>
-      </collision>
-
-      <visual name='visual_segment_8'>
-        <pose>-0.259 -0.9665 0 0 0 4.4482</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5</size>
-          </box>
-        </geometry>
-        <material>
-          <script>
-            <name>Gazebo/Orange</name>
-            <uri>file://media/materials/scripts/gazebo.material</uri>
-          </script>
-        </material>
-      </visual>
-      <collision name='collision_segment_8'>
-        <pose>-0.259 -0.9665 0 0 0 4.4482</pose>
-        <geometry>
-          <box>
-            <size>0.105 0.5265 0.5</size>
-          </box>
-        </geometry>
-      </collision>
-    </link>
-  </model>
+      <pose>0.896332 3.19047 0.5 0 -0 0</pose>
+      <link name='link'>
+        <inertial>
+          <mass>1</mass>
+          <inertia>
+            <ixx>0.166667</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>0.166667</iyy>
+            <iyz>0</iyz>
+            <izz>0.166667</izz>
+          </inertia>
+          <pose>0 0 0 0 -0 0</pose>
+        </inertial>
+        <collision name='collision'>
+          <geometry>
+            <box>
+              <size>0.7 0.2 1</size>
+            </box>
+          </geometry>
+          <max_contacts>10</max_contacts>
+          <surface>
+            <contact>
+              <ode/>
+            </contact>
+            <bounce/>
+            <friction>
+              <torsional>
+                <ode/>
+              </torsional>
+              <ode/>
+            </friction>
+          </surface>
+        </collision>
+        <visual name='visual'>
+          <geometry>
+            <box>
+              <size>0.7 0.2 1</size>
+            </box>
+          </geometry>
+          <material>
+            <script>
+              <name>Gazebo/Grey</name>
+              <uri>file://media/materials/scripts/gazebo.material</uri>
+            </script>
+          </material>
+        </visual>
+        <self_collide>0</self_collide>
+        <enable_wind>0</enable_wind>
+        <kinematic>0</kinematic>
+      </link>
+    </model>
 </sdf>

@@ -1,0 +1,29 @@
+# 评估配置文件
+# 注意：除了以下评估相关参数外，其他所有参数（如环境参数、模型参数、奖励函数参数等）
+# 都会自动从模型目录中的 config_used.yaml 读取，确保与训练时使用的参数一致
+
+# ==================== 基础参数 ====================
+gpu_id: 5  # 使用的GPU编号
+run_mode: 2  # 运行模式：2=后台（不向终端输出，终端关闭评估不停止，可通过tail -f查看日志）；3=可视化（仅第1个环境可视化）
+gazebo_wait_time: 15  # Gazebo启动等待时间（秒）
+
+# ==================== 评估参数 ====================
+num_envs: 4  # 并行环境数量
+total_episodes: 1000  # 总评估episode数量
+distance_intervals: [3, 6, 9]  # 距离区间列表，评估将按此列表分段进行（例如[3,6,9]表示先评估3m，再评估6m，再评估9m），统计区间将自动从该列表生成
+
+# ==================== 路径参数 ====================
+model_load_dir: "/home/zc/DRL-Robot-Navigation-ROS2/models/multi_env_train_model/20251217_155627"  # 模型加载目录（必须指定，评估脚本会从此目录的config_used.yaml读取训练参数）
+# eval_log_dir: 不再需要，评估日志统一保存到 log/evaluation 目录（与shell脚本的日志目录一致）
+
+# ==================== 说明 ====================
+# 以下参数将从模型目录的 config_used.yaml 自动读取，无需在此配置：
+# - 机器人和环境参数（max_velocity, max_acceleration, max_deceleration, max_yawrate, neglect_angle, scan_range, 
+#   init_target_distance, target_dist_increase, target_reached_delta, collision_delta, world_size, obs_min_dist, obs_num）
+# - 模型参数（action_dim, max_action, state_dim, device）
+# - 网络结构参数（hidden_dim, hidden_depth）
+# - 奖励函数参数（goal_reward, collision_penalty_base, angle_penalty_base, linear_penalty_base, yawrate_penalty_base等）
+# - 障碍物距离惩罚参数（obs_penalty_threshold, min_obs_penalty_threshold, obs_penalty_base, obs_penalty_power等）
+# - 时间控制参数（sim_time, step_sleep_time, eval_sleep_time, reset_step_count）
+# - 动作噪声参数（action_noise_std）
+# - 调试参数（reward_debug等）

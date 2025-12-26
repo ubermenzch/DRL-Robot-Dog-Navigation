@@ -14,8 +14,8 @@ SEVERITY = LoggingSeverity.ERROR
 
 
 class SensorSubscriber(Node):
-    def __init__(self):
-        super().__init__("sensor_subscriber")
+    def __init__(self, env_id=0):
+        super().__init__(f"sensor_subscriber_env_{env_id}")
         self.get_logger().set_level(SEVERITY)
         self.subscriber_ = self.create_subscription(
             LaserScan, "scan", self.scan_listener_callback, 1
@@ -29,6 +29,7 @@ class SensorSubscriber(Node):
 
     def scan_listener_callback(self, msg):
         self.latest_scan = msg.ranges[:]
+        #print(len(self.latest_scan))
 
     def odom_listener_callback(self, msg):
         self.latest_position = msg.pose.pose.position
@@ -40,8 +41,8 @@ class SensorSubscriber(Node):
 
 
 class ScanSubscriber(Node):
-    def __init__(self):
-        super().__init__("scan_subscriber")
+    def __init__(self, env_id=0):
+        super().__init__(f"scan_subscriber_env_{env_id}")
         self.get_logger().set_level(SEVERITY)
         self.subscriber_ = self.create_subscription(
             LaserScan, "scan", self.listener_callback, 1
@@ -56,8 +57,8 @@ class ScanSubscriber(Node):
 
 
 class OdomSubscriber(Node):
-    def __init__(self):
-        super().__init__("odom_subscriber")
+    def __init__(self, env_id=0):
+        super().__init__(f"odom_subscriber_env_{env_id}")
         self.get_logger().set_level(SEVERITY)
         self.subscriber_ = self.create_subscription(
             Odometry, "odom", self.listener_callback, 1
@@ -74,8 +75,8 @@ class OdomSubscriber(Node):
 
 
 class ResetWorldClient(Node):
-    def __init__(self):
-        super().__init__("reset_world_client")
+    def __init__(self, env_id=0):
+        super().__init__(f"reset_world_client_env_{env_id}")
         self.get_logger().set_level(SEVERITY)
         self.reset_client = self.create_client(Empty, "/reset_world")
         self.wait_for_service(self.reset_client, "reset_world")
@@ -100,8 +101,8 @@ class ResetWorldClient(Node):
 
 
 class PhysicsClient(Node):
-    def __init__(self):
-        super().__init__("physics_client")
+    def __init__(self, env_id=0):
+        super().__init__(f"physics_client_env_{env_id}")
         self.get_logger().set_level(SEVERITY)
         self.unpause_client = self.create_client(Empty, "/unpause_physics")
         self.pause_client = self.create_client(Empty, "/pause_physics")
@@ -140,8 +141,8 @@ class PhysicsClient(Node):
 
 
 class SetModelStateClient(Node):
-    def __init__(self):
-        super().__init__("set_entity_state_client")
+    def __init__(self, env_id=0):
+        super().__init__(f"set_entity_state_client_env_{env_id}")
         self.get_logger().set_level(SEVERITY)
         self.client = self.create_client(SetEntityState, "/gazebo/set_entity_state")
         #print("SetModelStateClient::create_client Done")
@@ -154,11 +155,94 @@ class SetModelStateClient(Node):
         self.request.state.name = name
         self.request.state.pose = new_pose
         self.future = self.client.call_async(self.request)
+        # 等待服务调用完成并返回结果
+        rclpy.spin_until_future_complete(self, self.future)
+        if self.future.result() is not None:
+            response = self.future.result()
+            return response.success
+        return False
+
+
+class GoalModelClient(Node):
+    """用于在Gazebo中设置绿色圆柱体目标模型的位置（模型已在世界文件中定义）"""
+    def __init__(self, env_id=0, model_name="goal_cylinder"):
+        super().__init__(f"goal_model_client_env_{env_id}")
+        self.get_logger().set_level(SEVERITY)
+        self.model_name = model_name
+        self.services_ready = False
+        
+        # 创建服务客户端（延迟初始化，不立即等待服务）
+        self.set_state_client = self.create_client(SetEntityState, "/gazebo/set_entity_state")
+
+    def _ensure_services_ready(self, timeout=30.0):
+        """确保服务可用（延迟初始化）"""
+        if self.services_ready:
+            return True
+        
+        # 等待服务可用
+        self.get_logger().info("Waiting for Gazebo services to be available...")
+        if not self.set_state_client.wait_for_service(timeout_sec=timeout):
+            self.get_logger().warn(f"Service set_entity_state not available after {timeout}s, will retry later")
+            return False
+        
+        self.services_ready = True
+        self.get_logger().info("Gazebo services are ready")
+        return True
+
+    def set_goal_position(self, x, y, z=1.0):
+        """设置目标圆柱体的位置（模型已在世界文件中定义）
+        Args:
+            x, y: 目标位置的 x, y 坐标（米）
+            z: 目标位置的 z 坐标（米），默认 1.0 使圆柱体在地面上方1米，不阻挡激光扫描
+        """
+        # 确保服务可用
+        if not self._ensure_services_ready():
+            self.get_logger().warn("Gazebo services not available, skipping goal position update")
+            return
+        
+        # 更新模型位置
+        request = SetEntityState.Request()
+        request.state.name = self.model_name
+        request.state.pose.position.x = float(x)
+        request.state.pose.position.y = float(y)
+        request.state.pose.position.z = float(z)
+        
+        # 设置方向（保持水平，无旋转）
+        request.state.pose.orientation.x = 0.0
+        request.state.pose.orientation.y = 0.0
+        request.state.pose.orientation.z = 0.0
+        request.state.pose.orientation.w = 1.0
+        
+        # 设置速度和角速度为0（保持静止）
+        request.state.twist.linear.x = 0.0
+        request.state.twist.linear.y = 0.0
+        request.state.twist.linear.z = 0.0
+        request.state.twist.angular.x = 0.0
+        request.state.twist.angular.y = 0.0
+        request.state.twist.angular.z = 0.0
+        
+        # 设置参考坐标系（使用world坐标系）
+        request.state.reference_frame = "world"
+        
+        # 调用服务并等待完成
+        future = self.set_state_client.call_async(request)
+        rclpy.spin_until_future_complete(self, future)
+        
+        # 检查结果
+        if future.result() is not None:
+            response = future.result()
+            if response.success:
+                self.get_logger().info(f"Goal cylinder set to position ({x:.3f}, {y:.3f}, {z:.3f})")
+            else:
+                error_msg = response.status_message if hasattr(response, 'status_message') else "Unknown error"
+                self.get_logger().warn(f"Failed to set goal cylinder position: {error_msg}")
+        else:
+            self.get_logger().warn(f"Failed to set goal cylinder position: Service returned None")
 
 
 class CmdVelPublisher(Node):
-    def __init__(self):
-        super().__init__("cmd_vel_publisher")
+    def __init__(self, env_id=0):
+        super().__init__(f"cmd_vel_publisher_env_{env_id}")
         self.get_logger().set_level(SEVERITY)
         self.publisher_ = self.create_publisher(Twist, "cmd_vel", 1)
         self.timer = self.create_timer(0.1, self.publish_cmd_vel)
@@ -174,10 +258,10 @@ class CmdVelPublisher(Node):
 
 
 class MarkerPublisher(Node):
-    def __init__(self):
-        super().__init__("marker_publisher")
+    def __init__(self, env_id=0):
+        super().__init__(f"marker_publisher_env_{env_id}")
         self.get_logger().set_level(SEVERITY)
-        self.publisher = self.create_publisher(Marker, "visualization_marker", 1)
+        self.publisher = self.create_publisher(Marker, f"/env_{env_id}/visualization_marker", 1)
 
     def publish(self, x, y):
         marker = Marker()

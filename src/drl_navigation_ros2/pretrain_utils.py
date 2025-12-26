@@ -57,8 +57,16 @@ class Pretraining:
                         next_goal,
                         next_action,
                     )
+                    # 与ROS环境一致的奖励函数签名：
+                    # get_reward(goal, collision, action, latest_scan, distance, cos, sin)
                     reward = self.reward_function(
-                        next_goal, next_collision, action, next_latest_scan
+                        next_goal,
+                        next_collision,
+                        action,
+                        next_latest_scan,
+                        next_distance,
+                        next_cos,
+                        next_sin,
                     )
                     self.replay_buffer.add(
                         state, action, reward, next_terminal, next_state

@@ -1,0 +1,135 @@
+# 训练配置文件（统一配置，同时支持单环境训练和多环境并行训练）
+# 所有可配置参数都在此文件中设置
+# 参数结构分为三层：1.仅多环境使用参数 2.仅单环境使用参数 3.共享参数
+
+# ============================================================================
+# 第一层：仅多环境使用参数
+# ============================================================================
+
+# ==================== 多环境训练参数 ====================
+num_envs: 64  # 并行环境数量(一个环境要占用800m左右的显存)
+critic_loss_threshold: -1.0  # critic损失阈值，前X次平均损失小于此值时才更新模型；若值为-1，则无视该阈值，环境控制进程均使用最新模型
+enable_weight_consistency_check: false  # 是否进行模型权重一致性详细检验（为true时会在每个环境初始化时打印大量权重信息）
+
+# ==================== 多环境路径参数 ====================
+model_save_dir: "/home/zc/DRL-Robot-Navigation-ROS2/models/multi_env_train_model"  # 模型保存基目录，训练启动时会在此下创建时间戳子目录保存模型与config_used.yaml
+multi_env_log_dir: "/home/zc/DRL-Robot-Navigation-ROS2/log/multi_env_training"  # 日志保存基目录，启动训练时会在此下按时间戳创建子目录存放日志
+gazebo_wait_time: 15  # Gazebo启动等待时间（秒）
+
+# ============================================================================
+# 第二层：仅单环境使用参数
+# ============================================================================
+
+# ==================== 单环境基础参数 ====================
+run_mode: 2  # 运行模式：1=后台模式（不向终端输出，终端关闭训练不停止）；2=可视化模式（VNC/本机显示）
+
+# ==================== 单环境训练参数 ====================
+train_every_n: 2  # 每train_every_n个回合后执行一次训练
+pretrain: false  # 是否执行预训练（为true时会加载预存经验池并进行预训练；为false时不加载预存经验池）
+pretraining_iterations: 50  # 预训练迭代次数
+
+# ==================== 单环境路径参数 ====================
+save_path: "/home/zc/DRL-Robot-Navigation-ROS2/models/single_env_train_model"  # 模型保存基础目录（训练启动时会在此目录下创建时间戳子目录）
+pretrain_data_path: "src/drl_navigation_ros2/assets/data.yml"  # 预训练数据路径
+single_env_log_dir: "/home/zc/DRL-Robot-Navigation-ROS2/log/single_env_training"  # 日志保存基目录，启动训练时会在此下按时间戳创建子目录存放日志
+
+# ============================================================================
+# 第三层：共享参数（单环境和多环境共用）
+# ============================================================================
+
+# ==================== 基础参数 ====================
+is_code_debug: false  # 是否为调试代码
+gpu_id: 5  # 使用的GPU编号（可用于导出 CUDA_VISIBLE_DEVICES）
+
+# ==================== 机器人和环境参数 ====================
+max_velocity: 2.5  # 最大速度
+max_acceleration: 5.0  # 最大加速度（m/s^2）
+max_deceleration: -5.0  # 最大减速度（m/s^2，建议填负值表示减速幅度，代码会取绝对值）
+max_yawrate: 30.0  # 最大偏航率（单位：度/秒）
+neglect_angle: 30  # 前方视野左右两边忽略的角度（单位：度）
+scan_range: 10  # 激光雷达扫描范围
+max_target_dist: 6.0  # 最大目标距离
+init_target_distance: 6.0  # 初始目标距离
+target_dist_increase: 0.001  # 目标距离增加量
+target_reached_delta: 0.4  # 判定到达目标的阈值
+collision_delta: 0.3  # 碰撞检测阈值
+world_size: 10  # 世界尺寸（米）
+goals_per_map: 4  # 每张地图的目标点数量（即一张地图可以用来产生多少个episode）；当机器人完成一个episode后，如果不达到此数量，则不重新生成地图（障碍物），只将机器人重置到最近的空格子中心并重新生成目标点；达到此数量后才重新生成新地图
+obs_min_dist: 1.0  # 障碍物圆心最小距离（米）
+obs_num: 25  # 障碍物数量
+obs_distribution_mode: "random"  # 障碍物生成方式："uniform"=均匀分布（默认），"random"=随机分布
+costmap_resolution: 1.0  # costmap 分辨率（米/格）
+obstacle_size: 1.0  # costmap 中障碍物等效边长（米，默认正方形）
+region_select_bias: 0.6  # 选择"最大连通区域"的概率：1.0=总是选择最大区域；0.8=80%概率选最大，否则从剩余区域随机选
+
+# ==================== 模型参数 ====================
+action_dim: 2  # 模型产生的动作数量
+max_action: 1  # 输出动作的最大绝对值
+state_dim: 25  # 神经网络输入值的数量（状态输入向量长度）；注意：当state_history_steps > 0时，此值会被动态计算为 base_state_dim * (1 + state_history_steps)
+base_state_dim: 25  # 基础状态维度（单个时间步的状态向量长度），用于计算包含历史信息时的最终state_dim
+state_history_steps: 100  # 包含历史多少step的state信息（例如：2表示包含当前step和之前2个step，共3个step的状态信息）；当state_history_steps > 0时启用历史state，state_dim = base_state_dim * (1 + state_history_steps)；当为0时不启用历史state，state_dim = base_state_dim
+device: "auto"  # 设备选择："auto"自动选择，"cuda"使用GPU，"cpu"使用CPU
+hidden_dim: 1024  # 神经网络隐藏层维度
+hidden_depth: 3  # 神经网络隐藏层深度
+
+# ==================== 训练算法参数 ====================
+actor_update_frequency: 1  # Actor网络更新频率（每多少次critic更新后更新一次actor）
+critic_target_update_frequency: 4  # Critic目标网络更新频率（每多少次critic更新后更新一次目标网络）
+
+# ==================== 共享训练参数 ====================
+training_iterations: 100  # 每次执行训练时，用随机抽取的批次数据更新模型training_iterations次
+batch_size: 4096  # 从经验池中随机抽取batch_size条经验作为一个训练批次来对模型参数进行更新
+buffer_size: 50000  # 重放缓冲区大小
+use_float64_for_buffer: true  # 是否在本地重放缓冲区中使用float64存储（true则使用float64；false则使用float32，推荐false以提升速度并降低内存占用）
+load_model: false  # 是否加载已有模型
+max_steps: 200  # 限制每个回合最多执行max_steps步操作，超过会强制结束回合（当max_steps_ratio=0时使用此固定值）
+max_steps_ratio: 0  # 每Episode最大步数比例 (max_steps = target_distance * max_steps_ratio)，当为0时使用固定值max_steps
+max_steps_min: 50  # 每Episode最小步数 (max_steps不会小于此值)
+save_every: 50  # 每多少次训练后保存一次模型
+report_every: 100  # 每多少个episode/回合打印一次统计报告
+max_training_count: 30000  # 最大训练次数（训练完成后自动停止）
+loss_window_size: 10  # 训练损失窗口大小，用于计算平均Critic损失
+total_eval_episodes: 1000  # 评估阶段采集的episode数量；>0时训练结束后进入评估并在完成后输出统一统计报告
+
+# ==================== 共享路径参数 ====================
+load_path: "/home/zc/DRL-Robot-Navigation-ROS2/models/multi_env_train_model/20251224_181328"  # 模型加载路径
+
+# ==================== 奖励函数参数 ====================
+# 奖励/惩罚开关
+enable_obs_penalty: false  # 是否启用障碍物距离惩罚
+enable_yawrate_penalty: false  # 是否启用角速度惩罚
+enable_angle_penalty: true  # 是否启用角度偏移惩罚
+enable_linear_penalty: true  # 是否启用线速度惩罚
+enable_target_distance_penalty: true  # 是否启用终点距离惩罚
+enable_linear_acceleration_oscillation_penalty: false  # 是否启用线速度加速度震荡惩罚
+enable_yawrate_oscillation_penalty: false  # 是否启用角速度震荡惩罚
+reward_debug: false  # 是否打印奖励/惩罚明细
+
+goal_reward: 150.0  # 到达目标的奖励
+collision_penalty_base: -150.0  # 碰撞惩罚系数（负值惩罚）
+angle_penalty_base: -0.2  # 角度偏差基础惩罚
+linear_penalty_base: -0.075  # 线速度基础惩罚
+yawrate_penalty_base: -0.5  # 角速度惩罚系数（负值惩罚，0为无惩罚）
+
+# ==================== 障碍物距离惩罚参数 ====================
+obs_penalty_threshold: -1.0  # 障碍物距离惩罚阈值（米）；设为-1时按 |线速度| * sim_time 自动计算阈值；否则使用固定阈值
+min_obs_penalty_threshold: 0.5  # 动态计算阈值时的最小阈值下限，避免阈值过小
+obs_penalty_base: -0.5  # 障碍物距离惩罚基础系数，负值表示惩罚
+obs_penalty_power: 2.0  # 障碍物距离惩罚指数，值越大惩罚增长越快（建议范围：1.0-3.0）
+obs_penalty_high_weight: 1.0  # 中间高权重区域惩罚权重
+obs_penalty_low_weight: 0.4  # 两侧低权重区域惩罚权重
+obs_penalty_middle_ratio: 0.4  # 中间高权重区域比例（0-1）
+
+# ==================== 终点距离惩罚参数 ====================
+target_distance_penalty_base: -0.1  # 终点距离惩罚基础系数（负值表示惩罚）；惩罚 = base * (当前距离 / 初始距离)
+
+# ==================== 震荡惩罚参数 ====================
+linear_acceleration_oscillation_penalty_base: -1.0  # 线速度加速度震荡惩罚基础系数（负值表示惩罚）；当加速度符号改变时，惩罚 = base * |当前加速度 - 上一加速度|
+yawrate_oscillation_penalty_base: -1.0  # 角速度震荡惩罚基础系数（负值表示惩罚）；当角速度符号改变时，惩罚 = base * |当前角速度 - 上一角速度|
+
+# ==================== 时间控制参数 ====================
+sim_time: 2.0  # 仿真步长，用于速度相关的动态阈值等计算
+step_sleep_time: 0.1  # step方法中的sleep时间（秒）
+eval_sleep_time: 1.0  # eval方法中的sleep时间（秒）
+reset_step_count: 3  # reset方法中调用step的次数
+

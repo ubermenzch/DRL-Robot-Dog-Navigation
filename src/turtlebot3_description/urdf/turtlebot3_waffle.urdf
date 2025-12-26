@@ -113,6 +113,14 @@
       </inertial>
   </link>
 
+  <!-- Gazebo扩展：为左轮添加高摩擦系数，防止惯性滑动 -->
+  <gazebo reference="wheel_left_link">
+    <mu1>100</mu1>
+    <mu2>50</mu2>
+    <kp>10000000000000</kp>
+    <kd>1</kd>
+  </gazebo>
+
   <joint name="wheel_right_joint" type="continuous">
     <parent link="base_link"/>
     <child link="wheel_right_link"/>
@@ -134,6 +142,17 @@
       <geometry>
         <cylinder length="0.018" radius="0.033"/>
       </geometry>
+      <!-- Gazebo扩展：添加高摩擦系数，防止惯性滑动 -->
+      <gazebo>
+        <surface>
+          <friction>
+            <ode>
+              <mu>100</mu>
+              <mu2>50</mu2>
+            </ode>
+          </friction>
+        </surface>
+      </gazebo>
     </collision>
 
     <inertial>

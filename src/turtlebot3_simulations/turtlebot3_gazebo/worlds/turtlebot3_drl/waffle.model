@@ -118,37 +118,425 @@
       <uri>model://10by10</uri>
     </include>
 
+    <!-- 25 个圆柱障碍物（半径0.5，高度1），基于 obstacle5 模型 -->
+    <!-- 这里仅定义模型实例，具体位置在仿真运行时可由 ROS 节点通过 /gazebo/set_entity_state 动态设置 -->
     <include>
-      <uri>model://obstacle1</uri>
+      <uri>model://obstacle5</uri>
+      <name>obstacle1</name>
     </include>
-
     <include>
-      <uri>model://obstacle2</uri>
+      <uri>model://obstacle5</uri>
+      <name>obstacle2</name>
     </include>
-
     <include>
-      <uri>model://obstacle3</uri>
+      <uri>model://obstacle5</uri>
+      <name>obstacle3</name>
     </include>
-
     <include>
-      <uri>model://obstacle4</uri>
+      <uri>model://obstacle5</uri>
+      <name>obstacle4</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle5</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle6</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle7</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle8</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle9</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle10</name>
     </include>
 
     <include>
       <uri>model://obstacle5</uri>
+      <name>obstacle11</name>
     </include>
-
     <include>
-      <uri>model://obstacle6</uri>
+      <uri>model://obstacle5</uri>
+      <name>obstacle12</name>
     </include>
-
     <include>
-      <uri>model://obstacle7</uri>
+      <uri>model://obstacle5</uri>
+      <name>obstacle13</name>
     </include>
-
     <include>
-      <uri>model://obstacle8</uri>
+      <uri>model://obstacle5</uri>
+      <name>obstacle14</name>
     </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle15</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle16</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle17</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle18</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle19</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle20</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle21</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle22</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle23</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle24</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle25</name>
+    </include>
+    <!-- <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle31</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle32</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle33</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle34</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle35</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle36</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle37</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle38</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle39</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle40</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle41</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle42</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle43</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle44</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle45</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle46</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle47</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle48</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle49</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle50</name>
+    </include> -->
+    <!-- <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle51</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle52</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle53</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle54</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle55</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle56</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle57</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle58</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle59</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle60</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle61</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle62</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle63</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle64</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle65</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle66</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle67</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle68</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle69</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle70</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle71</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle72</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle73</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle74</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle75</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle76</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle77</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle78</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle79</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle80</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle81</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle82</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle83</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle84</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle85</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle86</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle87</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle88</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle89</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle90</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle91</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle92</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle93</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle94</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle95</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle96</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle97</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle98</name>
+    </include>
+    <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle99</name>
+    </include> -->
+    <!-- <include>
+      <uri>model://obstacle_cylinder_small</uri>
+      <name>obstacle100</name>
+    </include> -->
+    <!-- 目标模型（绿色圆柱体），用于可视化终点位置 -->
+    <model name="goal_cylinder">
+      <link name="link">
+        <gravity>0</gravity>
+        <inertial>
+          <mass>1</mass>
+          <inertia>
+            <ixx>0.166667</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>0.166667</iyy>
+            <iyz>0</iyz>
+            <izz>0.166667</izz>
+          </inertia>
+          <pose>0 0 0 0 -0 0</pose>
+        </inertial>
+        <visual name="visual">
+          <geometry>
+            <cylinder>
+              <radius>0.1</radius>
+              <length>0.1</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.0 1.0 0.0 1.0</ambient>
+            <diffuse>0.0 1.0 0.0 1.0</diffuse>
+            <specular>0.1 0.1 0.1 1.0</specular>
+          </material>
+        </visual>
+        <self_collide>0</self_collide>
+        <enable_wind>0</enable_wind>
+        <kinematic>0</kinematic>
+      </link>
+      <!-- 高度 0.1 时，中心抬高 0.05 保持底部贴地；仅可视化，无碰撞体积与重力 -->
+      <pose>0 0 0.05 0 0 0</pose>
+    </model>
 
   </world>
 </sdf>

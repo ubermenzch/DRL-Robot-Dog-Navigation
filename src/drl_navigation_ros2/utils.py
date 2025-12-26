@@ -193,16 +193,40 @@ def wgs2bd(wgsLat, wgsLng):
 def bd2wgs(bdLat, bdLng):
     return gcj2wgs(*bd2gcj(bdLat, bdLng))
 
-def action_limit(action, max_velocity=1.0, max_yawrate=45.0):
+def transfor_action(
+    action,
+    max_velocity=1.0,
+    max_yawrate=45.0,
+    prev_linear_velocity=0.0,
+    max_acceleration=None,
+    max_deceleration=None,
+    step_time=0.1,
+):
     """
     限制动作的范围
-    :param action: 动作数组 [线速度, 角速度] 线速度范围 [0, 1]（单位：米/秒），角速度范围 [-1, 1](单位：弧度/秒)
+    :param action: 模型输出动作数组 [线速度, 角速度]（范围[-1,1]）
     :return: 限制后的动作数组
     """
-    return [
-            (action[0] + 1) / (2/ max_velocity), #线速度限制到 [0, max_velocity]（单位：米/秒）
-            action[1]*(max_yawrate/180)*math.pi, #角速度限制到 [-max_yawrate, max_yawrate]（单位：度/秒）
-        ]
+    # 模型输出[-1,1] -> 目标线速度[0, max_velocity]
+    target_linear = (action[0] + 1) / (2 / max_velocity)
+
+    # 加速度/减速度限制（允许配置为负值，内部取绝对值）
+    if max_acceleration is not None:
+        max_acc = abs(max_acceleration)
+        # 不能超过上一时刻速度 + 加速度步长，也不能超过 max_velocity
+        target_linear = min(target_linear, prev_linear_velocity + max_acc * step_time, max_velocity)
+    if max_deceleration is not None:
+        max_dec = abs(max_deceleration)
+        # 不能低于上一时刻速度 - 减速度步长，且不低于 0
+        target_linear = max(target_linear, prev_linear_velocity - max_dec * step_time, 0.0)
+
+    # 双保险：保持在线速度允许范围内
+    target_linear = np.clip(target_linear, 0.0, max_velocity)
+
+    # 角速度缩放到 [-max_yawrate, max_yawrate]（输入是-1到1）
+    target_yawrate = action[1] * (max_yawrate / 180) * math.pi
+
+    return [target_linear, target_yawrate]
 
 def calculate_trajectory(start_pos, action, steps=10, step_size=0.2, resolution=0.1,edge_length=100):
     """

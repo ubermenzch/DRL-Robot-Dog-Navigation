@@ -10,9 +10,68 @@
       <update_rate>1.0</update_rate>
     </plugin>
 
-    <include>
+    <!-- <include>
       <uri>model://ground_plane</uri>
-    </include>
+    </include> -->
+
+    <model name='ground_plane'>
+    <static>true</static>
+    <link name='link'>
+      <collision name='collision'>
+        <geometry>
+          <plane>
+            <!-- normal定义了平面的朝向, 0 0 1 表示Z轴向上 -->
+            <normal>0 0 1</normal>
+            <!-- size定义了平面的尺寸(米), 改这里可以把地面变大变小 -->
+            <size>100 100</size> 
+          </plane>
+        </geometry>
+        <surface>
+          <friction>
+            <!-- 修改物理属性：摩擦力 -->
+            <ode>
+              <mu>100</mu>
+              <mu2>50</mu2>
+            </ode>
+          </friction>
+          <contact>
+              <ode>
+                  <!-- 修改物理属性: 柔软度等 -->
+                  <kp>1e+13</kp>
+                  <kd>1</kd>
+              </ode>
+          </contact>
+          <bounce>
+              <!-- 修改物理属性：弹力 -->
+              <restitution_coefficient>0</restitution_coefficient>
+              <threshold>1e+06</threshold>
+          </bounce>
+        </surface>
+      </collision>
+      <visual name='visual'>
+        <cast_shadows>false</cast_shadows>
+        <geometry>
+          <plane>
+            <normal>0 0 1</normal>
+            <!-- 视觉尺寸要和物理尺寸保持一致 -->
+            <size>100 100</size>
+          </plane>
+        </geometry>
+        <material>
+          <!-- 修改外观：使用Gazebo内置的带格子的灰色纹理 -->
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Grey</name>
+          </script>
+          <!-- 如果想用纯色，可以注释掉上面的<script>，用下面的<ambient> -->
+          <!-- 
+          <ambient>0.0 0.5 0.0 1.0</ambient>  (R, G, B, Alpha) 这是一个绿色
+          <diffuse>0.0 0.5 0.0 1.0</diffuse>
+          -->
+        </material>
+      </visual>
+    </link>
+  </model>
 
     <include>
       <uri>model://sun</uri>
@@ -52,7 +111,7 @@
     </physics>
 
     <include>
-      <uri>model://turtlebot3_waffle_pi</uri>
+      <uri>model://turtlebot3_waffle</uri>
     </include>
 
     <include>

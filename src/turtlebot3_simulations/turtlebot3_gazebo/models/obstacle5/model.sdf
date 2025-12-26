@@ -4,14 +4,16 @@
       <pose>-2.06176 -3.02362 0.5 0 -0 0</pose>
       <link name='link'>
         <inertial>
-          <mass>1</mass>
+          <!-- 设置很大的质量（10000），使被撞击后位移小到可以忽略 -->
+          <mass>10000</mass>
           <inertia>
-            <ixx>0.145833</ixx>
+            <!-- 惯性矩与质量成比例增加 -->
+            <ixx>1458.33</ixx>
             <ixy>0</ixy>
             <ixz>0</ixz>
-            <iyy>0.145833</iyy>
+            <iyy>1458.33</iyy>
             <iyz>0</iyz>
-            <izz>0.125</izz>
+            <izz>1250</izz>
           </inertia>
           <pose>0 0 0 0 -0 0</pose>
         </inertial>
