@@ -91,8 +91,9 @@ class TrainingMetricsAnalyzer:
     def __init__(self, log_file: str):
         self.log_file = Path(log_file)
         self.training_records = []  # (training_step, critic_loss, actor_loss, avg_sample_times)
-        self.episodes = []  # (episode_num, env_id, end_status, reward_details)
+        self.episodes = []  # (episode_num, env_id, end_status, reward_details, steps)
         # reward_details: Dict with keys: goal, collision, angle, linear, target_distance, obs, yawrate
+        # steps: int, episode的步数
         
     def parse_training_record(self, line: str) -> Optional[Tuple]:
         """解析训练完成记录"""
@@ -171,16 +172,20 @@ class TrainingMetricsAnalyzer:
             reward_detail = self.parse_reward_detail(line)
             
             if end_match and prev_line:
-                # 从上一行提取episode编号和环境ID
+                # 从上一行提取episode编号、环境ID和Steps
                 # 匹配格式：环境 X Episode: Y Target Distance: A.AA (actual: B.BB) Steps: N
                 pattern1 = r'环境\s+(\d+)\s+Episode:\s+(\d+)'
+                steps_pattern = r'Steps:\s+(\d+)'
                 
                 match = re.search(pattern1, prev_line)
+                steps_match = re.search(steps_pattern, prev_line)
                 if match:
                     env_id = int(match.group(1))
                     episode_num = int(match.group(2))
                     end_status = end_match.group(1)
-                    return ('episode', env_id, episode_num, end_status, reward_detail)
+                    # 提取Steps信息，如果没有找到则默认为0
+                    steps = int(steps_match.group(1)) if steps_match else 0
+                    return ('episode', env_id, episode_num, end_status, reward_detail, steps)
         
         # 向后兼容：尝试匹配旧格式
         pattern_old = r'环境\s+(\d+)\s+Episode:\s+(\d+).*?End:\s+(Goal|Collision|Timeout)'
@@ -192,7 +197,9 @@ class TrainingMetricsAnalyzer:
             # 旧格式没有reward detail，使用空字典
             reward_detail = {'goal': 0.0, 'collision': 0.0, 'angle': 0.0, 'linear': 0.0, 
                            'target_distance': 0.0, 'obs': 0.0, 'yawrate': 0.0}
-            return ('episode', env_id, episode_num, end_status, reward_detail)
+            # 旧格式没有steps信息，默认为0
+            steps = 0
+            return ('episode', env_id, episode_num, end_status, reward_detail, steps)
         
         return None
     
@@ -230,8 +237,8 @@ class TrainingMetricsAnalyzer:
             # 解析Episode
             episode_info = self.parse_episode(line, prev_line)
             if episode_info and episode_info[0] == 'episode':
-                _, env_id, episode_num, end_status, reward_detail = episode_info
-                self.episodes.append((episode_num, env_id, end_status, reward_detail))
+                _, env_id, episode_num, end_status, reward_detail, steps = episode_info
+                self.episodes.append((episode_num, env_id, end_status, reward_detail, steps))
             
             prev_line = line
             i += 1
@@ -287,6 +294,47 @@ class TrainingMetricsAnalyzer:
             reward_curves[key] = smoothed
         
         return episodes, reward_curves
+    
+    def calculate_per_step_reward_stats(self) -> Dict[str, float]:
+        """计算每个step平均的Reward Detail（不包含goal和collision）"""
+        if not self.episodes:
+            return {}
+        
+        # 排除goal和collision的reward keys
+        reward_keys = ['angle', 'linear', 'target_distance', 'obs', 'yawrate']
+        
+        # 统计所有episode的总reward和总step数
+        total_rewards = {key: 0.0 for key in reward_keys}
+        total_steps = 0
+        valid_episodes = 0
+        
+        for ep in self.episodes:
+            episode_num, env_id, end_status, reward_detail, steps = ep
+            
+            # 跳过steps为0的episode（可能是旧格式或解析失败）
+            if steps <= 0:
+                continue
+            
+            valid_episodes += 1
+            total_steps += steps
+            
+            # 累加每个reward项的总值
+            for key in reward_keys:
+                reward_value = reward_detail.get(key, 0.0)
+                total_rewards[key] += reward_value
+        
+        # 计算每个step的平均reward（总reward除以总step数）
+        result = {}
+        for key in reward_keys:
+            if total_steps > 0:
+                result[key] = total_rewards[key] / total_steps
+            else:
+                result[key] = 0.0
+        
+        result['total_steps'] = total_steps
+        result['valid_episodes'] = valid_episodes
+        
+        return result
     
     def plot_curves(self, output_dir: Optional[str] = None, window_size: int = 100):
         """绘制训练曲线"""
@@ -487,6 +535,20 @@ class TrainingMetricsAnalyzer:
             print(f"到达终点: {goal_count} ({goal_count/total*100:.1f}%)")
             print(f"发生碰撞: {collision_count} ({collision_count/total*100:.1f}%)")
             print(f"超时结束: {timeout_count} ({timeout_count/total*100:.1f}%)")
+            
+            # 统计每个step平均的Reward Detail（不包含goal和collision）
+            per_step_stats = self.calculate_per_step_reward_stats()
+            if per_step_stats and per_step_stats.get('valid_episodes', 0) > 0:
+                print("\n" + "="*80)
+                print("【每Step平均Reward Detail统计】（不包含goal和collision）")
+                print("="*80)
+                print(f"有效episode数: {per_step_stats['valid_episodes']}")
+                print(f"总step数: {per_step_stats['total_steps']}")
+                print("\n每个step的平均Reward Detail:")
+                reward_keys = ['angle', 'linear', 'target_distance', 'obs', 'yawrate']
+                for key in reward_keys:
+                    if key in per_step_stats:
+                        print(f"  {REWARD_LABELS.get(key, key)}: {per_step_stats[key]:.4f}")
             
             # Reward Detail统计
             if any(ep[3] for ep in self.episodes if any(ep[3].values())):

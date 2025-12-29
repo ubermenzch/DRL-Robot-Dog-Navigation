@@ -216,12 +216,33 @@ class SAC(object):
         # 在推理时禁用梯度计算，提高性能
         with torch.no_grad():
             obs = torch.FloatTensor(obs).to(self.device)
+            
+            # 检查输入观察值是否包含NaN或Inf
+            if not torch.isfinite(obs).all():
+                # 如果输入包含NaN/Inf，使用零动作作为安全回退
+                print(f"警告: act方法收到包含NaN/Inf的观察值，使用零动作作为回退。NaN count: {(~torch.isfinite(obs)).sum().item()}")
+                obs = torch.zeros_like(obs)
+            
             obs = obs.unsqueeze(0)
-            dist = self.actor(obs)
-            action = dist.sample() if sample else dist.mean
-            action = action.clamp(*self.action_range)
-            assert action.ndim == 2 and action.shape[0] == 1
-            return utils.to_np(action[0])
+            
+            try:
+                dist = self.actor(obs)
+                action = dist.sample() if sample else dist.mean
+                
+                # 检查动作是否包含NaN或Inf
+                if not torch.isfinite(action).all():
+                    print(f"警告: Actor输出的动作包含NaN/Inf，使用零动作作为回退。NaN count: {(~torch.isfinite(action)).sum().item()}")
+                    action = torch.zeros_like(action)
+                
+                action = action.clamp(*self.action_range)
+                assert action.ndim == 2 and action.shape[0] == 1
+                return utils.to_np(action[0])
+            except (ValueError, RuntimeError) as e:
+                # 如果Actor网络出现问题，使用零动作作为安全回退
+                print(f"警告: Actor网络出错 ({e})，使用零动作作为回退")
+                action_shape = (1, self.action_dim)
+                action = torch.zeros(action_shape, device=self.device)
+                return utils.to_np(action[0])
 
     def update_critic(self, obs, action, reward, next_obs, done, step):
         dist = self.actor(next_obs)

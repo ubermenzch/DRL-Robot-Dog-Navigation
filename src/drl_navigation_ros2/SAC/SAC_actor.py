@@ -67,6 +67,12 @@ class DiagGaussianActor(nn.Module):
         self.apply(utils.weight_init)
 
     def forward(self, obs):
+        # 检查输入是否包含NaN或Inf
+        if not torch.isfinite(obs).all():
+            raise ValueError(f"Actor输入包含NaN或Inf: obs contains non-finite values. "
+                           f"NaN count: {(~torch.isfinite(obs)).sum().item()}, "
+                           f"Inf count: {torch.isinf(obs).sum().item()}")
+        
         mu, log_std = self.trunk(obs).chunk(2, dim=-1)
 
         # constrain log_std inside [log_std_min, log_std_max]
@@ -75,6 +81,18 @@ class DiagGaussianActor(nn.Module):
         log_std = log_std_min + 0.5 * (log_std_max - log_std_min) * (log_std + 1)
 
         std = log_std.exp()
+
+        # 检查输出是否包含NaN或Inf
+        if not torch.isfinite(mu).all():
+            raise ValueError(f"Actor输出mu包含NaN或Inf: mu contains non-finite values. "
+                           f"NaN count: {(~torch.isfinite(mu)).sum().item()}, "
+                           f"Inf count: {torch.isinf(mu).sum().item()}, "
+                           f"Input obs range: [{obs.min().item():.4f}, {obs.max().item():.4f}]")
+        
+        if not torch.isfinite(std).all():
+            raise ValueError(f"Actor输出std包含NaN或Inf: std contains non-finite values. "
+                           f"NaN count: {(~torch.isfinite(std)).sum().item()}, "
+                           f"Inf count: {torch.isinf(std).sum().item()}")
 
         self.outputs["mu"] = mu
         self.outputs["std"] = std

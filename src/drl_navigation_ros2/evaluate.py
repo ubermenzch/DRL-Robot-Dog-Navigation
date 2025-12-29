@@ -156,6 +156,7 @@ def collect_evaluation_episodes(env_id, model_path, config,
             action_dim=config['action_dim'],
             max_action=config['max_action'],
             device=device,
+            discount=config.get('discount_factor', 0.99),  # 传递折扣因子
             hidden_dim=config.get('hidden_dim', 1024),
             hidden_depth=config.get('hidden_depth', 3),
             save_every=0,

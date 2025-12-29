@@ -228,6 +228,7 @@ def main(args=None):
     
     hidden_dim = config.get('hidden_dim', 1024)
     hidden_depth = config.get('hidden_depth', 2)
+    discount_factor = config.get('discount_factor', 0.99)  # 折扣因子
     actor_update_frequency = config.get('actor_update_frequency', 1)
     critic_target_update_frequency = config.get('critic_target_update_frequency', 2)
     
@@ -351,6 +352,7 @@ def main(args=None):
         action_dim=action_dim,
         max_action=max_action,
         device=device,
+        discount=discount_factor,  # 传递折扣因子
         save_every=save_every,
         load_model=load_model,
         save_directory=save_path,

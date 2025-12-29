@@ -120,6 +120,32 @@ def load_config(config_path=None):
         return {}
 
 
+def _is_valid_experience(exp):
+    """检查经验是否包含NaN或Inf值
+    
+    Args:
+        exp: 经验元组 (state, action, reward, done, next_state)
+        
+    Returns:
+        bool: True表示经验有效，False表示包含无效值
+    """
+    state, action, reward, done, next_state = exp
+    
+    # 检查state和next_state
+    for name, data in [("state", state), ("next_state", next_state), ("action", action)]:
+        arr = np.asarray(data)
+        if not np.isfinite(arr).all():
+            return False
+    
+    # 检查reward和done
+    if not np.isfinite(reward):
+        return False
+    if not np.isfinite(done):
+        return False
+    
+    return True
+
+
 class SharedReplayBuffer:
     """多进程共享的重放缓冲区 - 真正的并行版本"""
     
@@ -129,6 +155,7 @@ class SharedReplayBuffer:
         self.total_added_step = total_added_step  # 改名为total_added_step，记录step数量
         self.buffer_size = buffer_size
         self.total_episodes_counter = total_episodes_counter  # 新增：Episode计数器
+        self.filtered_count = 0  # 统计被过滤的无效经验数量
         
     def add_batch(self, experiences):
         """批量添加经验 - 使用锁自然阻塞，优化性能"""
@@ -136,10 +163,19 @@ class SharedReplayBuffer:
             return
         
         with self.lock:
-            # 批量添加，减少锁持有时间
+            valid_count = 0
+            # 批量添加，减少锁持有时间，同时过滤无效经验
             for exp in experiences:
-                self.shared_list.append(exp)
-                self.total_added_step.value += 1  # 改名为total_added_step
+                if _is_valid_experience(exp):
+                    self.shared_list.append(exp)
+                    self.total_added_step.value += 1  # 改名为total_added_step
+                    valid_count += 1
+                else:
+                    self.filtered_count += 1
+            
+            # 如果过滤了很多无效经验，打印警告
+            if self.filtered_count > 0 and self.filtered_count % 100 == 0:
+                print(f"警告: SharedReplayBuffer已过滤 {self.filtered_count} 条包含NaN/Inf的无效经验")
             
             # 高效清理超出部分：使用切片操作，避免pop(0)的O(n)复杂度
             # 当缓冲区超过限制时，一次性删除多余的元素
@@ -148,8 +184,9 @@ class SharedReplayBuffer:
                 # 使用切片赋值，比逐个pop(0)快得多
                 self.shared_list[:] = self.shared_list[excess_count:]
             
-            # 只有在数据成功添加到缓冲区时才增加episode计数
-            self.total_episodes_counter.value += 1
+            # 只有在数据成功添加到缓冲区时才增加episode计数（至少有一条有效经验）
+            if valid_count > 0:
+                self.total_episodes_counter.value += 1
     
     def drain_batch(self, max_items=None):
         """从共享缓冲区一次性拉取数据到训练线程本地缓存。
@@ -219,6 +256,7 @@ class LocalReplayBuffer:
         self.write_pos = 0      # 循环写入指针
         self.initialized = False
         self.dtype = dtype
+        self.filtered_count = 0  # 统计被过滤的无效经验数量
         
         # 延迟初始化实际存储数组（直到拿到第一条经验，才能知道 state_dim / action_dim）
         self.states = None          # shape: (max_size, state_dim)
@@ -269,11 +307,25 @@ class LocalReplayBuffer:
         if not experiences:
             return
         
+        # 过滤掉包含NaN/Inf的无效经验
+        valid_experiences = []
+        for exp in experiences:
+            if _is_valid_experience(exp):
+                valid_experiences.append(exp)
+            else:
+                self.filtered_count += 1
+        
+        if not valid_experiences:
+            # 如果所有经验都被过滤，返回
+            if self.filtered_count > 0 and self.filtered_count % 100 == 0:
+                print(f"警告: LocalReplayBuffer已过滤 {self.filtered_count} 条包含NaN/Inf的无效经验")
+            return
+        
         # 延迟初始化底层数组（只有第一次有数据时才初始化）
         if not self.initialized:
-            self._lazy_init(experiences[0])
+            self._lazy_init(valid_experiences[0])
         
-        for exp in experiences:
+        for exp in valid_experiences:
             state, action, reward, done, next_state = exp
             
             # 转成指定精度（float32 或 float64）
@@ -388,14 +440,13 @@ class GlobalStatistics:
             
             return episode_number
     
-    def get_statistics(self, use_window=True, max_target_dist=None, report_every=None):
+    def get_statistics(self, use_window=True, eligibility_threshold=None, eligibility_ratio=None, report_every=None):
         """获取统计信息
         
         Args:
             use_window: 是否使用滑动窗口统计
-            max_target_dist: 最大目标距离，用于检查最好模型评比资格
-                           资格条件：过去 report_every 个 episode 的期望目标距离（ros_env.target_dist）
-                           都等于 max_target_dist（注意：比较的是期望值，不是实际生成的终点距离）
+            eligibility_threshold: 最好模型评比资格检查的target_dist阈值（过去report_every个episode中，至少eligibility_ratio比例的target_dist需大于等于此值才有资格）
+            eligibility_ratio: 最好模型评比资格检查的比例阈值（0-1之间，例如0.8表示80%）
             report_every: 报告间隔，用于检查最好模型评比资格
         """
         with self.lock:
@@ -412,20 +463,21 @@ class GlobalStatistics:
                 }
             
             # 检查是否有资格参与最好模型评比
-            # 资格条件：过去 report_every 个 episode 的期望目标距离（ros_env.target_dist）都等于 max_target_dist
-            # 注意：这里比较的是生成episode时的期望目标距离，而非实际生成的终点距离（实际距离有随机性）
+            # 资格条件：过去 report_every 个 episode 中，至少 eligibility_ratio 比例的期望目标距离（ros_env.target_dist）大于等于 eligibility_threshold
+            # 注意：这里比较的是生成episode时的期望目标距离（Target Distance），而非实际生成的终点距离（actual），实际距离有随机性
             eligible_for_best_model = False
-            if max_target_dist is not None and report_every is not None and len(self.recent_episodes) >= report_every:
-                # 只要遇到一个不等于 max_target_dist（或缺少 target_dist），就立即判定为不具备资格
+            if eligibility_threshold is not None and eligibility_ratio is not None and report_every is not None and len(self.recent_episodes) >= report_every:
                 recent_eps = list(self.recent_episodes)[-report_every:]
-                all_match = True
+                match_count = 0
+                total_count = 0
                 for ep in recent_eps:
                     td = ep.get('target_dist', None)
-                    # 旧数据可能没有 target_dist，直接视为不具备资格
-                    if td is None or abs(td - max_target_dist) >= 1e-10:
-                        all_match = False
-                        break
-                eligible_for_best_model = all_match
+                    total_count += 1
+                    # 检查是否大于等于 eligibility_threshold
+                    if td is not None and td >= eligibility_threshold:
+                        match_count += 1
+                # 至少eligibility_ratio比例的episode的target_dist大于等于threshold才有资格
+                eligible_for_best_model = (match_count / total_count) >= eligibility_ratio if total_count > 0 else False
             
             if use_window and len(self.recent_episodes) > 0:
                 # 使用滑动窗口统计
@@ -706,6 +758,7 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             action_dim=config['action_dim'],
             max_action=config['max_action'],
             device=device,
+            discount=config.get('discount_factor', 0.99),  # 传递折扣因子
             actor_update_frequency=config.get('actor_update_frequency', 1),
             critic_target_update_frequency=config.get('critic_target_update_frequency', 4),
             hidden_dim=config.get('hidden_dim', 1024),
@@ -1001,12 +1054,31 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 # 训练阶段才写入经验队列；评估阶段仅统计
                 if not is_eval:
                     # experiences 为本 episode 的一批 transition
+                    # 在添加到队列之前，过滤掉包含NaN/Inf的无效经验
+                    valid_experiences = []
+                    invalid_count = 0
+                    for exp in experiences:
+                        if _is_valid_experience(exp):
+                            valid_experiences.append(exp)
+                        else:
+                            invalid_count += 1
+                    
+                    # 如果所有经验都无效，跳过这个episode
+                    if not valid_experiences:
+                        if invalid_count > 0:
+                            print(f"环境 {env_id} Episode {global_episode_number}: 所有 {invalid_count} 条经验都包含NaN/Inf，跳过该episode")
+                        continue
+                    
+                    # 如果有部分经验无效，打印警告
+                    if invalid_count > 0:
+                        print(f"环境 {env_id} Episode {global_episode_number}: 过滤了 {invalid_count}/{len(experiences)} 条包含NaN/Inf的无效经验")
+                    
                     # 使用队列将经验推送到训练进程，避免使用 Manager().list 大列表切片
                     try:
-                        experience_queue.put(experiences)
+                        experience_queue.put(valid_experiences)
                     except Exception as e:
                         print(f"环境 {env_id} 推送经验到队列失败: {e}")
-                        experiences = []
+                        valid_experiences = []
                 
                 # 使用ros_python.py中已计算的初始终点距离
                 target_distance = getattr(ros_env, "initial_target_distance", None)
@@ -1358,7 +1430,9 @@ class ParallelMultiEnvTrainer:
                  target_distance_penalty_base=-1.0,
                  linear_acceleration_oscillation_penalty_base=-1.0,
                  yawrate_oscillation_penalty_base=-1.0,
-                 config_path=None):
+                 config_path=None,
+                 best_model_eligibility_threshold=5.0,
+                 best_model_eligibility_ratio=0.8):
         
         def _to_bool(val, default=True):
             if isinstance(val, bool):
@@ -1436,6 +1510,9 @@ class ParallelMultiEnvTrainer:
         self.reset_step_count = reset_step_count
         # 动作噪声参数
         self.action_noise_std = action_noise_std
+        # 最好模型评比资格检查参数
+        self.best_model_eligibility_threshold = best_model_eligibility_threshold
+        self.best_model_eligibility_ratio = best_model_eligibility_ratio
         
         # 设备配置
         # 注意：如果通过环境变量 CUDA_VISIBLE_DEVICES 设置了 GPU，PyTorch 视角下 GPU 索引从 0 开始
@@ -1491,6 +1568,7 @@ class ParallelMultiEnvTrainer:
             action_dim=action_dim,
             max_action=max_action,
             device=self.device,
+            discount=discount_factor,  # 传递折扣因子
             actor_update_frequency=actor_update_frequency,
             critic_target_update_frequency=critic_target_update_frequency,
             hidden_dim=hidden_dim,
@@ -1583,6 +1661,7 @@ class ParallelMultiEnvTrainer:
         self.best_collision_rate = float('inf')  # 最好的碰撞率（初始化为无穷大，表示还没有记录）
         self.check_best_model_ref = self.manager.Value('i', 0)  # 共享变量：标记是否需要检查最好模型（episode编号）
         self.check_best_model_lock = self.manager.Lock()  # 锁，用于保护检查最好模型的逻辑
+        self.last_eligibility_warning_episode = 0  # 记录上次打印资格警告的episode编号，避免频繁打印
         
         # 初始化计数器（不再需要同步事件）
         self.init_complete_counter = mp.Value('i', 0)  # 跟踪初始化完成的环境数量
@@ -1660,6 +1739,9 @@ class ParallelMultiEnvTrainer:
             'action_noise_std': action_noise_std,
             # 连通区域选择参数（从 train.yaml 读取）
             'region_select_bias': self.region_select_bias,
+            # 最好模型评比资格检查参数
+            'best_model_eligibility_threshold': self.best_model_eligibility_threshold,
+            'best_model_eligibility_ratio': self.best_model_eligibility_ratio,
         }
         
         # 初始化信息在 shell 脚本中已经完整打印过，这里只打一行简要提示，避免重复参数配置
@@ -1671,8 +1753,8 @@ class ParallelMultiEnvTrainer:
         try:
             self.model_save_dir.mkdir(parents=True, exist_ok=True)
             print(f"模型保存目录已准备: {self.model_save_dir}")
-            # 创建best模型保存目录
-            self.best_model_save_dir = Path(str(self.model_save_dir) + "_best")
+            # 创建best模型保存目录（作为子目录）
+            self.best_model_save_dir = self.model_save_dir / "best"
             self.best_model_save_dir.mkdir(parents=True, exist_ok=True)
             print(f"最好模型保存目录已准备: {self.best_model_save_dir}")
         except PermissionError:
@@ -1692,7 +1774,13 @@ class ParallelMultiEnvTrainer:
             # 首先检查是否有资格参与最好模型评比
             eligible_for_best_model = stats.get('eligible_for_best_model', False)
             if not eligible_for_best_model:
-                # 没有资格，不进行评比
+                # 没有资格，不进行评比（每100个episode打印一次警告，避免刷屏）
+                current_episode = stats.get('total_episodes', 0)
+                eligibility_threshold = self.config.get('best_model_eligibility_threshold', 5.0)
+                eligibility_ratio = self.config.get('best_model_eligibility_ratio', 0.8)
+                if current_episode - self.last_eligibility_warning_episode >= 100:
+                    print(f"[最好模型检查] Episode {current_episode}: 当前统计不具备参与最好模型评比的资格（资格要求：过去report_every个episode中至少{eligibility_ratio*100:.0f}%的target_dist >= {eligibility_threshold}）")
+                    self.last_eligibility_warning_episode = current_episode
                 return
             
             current_goal_rate = stats.get('goal_rate', 0.0)
@@ -1777,9 +1865,10 @@ class ParallelMultiEnvTrainer:
                 # 数据收集进程在每 report_every 个 episode 时设置标记，通知主进程
                 current_check_episode = self.check_best_model_ref.value
                 if current_check_episode > last_checked_episode:
-                    # 获取当前统计信息，传递 max_target_dist 和 report_every 用于资格检查
+                    # 获取当前统计信息，传递资格检查参数
                     stats = self.global_stats.get_statistics(
-                        max_target_dist=self.config.get('max_target_dist'),
+                        eligibility_threshold=self.config.get('best_model_eligibility_threshold', 5.0),
+                        eligibility_ratio=self.config.get('best_model_eligibility_ratio', 0.8),
                         report_every=self.config.get('report_every', 20)
                     )
                     # 打印统计报告（主进程统一负责）
@@ -2030,6 +2119,7 @@ def main():
     hidden_depth = args.hidden_depth if hasattr(args, 'hidden_depth') and args.hidden_depth is not None else config.get('hidden_depth', 3)
     
     # 训练算法参数
+    discount_factor = config.get('discount_factor', 0.99)  # 折扣因子
     critic_loss_threshold = args.critic_loss_threshold if hasattr(args, 'critic_loss_threshold') and args.critic_loss_threshold is not None else config.get('critic_loss_threshold', 100.0)
     actor_update_frequency = args.actor_update_frequency if hasattr(args, 'actor_update_frequency') and args.actor_update_frequency is not None else config.get('actor_update_frequency', 1)
     critic_target_update_frequency = args.critic_target_update_frequency if hasattr(args, 'critic_target_update_frequency') and args.critic_target_update_frequency is not None else config.get('critic_target_update_frequency', 4)
@@ -2093,6 +2183,10 @@ def main():
     
     # 连通区域选择参数（仅来自配置文件）
     region_select_bias = config.get('region_select_bias', 1.0)
+    
+    # 最好模型评比资格检查参数（仅来自配置文件）
+    best_model_eligibility_threshold = config.get('best_model_eligibility_threshold', 5.0)
+    best_model_eligibility_ratio = config.get('best_model_eligibility_ratio', 0.8)
     
     # 创建训练器
     trainer = ParallelMultiEnvTrainer(
@@ -2165,6 +2259,8 @@ def main():
         reward_debug=reward_debug,
         total_eval_episodes=total_eval_episodes,
         config_path=actual_config_path,
+        best_model_eligibility_threshold=best_model_eligibility_threshold,
+        best_model_eligibility_ratio=best_model_eligibility_ratio,
     )
     
     # 开始训练

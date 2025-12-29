@@ -7,7 +7,7 @@
 # ============================================================================
 
 # ==================== 多环境训练参数 ====================
-num_envs: 64  # 并行环境数量(一个环境要占用800m左右的显存)
+num_envs: 48  # 并行环境数量(一个环境要占用800m左右的显存)
 critic_loss_threshold: -1.0  # critic损失阈值，前X次平均损失小于此值时才更新模型；若值为-1，则无视该阈值，环境控制进程均使用最新模型
 enable_weight_consistency_check: false  # 是否进行模型权重一致性详细检验（为true时会在每个环境初始化时打印大量权重信息）
 
@@ -49,7 +49,7 @@ max_yawrate: 30.0  # 最大偏航率（单位：度/秒）
 neglect_angle: 30  # 前方视野左右两边忽略的角度（单位：度）
 scan_range: 10  # 激光雷达扫描范围
 max_target_dist: 6.0  # 最大目标距离
-init_target_distance: 6.0  # 初始目标距离
+init_target_distance: 1.0  # 初始目标距离
 target_dist_increase: 0.001  # 目标距离增加量
 target_reached_delta: 0.4  # 判定到达目标的阈值
 collision_delta: 0.3  # 碰撞检测阈值
@@ -73,6 +73,7 @@ hidden_dim: 1024  # 神经网络隐藏层维度
 hidden_depth: 3  # 神经网络隐藏层深度
 
 # ==================== 训练算法参数 ====================
+discount_factor: 0.99  # 折扣因子（gamma），用于计算未来奖励的折扣，范围通常在0.9-0.999之间
 actor_update_frequency: 1  # Actor网络更新频率（每多少次critic更新后更新一次actor）
 critic_target_update_frequency: 4  # Critic目标网络更新频率（每多少次critic更新后更新一次目标网络）
 
@@ -90,6 +91,8 @@ report_every: 100  # 每多少个episode/回合打印一次统计报告
 max_training_count: 30000  # 最大训练次数（训练完成后自动停止）
 loss_window_size: 10  # 训练损失窗口大小，用于计算平均Critic损失
 total_eval_episodes: 1000  # 评估阶段采集的episode数量；>0时训练结束后进入评估并在完成后输出统一统计报告
+best_model_eligibility_threshold: 5.0  # 最好模型评比资格检查的target_dist阈值（过去report_every个episode中，至少best_model_eligibility_ratio比例的target_dist需大于等于此值才有资格）
+best_model_eligibility_ratio: 0.8  # 最好模型评比资格检查的比例阈值（0-1之间，例如0.8表示80%）
 
 # ==================== 共享路径参数 ====================
 load_path: "/home/zc/DRL-Robot-Navigation-ROS2/models/multi_env_train_model/20251224_181328"  # 模型加载路径
