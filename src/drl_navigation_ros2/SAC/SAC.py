@@ -229,10 +229,7 @@ class SAC(object):
                 dist = self.actor(obs)
                 action = dist.sample() if sample else dist.mean
                 
-                # 检查动作是否包含NaN或Inf
-                if not torch.isfinite(action).all():
-                    print(f"警告: Actor输出的动作包含NaN/Inf，使用零动作作为回退。NaN count: {(~torch.isfinite(action)).sum().item()}")
-                    action = torch.zeros_like(action)
+                # 注意：actor网络的输出（action）不检查NaN/Inf，只检查输入
                 
                 action = action.clamp(*self.action_range)
                 assert action.ndim == 2 and action.shape[0] == 1

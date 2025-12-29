@@ -643,7 +643,6 @@ start_multi_env_training() {
         --obs_num $OBS_NUM \
         --action_dim $ACTION_DIM \
         --max_action $MAX_ACTION \
-        --state_dim $STATE_DIM \
         --is_code_debug $IS_CODE_DEBUG \
         --model_save_dir "$MODEL_SAVE_DIR" \
         --model_load_dir "$MODEL_LOAD_DIR" \

@@ -82,17 +82,7 @@ class DiagGaussianActor(nn.Module):
 
         std = log_std.exp()
 
-        # 检查输出是否包含NaN或Inf
-        if not torch.isfinite(mu).all():
-            raise ValueError(f"Actor输出mu包含NaN或Inf: mu contains non-finite values. "
-                           f"NaN count: {(~torch.isfinite(mu)).sum().item()}, "
-                           f"Inf count: {torch.isinf(mu).sum().item()}, "
-                           f"Input obs range: [{obs.min().item():.4f}, {obs.max().item():.4f}]")
-        
-        if not torch.isfinite(std).all():
-            raise ValueError(f"Actor输出std包含NaN或Inf: std contains non-finite values. "
-                           f"NaN count: {(~torch.isfinite(std)).sum().item()}, "
-                           f"Inf count: {torch.isinf(std).sum().item()}")
+        # 注意：actor网络的输出（mu, std）不检查NaN/Inf，只检查输入
 
         self.outputs["mu"] = mu
         self.outputs["std"] = std

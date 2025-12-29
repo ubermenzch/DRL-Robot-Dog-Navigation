@@ -407,17 +407,6 @@ class ROS_env:
         else:
             self.initial_target_distance = distance  # 如果无法计算，使用当前距离作为初始距离
         
-        # 数值检查和限制：确保initial_target_distance是有效数值
-        if self.initial_target_distance is not None:
-            # 检查NaN和inf
-            if not np.isfinite(self.initial_target_distance):
-                self.initial_target_distance = None
-            # 确保最小值，防止除零和极大比值
-            elif self.initial_target_distance < 0.01:
-                self.initial_target_distance = 0.01
-            # 限制最大值，防止异常大值
-            elif self.initial_target_distance > 1000.0:
-                self.initial_target_distance = 1000.0
         # 采样后重置计步，保证新episode从0开始计数
         self.step_count = 0
         # 重置阶段可能因为初始位置接近目标/障碍导致奖励被计入，出于公平性将奖励分解清零
@@ -1109,9 +1098,9 @@ class ROS_env:
                     # 限制distance的最大值，防止异常大值
                     distance_clipped = min(distance, 50.0)
                     # 计算当前距离与初始距离的比值
-                    distance_ratio = distance_clipped / self.initial_target_distance
+                    distance_ratio = distance_clipped / max(self.initial_target_distance, 1.0)
                     # 限制distance_ratio的最大值，防止数值溢出（最大比值设为100）
-                    distance_ratio = min(distance_ratio, 100.0)
+                    distance_ratio = min(distance_ratio, 5.0)
                     # 惩罚 = base * 距离比值（距离越远，比值越大，惩罚越大）
                     target_distance_penalty = self.target_distance_penalty_base * distance_ratio
                     # 最终检查：确保惩罚值是有限数值，防止NaN和inf

@@ -72,6 +72,7 @@ import argparse
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import numpy as np
+from datetime import datetime
 
 # 尝试导入matplotlib，如果失败则只提供统计功能
 try:
@@ -85,6 +86,26 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
     print("警告: matplotlib未安装，将跳过绘图功能")
+
+
+class TeeOutput:
+    """同时输出到终端和文件的类"""
+    def __init__(self, file_path: Path):
+        self.terminal = sys.stdout
+        self.log_file = open(file_path, 'w', encoding='utf-8')
+    
+    def write(self, message):
+        self.terminal.write(message)
+        self.log_file.write(message)
+        self.log_file.flush()  # 确保立即写入文件
+    
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
+    
+    def close(self):
+        if self.log_file:
+            self.log_file.close()
 
 
 class TrainingMetricsAnalyzer:
@@ -651,15 +672,39 @@ def main():
     output_dir = args.output_dir
     window_size = args.window_size
     
-    print(f"配置参数:")
-    print(f"  日志文件: {log_path}")
-    print(f"  窗口大小: {window_size}")
-    print(f"  生成图片: {generate_plot}")
-    print(f"  输出目录: {output_dir if output_dir else '日志文件所在目录'}")
-    print()
+    # 确定输出目录（和图片同目录）
+    if output_dir is None:
+        output_dir = log_path.parent
+    else:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
     
-    analyzer = TrainingMetricsAnalyzer(str(log_path))
-    analyzer.run(plot=generate_plot, output_dir=output_dir, window_size=window_size)
+    # 创建输出txt文件路径（和图片同目录）
+    base_name = log_path.stem
+    output_txt_file = output_dir / f'{base_name}_output.txt'
+    
+    # 设置输出重定向（同时输出到终端和文件）
+    original_stdout = sys.stdout
+    tee = TeeOutput(output_txt_file)
+    sys.stdout = tee
+    
+    try:
+        print(f"配置参数:")
+        print(f"  日志文件: {log_path}")
+        print(f"  窗口大小: {window_size}")
+        print(f"  生成图片: {generate_plot}")
+        print(f"  输出目录: {output_dir}")
+        print(f"  输出文本文件: {output_txt_file}")
+        print()
+        
+        analyzer = TrainingMetricsAnalyzer(str(log_path))
+        analyzer.run(plot=generate_plot, output_dir=str(output_dir), window_size=window_size)
+        
+        print(f"\n终端输出已保存至: {output_txt_file}")
+    finally:
+        # 恢复原始输出
+        sys.stdout = original_stdout
+        tee.close()
 
 
 if __name__ == "__main__":

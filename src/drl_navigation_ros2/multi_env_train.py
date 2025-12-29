@@ -27,45 +27,6 @@ from typing import Optional
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-def concatenate_state_history(current_state, state_history, state_history_steps, base_state_dim):
-    """将当前state与历史state拼接
-    
-    Args:
-        current_state: 当前step的状态（list或numpy array）
-        state_history: 历史state队列（deque）
-        state_history_steps: 包含历史多少step（例如：2表示包含当前step和之前2个step，共3个step）
-        base_state_dim: 基础状态维度（单个时间步的状态向量长度）
-    
-    Returns:
-        拼接后的state（list），如果state_history_steps为0则只返回当前state
-        如果历史不足，用零填充
-    """
-    if state_history_steps <= 0:
-        return list(current_state)
-    
-    # 计算需要的历史步数（不包括当前step）
-    needed_history_steps = state_history_steps
-    history_list = list(state_history)
-    available_history_steps = len(history_list)
-    
-    # 拼接：历史state（从旧到新）+ 当前state
-    concatenated = []
-    
-    # 如果历史不足，用零填充
-    missing_steps = needed_history_steps - available_history_steps
-    if missing_steps > 0:
-        zero_state = [0.0] * base_state_dim
-        for _ in range(missing_steps):
-            concatenated.extend(zero_state)
-    
-    # 添加实际的历史state
-    for hist_state in history_list:
-        concatenated.extend(hist_state)
-    
-    # 最后添加当前state
-    concatenated.extend(current_state)
-    
-    return concatenated
 from SAC.SAC import SAC
 from ros_python import ROS_env
 from replay_buffer import ReplayBuffer
@@ -142,6 +103,38 @@ def _is_valid_experience(exp):
         return False
     if not np.isfinite(done):
         return False
+    
+    return True
+
+
+def _is_valid_env_return(latest_scan, distance, cos, sin, collision, goal, last_action, reward):
+    """检查环境reset/step返回值是否包含NaN或Inf值
+    
+    Args:
+        latest_scan: 激光扫描数据（数组）
+        distance: 距离（标量）
+        cos: 余弦值（标量）
+        sin: 正弦值（标量）
+        collision: 碰撞标志（布尔值）
+        goal: 目标到达标志（布尔值）
+        last_action: 上一个动作（数组）
+        reward: 奖励（标量）
+        
+    Returns:
+        bool: True表示返回值有效，False表示包含无效值
+    """
+    # 检查数组类型的数据
+    for name, data in [("latest_scan", latest_scan), ("last_action", last_action)]:
+        arr = np.asarray(data)
+        if not np.isfinite(arr).all():
+            return False
+    
+    # 检查标量类型的数据
+    for name, value in [("distance", distance), ("cos", cos), ("sin", sin), ("reward", reward)]:
+        if not np.isfinite(value):
+            return False
+    
+    # collision 和 goal 是布尔值，不需要检查 NaN/Inf
     
     return True
 
@@ -307,44 +300,71 @@ class LocalReplayBuffer:
         if not experiences:
             return
         
-        # 过滤掉包含NaN/Inf的无效经验
-        valid_experiences = []
-        for exp in experiences:
-            if _is_valid_experience(exp):
-                valid_experiences.append(exp)
-            else:
-                self.filtered_count += 1
-        
-        if not valid_experiences:
-            # 如果所有经验都被过滤，返回
-            if self.filtered_count > 0 and self.filtered_count % 100 == 0:
-                print(f"警告: LocalReplayBuffer已过滤 {self.filtered_count} 条包含NaN/Inf的无效经验")
-            return
-        
+        # 说明：
+        # 1. NaN/Inf 检查已经在采集进程（env进程）和 SharedReplayBuffer 中完成，
+        #    这里再做一次会造成明显的CPU开销，且重复意义不大，故在本地缓冲区去掉重复检查。
+        # 2. 这里对整个 batch 做向量化写入，避免逐样本 Python for 循环，显著降低
+        #    “拉取到本地 buffer” 阶段的时间开销。
+
         # 延迟初始化底层数组（只有第一次有数据时才初始化）
         if not self.initialized:
-            self._lazy_init(valid_experiences[0])
+            self._lazy_init(experiences[0])
         
-        for exp in valid_experiences:
-            state, action, reward, done, next_state = exp
-            
-            # 转成指定精度（float32 或 float64）
-            s = np.asarray(state, dtype=self.dtype)
-            ns = np.asarray(next_state, dtype=self.dtype)
-            a = np.asarray(action, dtype=self.dtype)
-            
-            # 写入当前指针位置
-            self.states[self.write_pos] = s
-            self.next_states[self.write_pos] = ns
-            self.actions[self.write_pos] = a
-            self.rewards[self.write_pos, 0] = float(reward)
-            # done 统一为 0/1 的 float32，便于后续直接转成 torch.Tensor
-            self.dones[self.write_pos, 0] = float(done)
-            
-            # 更新指针和计数
-            self.write_pos = (self.write_pos + 1) % self.max_size
-            if self.count < self.max_size:
-                self.count += 1
+        # -------------------------
+        # 向量化写入：一次性构造批量 NumPy 数组并写入环形缓冲区
+        # -------------------------
+        batch_size = len(experiences)
+
+        # 将 batch 拆分为各个字段的列表
+        states_list = [np.asarray(exp[0], dtype=self.dtype) for exp in experiences]
+        actions_list = [np.asarray(exp[1], dtype=self.dtype) for exp in experiences]
+        rewards_list = [float(exp[2]) for exp in experiences]
+        dones_list = [float(exp[3]) for exp in experiences]
+        next_states_list = [np.asarray(exp[4], dtype=self.dtype) for exp in experiences]
+
+        # 叠成批量数组
+        states_arr = np.stack(states_list, axis=0)
+        actions_arr = np.stack(actions_list, axis=0)
+        rewards_arr = np.asarray(rewards_list, dtype=self.dtype).reshape(-1, 1)
+        dones_arr = np.asarray(dones_list, dtype=self.dtype).reshape(-1, 1)
+        next_states_arr = np.stack(next_states_list, axis=0)
+
+        # 环形写入逻辑：最多拆成两段写入，避免逐样本循环
+        start = self.write_pos
+        end = start + batch_size
+
+        if end <= self.max_size:
+            # 不发生环绕，直接写入一段
+            idx_slice = slice(start, end)
+            self.states[idx_slice] = states_arr
+            self.next_states[idx_slice] = next_states_arr
+            self.actions[idx_slice] = actions_arr
+            self.rewards[idx_slice] = rewards_arr
+            self.dones[idx_slice] = dones_arr
+        else:
+            # 发生环绕，拆成两段写入
+            first_len = self.max_size - start
+            second_len = end - self.max_size
+
+            # 第一段：[start, max_size)
+            first_slice = slice(start, self.max_size)
+            self.states[first_slice] = states_arr[:first_len]
+            self.next_states[first_slice] = next_states_arr[:first_len]
+            self.actions[first_slice] = actions_arr[:first_len]
+            self.rewards[first_slice] = rewards_arr[:first_len]
+            self.dones[first_slice] = dones_arr[:first_len]
+
+            # 第二段：[0, end - max_size)
+            second_slice = slice(0, second_len)
+            self.states[second_slice] = states_arr[first_len:]
+            self.next_states[second_slice] = next_states_arr[first_len:]
+            self.actions[second_slice] = actions_arr[first_len:]
+            self.rewards[second_slice] = rewards_arr[first_len:]
+            self.dones[second_slice] = dones_arr[first_len:]
+
+        # 更新写指针与有效样本计数
+        self.write_pos = end % self.max_size
+        self.count = min(self.count + batch_size, self.max_size)
     
     def sample_batch(self, batch_size):
         """从本地缓冲区采样一个批次；不足 batch_size 时使用所有可用样本
@@ -745,10 +765,8 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
         
         # 计算实际使用的state_dim，确保与历史state拼接一致
         state_history_steps = config.get('state_history_steps', 0)
-        base_state_dim = config.get('base_state_dim', config['state_dim'])
+        base_state_dim = config.get('base_state_dim', 25)
         state_dim_effective = base_state_dim * (1 + state_history_steps) if state_history_steps > 0 else base_state_dim
-        if config['state_dim'] != state_dim_effective:
-            weight_log(f"环境 {env_id} 警告: config.state_dim={config['state_dim']} 与计算值 {state_dim_effective} 不一致，采用 {state_dim_effective}")
 
         # 创建本地SAC模型实例（子进程版本）
         # 注意：数据收集进程只需要actor模型进行推理，不需要critic和target_critic，以节省显存
@@ -961,6 +979,17 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 
                 # 重置环境
                 latest_scan, distance, cos, sin, collision, goal, last_action, reward = ros_env.reset()
+                
+                # 检查reset返回值是否包含NaN/Inf
+                if not _is_valid_env_return(latest_scan, distance, cos, sin, collision, goal, last_action, reward):
+                    print(
+                        f"环境 {env_id} reset()返回值包含NaN/Inf，丢弃本次episode（不占用episode编号）。"
+                        f"latest_scan包含NaN/Inf: {not np.isfinite(np.asarray(latest_scan)).all()}, "
+                        f"distance: {distance}, cos: {cos}, sin: {sin}, reward: {reward}, "
+                        f"last_action包含NaN/Inf: {not np.isfinite(np.asarray(last_action)).all()}"
+                    )
+                    continue
+                
                 state, terminal = local_model.prepare_state(
                     latest_scan, distance, cos, sin, collision, goal, last_action
                 )
@@ -968,6 +997,7 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 episode_reward = 0
                 episode_steps = 0
                 experiences = []
+                episode_discarded_due_to_nan_inf = False  # 标记是否因NaN/Inf而丢弃episode
                 # 清空并用 s0 填满历史队列（state_history_steps+1 个 s0）
                 state_history.clear()
                 for _ in range(state_history_steps + 1):
@@ -1006,6 +1036,20 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                         lin_velocity=ros_action[0], ang_velocity=ros_action[1]
                     )
                     
+                    # 检查step返回值是否包含NaN/Inf
+                    if not _is_valid_env_return(latest_scan, distance, cos, sin, collision, goal, last_action, reward):
+                        print(
+                            f"环境 {env_id} step()返回值包含NaN/Inf，中断并丢弃本次episode（不占用episode编号）。"
+                            f"已收集 {len(experiences)} 条样本将被丢弃。"
+                            f"latest_scan包含NaN/Inf: {not np.isfinite(np.asarray(latest_scan)).all()}, "
+                            f"distance: {distance}, cos: {cos}, sin: {sin}, reward: {reward}, "
+                            f"last_action包含NaN/Inf: {not np.isfinite(np.asarray(last_action)).all()}"
+                        )
+                        # 标记episode因NaN/Inf被丢弃，中断循环
+                        episode_discarded_due_to_nan_inf = True
+                        terminal = True  # 设置terminal为True以退出内层循环
+                        break
+                    
                     episode_reward += reward
                     episode_steps += 1
                     total_steps += 1
@@ -1025,6 +1069,10 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     experiences.append((current_state_with_history, model_action, reward, terminal, next_state_with_history))
                     # 下一个循环直接使用 x_{t+1}
                     current_state_with_history = next_state_with_history
+                
+                # 如果episode因NaN/Inf被丢弃，跳过后续所有处理，不占用episode编号
+                if episode_discarded_due_to_nan_inf:
+                    continue
                 
                 # 修复风险A：如果是因为timeout退出（步数达到上限且未发生goal/collision），将最后一个transition的done改为True
                 # 注意：如果同时达到max_steps和goal/collision，terminal已经是True，episode_ending会正确判断为Goal/Collision，无需修复
@@ -1054,31 +1102,27 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 # 训练阶段才写入经验队列；评估阶段仅统计
                 if not is_eval:
                     # experiences 为本 episode 的一批 transition
-                    # 在添加到队列之前，过滤掉包含NaN/Inf的无效经验
-                    valid_experiences = []
+                    # 在添加到队列之前，检查是否存在包含NaN/Inf的样本：
+                    #  - 若存在任意一条无效样本，则整条episode直接丢弃（不写入队列，也不占用episode编号）
+                    #  - 若全部样本有效，则原样写入队列
                     invalid_count = 0
                     for exp in experiences:
-                        if _is_valid_experience(exp):
-                            valid_experiences.append(exp)
-                        else:
+                        if not _is_valid_experience(exp):
                             invalid_count += 1
                     
-                    # 如果所有经验都无效，跳过这个episode
-                    if not valid_experiences:
-                        if invalid_count > 0:
-                            print(f"环境 {env_id} Episode {global_episode_number}: 所有 {invalid_count} 条经验都包含NaN/Inf，跳过该episode")
+                    if invalid_count > 0:
+                        # 本episode存在NaN/Inf，整条episode丢弃
+                        print(
+                            f"环境 {env_id} 当前episode包含 {invalid_count}/{len(experiences)} 条包含NaN/Inf的经验，"
+                            f"整条episode将被丢弃且不写入经验队列，不占用episode编号。"
+                        )
                         continue
                     
-                    # 如果有部分经验无效，打印警告
-                    if invalid_count > 0:
-                        print(f"环境 {env_id} Episode {global_episode_number}: 过滤了 {invalid_count}/{len(experiences)} 条包含NaN/Inf的无效经验")
-                    
-                    # 使用队列将经验推送到训练进程，避免使用 Manager().list 大列表切片
+                    # 所有样本均为有效数值，直接写入经验队列
                     try:
-                        experience_queue.put(valid_experiences)
+                        experience_queue.put(experiences)
                     except Exception as e:
                         print(f"环境 {env_id} 推送经验到队列失败: {e}")
-                        valid_experiences = []
                 
                 # 使用ros_python.py中已计算的初始终点距离
                 target_distance = getattr(ros_env, "initial_target_distance", None)
@@ -1156,11 +1200,20 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
 
                 # 输出详细的episode信息（含奖励明细），时间戳放在最前面，便于与训练日志对齐
                 # target_dist 是配置的目标距离上限，target_distance 是实际生成的终点距离
+                # 这里的 Queue(episodes) 表示当前经验队列中累计的 episode 数量（近似反映待训练数据量），
+                # 而本地训练缓冲区的样本数量由训练线程在训练日志中单独打印。
+                queue_size_episodes = 0
+                try:
+                    # multiprocessing.Queue.qsize() 在部分平台上可能不完全精确，但用于日志监控是可以接受的
+                    queue_size_episodes = experience_queue.qsize()
+                except Exception:
+                    queue_size_episodes = -1  # 获取失败时输出 -1 以示区分
+                
                 episode_info = (
                     f"{current_time.strftime('%Y-%m-%d %H:%M:%S')} 环境 {env_id} "
                     f"Episode: {global_episode_number} "
                     f"Target Distance: {ros_env.target_dist:.2f} (actual: {target_distance:.2f}) Steps: {episode_steps} "
-                    f"Buffer(local): {current_buffer_size_ref.value}\n"
+                    f"Queue(episodes): {queue_size_episodes}\n"
                     f"  Reward Detail: {detail_str}"
                 )
                 print(episode_info)
@@ -1262,8 +1315,8 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                     # 为了便于阅读，将训练耗时与统计信息分行打印，并细化耗时统计
                     total_train_time = end_time - start_time
 
-                    # 行1：训练完成基本信息
-                    print(f"{end_time_str} 第{training_count}次训练完成")
+                    # 行1：训练完成基本信息（附带当前本地缓冲区大小，便于和采样耗时一起分析）
+                    print(f"{end_time_str} 第{training_count}次训练完成 | 当前缓冲区大小: {buffer_size}")
 
                     # 行2：抽样与样本统计
                     print(
@@ -1299,20 +1352,23 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                         else:
                             print(f"  本次训练的平均actor网络损失: {avg_actor_loss:.2f}")
 
-                    # 行5：本次训练整体耗时（从调用train前到返回后的总墙钟时间）
-                    print(f"  训练耗时: {total_train_time:.2f}秒")
-
-                    # 行6+: 采样与前向/反向耗时的细分
+                    # 行5：本次训练整体耗时（使用“采样耗时总计 + 前向/反向耗时”的和，而不是墙钟时间）
+                    # 注意：total_sample_time 和 compute_time 仅在 sample_time / update_time 可用时才有意义
                     if sample_time is not None and update_time is not None:
-                        # 采样耗时分解为：拉取到本地buffer的耗时 + 从本地buffer随机采样的耗时
                         total_sample_time = pull_time + sample_time
+                        total_train_log_time = total_sample_time + compute_time if compute_time is not None else total_sample_time
+                        print(f"  训练耗时: {total_train_log_time:.2f}秒")
+                        
+                        # 行6+: 采样与前向/反向耗时的细分
                         print(
                             f"  采样耗时总计: {total_sample_time:.2f}秒 "
                             f"(拉取到本地buffer: {pull_time:.2f}秒, 从本地buffer随机采样: {sample_time:.2f}秒)"
                         )
-
                         # compute_time 是模型参数更新（前向+反向+优化）的总时间
                         print(f"  前向/反向(网络更新)耗时: {compute_time:.2f}秒")
+                    else:
+                        # 回退：若无法细分采样/更新耗时，则退回到总墙钟时间
+                        print(f"  训练耗时: {total_train_time:.2f}秒")
                     
                     # 增加共享训练次数计数器
                     if hasattr(model_manager, 'training_count_ref') and model_manager.training_count_ref is not None:
@@ -1359,7 +1415,6 @@ class ParallelMultiEnvTrainer:
                  num_envs=4,
                  batch_size=40,
                  training_iterations=200,
-                 state_dim=25,
                  base_state_dim=25,
                  state_history_steps=0,
                  action_dim=2,
@@ -1384,12 +1439,17 @@ class ParallelMultiEnvTrainer:
                  target_reached_delta=0.3,
                  collision_delta=0.25,
                  world_size=15,
+                 goals_per_map=4,
                  obs_min_dist=2,
                  obs_num=20,
                  costmap_resolution=0.3,
                  obstacle_size=0.3,
                  obs_distribution_mode='uniform',
+                 max_acceleration=5.0,
+                 max_deceleration=-5.0,
                  region_select_bias=1.0,
+                 enable_weight_consistency_check=False,
+                 use_float64_for_buffer=False,
                  is_code_debug=False,
                  max_training_count=1000,
                  stats_window_size=100,
@@ -1411,6 +1471,10 @@ class ParallelMultiEnvTrainer:
                  obs_penalty_threshold=1.0,
                  obs_penalty_base=-10.0,
                  obs_penalty_power=2.0,
+                 min_obs_penalty_threshold=0.5,
+                 obs_penalty_high_weight=1.0,
+                 obs_penalty_low_weight=0.4,
+                 obs_penalty_middle_ratio=0.4,
                  # 时间控制参数
                  step_sleep_time=0.1,
                  sim_time=0.1,
@@ -1432,7 +1496,8 @@ class ParallelMultiEnvTrainer:
                  yawrate_oscillation_penalty_base=-1.0,
                  config_path=None,
                  best_model_eligibility_threshold=5.0,
-                 best_model_eligibility_ratio=0.8):
+                 best_model_eligibility_ratio=0.8,
+                 discount_factor=0.99):
         
         def _to_bool(val, default=True):
             if isinstance(val, bool):
@@ -1452,6 +1517,7 @@ class ParallelMultiEnvTrainer:
         self.max_steps = max_steps
         self.max_steps_min = max_steps_min
         self.save_every = save_every
+        self.buffer_size = buffer_size
         self.report_every = report_every
         self.max_velocity = max_velocity
         self.neglect_angle = neglect_angle
@@ -1463,12 +1529,17 @@ class ParallelMultiEnvTrainer:
         self.target_reached_delta = target_reached_delta
         self.collision_delta = collision_delta
         self.world_size = world_size
+        self.goals_per_map = goals_per_map
         self.obs_min_dist = obs_min_dist
         self.obs_num = obs_num
         self.costmap_resolution = costmap_resolution
         self.obstacle_size = obstacle_size
         self.obs_distribution_mode = obs_distribution_mode
+        self.max_acceleration = max_acceleration
+        self.max_deceleration = max_deceleration
         self.region_select_bias = region_select_bias
+        self.enable_weight_consistency_check = enable_weight_consistency_check
+        self.use_float64_for_buffer = use_float64_for_buffer
         self.is_code_debug = is_code_debug
         self.max_training_count = max_training_count
         self.critic_loss_threshold = critic_loss_threshold
@@ -1498,6 +1569,10 @@ class ParallelMultiEnvTrainer:
         self.obs_penalty_threshold = obs_penalty_threshold
         self.obs_penalty_base = obs_penalty_base
         self.obs_penalty_power = obs_penalty_power
+        self.min_obs_penalty_threshold = min_obs_penalty_threshold
+        self.obs_penalty_high_weight = obs_penalty_high_weight
+        self.obs_penalty_low_weight = obs_penalty_low_weight
+        self.obs_penalty_middle_ratio = obs_penalty_middle_ratio
         # 终点距离惩罚参数
         self.target_distance_penalty_base = target_distance_penalty_base
         # 震荡惩罚参数
@@ -1552,10 +1627,7 @@ class ParallelMultiEnvTrainer:
         
         # 计算实际使用的state_dim，确保与历史state拼接保持一致
         state_dim_effective = self.base_state_dim * (1 + self.state_history_steps) if self.state_history_steps > 0 else self.base_state_dim
-        if state_dim != state_dim_effective:
-            print(f"警告: 传入state_dim={state_dim} 与计算值 {state_dim_effective} 不一致，已使用 {state_dim_effective}")
-        else:
-            print(f"使用state_dim={state_dim_effective}")
+        print(f"使用state_dim={state_dim_effective} (base_state_dim={self.base_state_dim}, state_history_steps={self.state_history_steps})")
 
         print(f"初始化SAC模型...")
         if self.load_model:
@@ -1621,10 +1693,10 @@ class ParallelMultiEnvTrainer:
 
         weight_log("主进程模型结构概览:")
         # actor 结构: trunk 输出为 action_dim 的均值和对数方差，故输出维度为 2 * action_dim
-        actor_layers = _describe_mlp(state_dim, hidden_dim, 2 * action_dim, hidden_depth)
+        actor_layers = _describe_mlp(state_dim_effective, hidden_dim, 2 * action_dim, hidden_depth)
         weight_log(f"  主进程 actor 层级神经元: " + " -> ".join([f"{name}:{size}" for name, size in actor_layers]))
         # critic 结构: Q1/Q2 两个 MLP，输入为 state_dim+action_dim，输出为标量 Q 值
-        critic_layers = _describe_mlp(state_dim + action_dim, hidden_dim, 1, hidden_depth)
+        critic_layers = _describe_mlp(state_dim_effective + action_dim, hidden_dim, 1, hidden_depth)
         weight_log(f"  主进程 critic(Q1/Q2) 层级神经元: " + " -> ".join([f"{name}:{size}" for name, size in critic_layers]))
         for key, value in self.model.state_dict().items():
             if isinstance(value, dict):
@@ -1680,6 +1752,7 @@ class ParallelMultiEnvTrainer:
             'batch_size': batch_size,
             'training_iterations': training_iterations,
             'save_every': save_every,
+            'buffer_size': buffer_size,
             'report_every': report_every,
             'model_save_dir': self.model_save_dir,
             'max_velocity': max_velocity,
@@ -1692,12 +1765,17 @@ class ParallelMultiEnvTrainer:
             'target_reached_delta': target_reached_delta,
             'collision_delta': collision_delta,
             'world_size': world_size,
+            'goals_per_map': goals_per_map,
             'obs_min_dist': obs_min_dist,
             'obs_num': obs_num,
             'costmap_resolution': costmap_resolution,
             'obstacle_size': obstacle_size,
             'obs_distribution_mode': obs_distribution_mode,
+            'max_acceleration': max_acceleration,
+            'max_deceleration': max_deceleration,
             'is_code_debug': is_code_debug,
+            'enable_weight_consistency_check': enable_weight_consistency_check,
+            'use_float64_for_buffer': use_float64_for_buffer,
             'max_training_count': max_training_count,
             'critic_loss_threshold': critic_loss_threshold,
             'actor_update_frequency': actor_update_frequency,
@@ -1725,6 +1803,10 @@ class ParallelMultiEnvTrainer:
             'obs_penalty_threshold': obs_penalty_threshold,
             'obs_penalty_base': obs_penalty_base,
             'obs_penalty_power': obs_penalty_power,
+            'min_obs_penalty_threshold': min_obs_penalty_threshold,
+            'obs_penalty_high_weight': obs_penalty_high_weight,
+            'obs_penalty_low_weight': obs_penalty_low_weight,
+            'obs_penalty_middle_ratio': obs_penalty_middle_ratio,
             # 终点距离惩罚参数
             'target_distance_penalty_base': self.target_distance_penalty_base,
             # 震荡惩罚参数
@@ -2003,7 +2085,6 @@ def parse_args():
     parser.add_argument('--loss_window_size', type=int, default=None, help='训练损失窗口大小（覆盖配置文件）')
     
     # 算法参数（命令行参数可以覆盖配置文件）
-    parser.add_argument('--state_dim', type=int, default=None, help='状态维度（覆盖配置文件）')
     parser.add_argument('--action_dim', type=int, default=None, help='动作维度（覆盖配置文件）')
     parser.add_argument('--max_action', type=float, default=None, help='最大动作值（覆盖配置文件）')
     
@@ -2080,6 +2161,8 @@ def main():
     
     # 机器人和环境参数
     max_velocity = args.max_velocity if hasattr(args, 'max_velocity') and args.max_velocity is not None else config.get('max_velocity', 1.0)
+    max_acceleration = config.get('max_acceleration', 5.0)
+    max_deceleration = config.get('max_deceleration', -5.0)
     neglect_angle = args.neglect_angle if hasattr(args, 'neglect_angle') and args.neglect_angle is not None else config.get('neglect_angle', 0)
     max_yawrate = args.max_yawrate if hasattr(args, 'max_yawrate') and args.max_yawrate is not None else config.get('max_yawrate', 20.0)
     scan_range = args.scan_range if hasattr(args, 'scan_range') and args.scan_range is not None else config.get('scan_range', 5)
@@ -2089,6 +2172,7 @@ def main():
     target_reached_delta = args.target_reached_delta if hasattr(args, 'target_reached_delta') and args.target_reached_delta is not None else config.get('target_reached_delta', 0.3)
     collision_delta = args.collision_delta if hasattr(args, 'collision_delta') and args.collision_delta is not None else config.get('collision_delta', 0.25)
     world_size = args.world_size if hasattr(args, 'world_size') and args.world_size is not None else config.get('world_size', 15)
+    goals_per_map = config.get('goals_per_map', 4)
     obs_min_dist = args.obs_min_dist if hasattr(args, 'obs_min_dist') and args.obs_min_dist is not None else config.get('obs_min_dist', 2)
     obs_num = args.obs_num if hasattr(args, 'obs_num') and args.obs_num is not None else config.get('obs_num', 20)
     costmap_resolution = config.get('costmap_resolution', 0.3)
@@ -2099,16 +2183,13 @@ def main():
     base_state_dim = config.get('base_state_dim', 25)
     state_history_steps = config.get('state_history_steps', 0)
     
-    # 动态计算state_dim
+    # 动态计算state_dim（始终从base_state_dim计算，不再从配置文件读取state_dim）
     if state_history_steps > 0:
-        calculated_state_dim = base_state_dim * (1 + state_history_steps)
-        print(f"启用历史state模式: base_state_dim={base_state_dim}, state_history_steps={state_history_steps}, 最终state_dim={calculated_state_dim}")
+        state_dim = base_state_dim * (1 + state_history_steps)
+        print(f"启用历史state模式: base_state_dim={base_state_dim}, state_history_steps={state_history_steps}, 最终state_dim={state_dim}")
     else:
-        calculated_state_dim = base_state_dim
-        print(f"未启用历史state模式: state_dim={calculated_state_dim}")
-    
-    # 命令行参数可以覆盖配置文件中的state_dim（如果指定了）
-    state_dim = args.state_dim if hasattr(args, 'state_dim') and args.state_dim is not None else calculated_state_dim
+        state_dim = base_state_dim
+        print(f"未启用历史state模式: state_dim={state_dim}")
     
     action_dim = args.action_dim if hasattr(args, 'action_dim') and args.action_dim is not None else config.get('action_dim', 2)
     max_action = args.max_action if hasattr(args, 'max_action') and args.max_action is not None else config.get('max_action', 1.0)
@@ -2159,6 +2240,10 @@ def main():
     obs_penalty_threshold = args.obs_penalty_threshold if hasattr(args, 'obs_penalty_threshold') and args.obs_penalty_threshold is not None else config.get('obs_penalty_threshold', 1.0)
     obs_penalty_base = args.obs_penalty_base if hasattr(args, 'obs_penalty_base') and args.obs_penalty_base is not None else config.get('obs_penalty_base', -10.0)
     obs_penalty_power = args.obs_penalty_power if hasattr(args, 'obs_penalty_power') and args.obs_penalty_power is not None else config.get('obs_penalty_power', 2.0)
+    min_obs_penalty_threshold = config.get('min_obs_penalty_threshold', 0.5)
+    obs_penalty_high_weight = config.get('obs_penalty_high_weight', 1.0)
+    obs_penalty_low_weight = config.get('obs_penalty_low_weight', 0.4)
+    obs_penalty_middle_ratio = config.get('obs_penalty_middle_ratio', 0.4)
     
     # 终点距离惩罚参数
     target_distance_penalty_base = config.get('target_distance_penalty_base', -1.0)
@@ -2188,6 +2273,12 @@ def main():
     best_model_eligibility_threshold = config.get('best_model_eligibility_threshold', 5.0)
     best_model_eligibility_ratio = config.get('best_model_eligibility_ratio', 0.8)
     
+    # 多环境训练参数（仅来自配置文件）
+    enable_weight_consistency_check = parse_bool(config.get('enable_weight_consistency_check', False), False)
+    
+    # 缓冲区参数（仅来自配置文件）
+    use_float64_for_buffer = parse_bool(config.get('use_float64_for_buffer', False), False)
+    
     # 创建训练器
     trainer = ParallelMultiEnvTrainer(
         num_envs=num_envs,
@@ -2209,14 +2300,18 @@ def main():
         target_reached_delta=target_reached_delta,
         collision_delta=collision_delta,
         world_size=world_size,
+        goals_per_map=goals_per_map,
         obs_min_dist=obs_min_dist,
         obs_num=obs_num,
         costmap_resolution=costmap_resolution,
         obstacle_size=obstacle_size,
         obs_distribution_mode=obs_distribution_mode,
+        max_acceleration=max_acceleration,
+        max_deceleration=max_deceleration,
         region_select_bias=region_select_bias,
+        enable_weight_consistency_check=enable_weight_consistency_check,
+        use_float64_for_buffer=use_float64_for_buffer,
         is_code_debug=is_code_debug,
-        state_dim=state_dim,
         base_state_dim=base_state_dim,  # 添加base_state_dim参数
         state_history_steps=state_history_steps,  # 添加state_history_steps参数
         action_dim=action_dim,
@@ -2248,6 +2343,10 @@ def main():
         obs_penalty_threshold=obs_penalty_threshold,
         obs_penalty_base=obs_penalty_base,
         obs_penalty_power=obs_penalty_power,
+        min_obs_penalty_threshold=min_obs_penalty_threshold,
+        obs_penalty_high_weight=obs_penalty_high_weight,
+        obs_penalty_low_weight=obs_penalty_low_weight,
+        obs_penalty_middle_ratio=obs_penalty_middle_ratio,
         target_distance_penalty_base=target_distance_penalty_base,
         linear_acceleration_oscillation_penalty_base=linear_acceleration_oscillation_penalty_base,
         yawrate_oscillation_penalty_base=yawrate_oscillation_penalty_base,
@@ -2261,6 +2360,7 @@ def main():
         config_path=actual_config_path,
         best_model_eligibility_threshold=best_model_eligibility_threshold,
         best_model_eligibility_ratio=best_model_eligibility_ratio,
+        discount_factor=discount_factor,
     )
     
     # 开始训练

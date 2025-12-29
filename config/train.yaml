@@ -14,7 +14,7 @@ enable_weight_consistency_check: false  # 是否进行模型权重一致性详�
 # ==================== 多环境路径参数 ====================
 model_save_dir: "/home/zc/DRL-Robot-Navigation-ROS2/models/multi_env_train_model"  # 模型保存基目录，训练启动时会在此下创建时间戳子目录保存模型与config_used.yaml
 multi_env_log_dir: "/home/zc/DRL-Robot-Navigation-ROS2/log/multi_env_training"  # 日志保存基目录，启动训练时会在此下按时间戳创建子目录存放日志
-gazebo_wait_time: 15  # Gazebo启动等待时间（秒）
+gazebo_wait_time: 5  # Gazebo启动等待时间（秒）
 
 # ============================================================================
 # 第二层：仅单环境使用参数
@@ -46,11 +46,11 @@ max_velocity: 2.5  # 最大速度
 max_acceleration: 5.0  # 最大加速度（m/s^2）
 max_deceleration: -5.0  # 最大减速度（m/s^2，建议填负值表示减速幅度，代码会取绝对值）
 max_yawrate: 30.0  # 最大偏航率（单位：度/秒）
-neglect_angle: 30  # 前方视野左右两边忽略的角度（单位：度）
+neglect_angle: 0  # 前方视野左右两边忽略的角度（单位：度）
 scan_range: 10  # 激光雷达扫描范围
 max_target_dist: 6.0  # 最大目标距离
 init_target_distance: 1.0  # 初始目标距离
-target_dist_increase: 0.001  # 目标距离增加量
+target_dist_increase: 0.01  # 目标距离增加量
 target_reached_delta: 0.4  # 判定到达目标的阈值
 collision_delta: 0.3  # 碰撞检测阈值
 world_size: 10  # 世界尺寸（米）
@@ -65,8 +65,7 @@ region_select_bias: 0.6  # 选择"最大连通区域"的概率：1.0=总是选�
 # ==================== 模型参数 ====================
 action_dim: 2  # 模型产生的动作数量
 max_action: 1  # 输出动作的最大绝对值
-state_dim: 25  # 神经网络输入值的数量（状态输入向量长度）；注意：当state_history_steps > 0时，此值会被动态计算为 base_state_dim * (1 + state_history_steps)
-base_state_dim: 25  # 基础状态维度（单个时间步的状态向量长度），用于计算包含历史信息时的最终state_dim
+base_state_dim: 25  # 基础状态维度（单个时间步的状态向量长度），用于计算包含历史信息时的最终state_dim；最终state_dim = base_state_dim * (1 + state_history_steps) 当state_history_steps > 0时，否则 state_dim = base_state_dim
 state_history_steps: 100  # 包含历史多少step的state信息（例如：2表示包含当前step和之前2个step，共3个step的状态信息）；当state_history_steps > 0时启用历史state，state_dim = base_state_dim * (1 + state_history_steps)；当为0时不启用历史state，state_dim = base_state_dim
 device: "auto"  # 设备选择："auto"自动选择，"cuda"使用GPU，"cpu"使用CPU
 hidden_dim: 1024  # 神经网络隐藏层维度
@@ -75,24 +74,24 @@ hidden_depth: 3  # 神经网络隐藏层深度
 # ==================== 训练算法参数 ====================
 discount_factor: 0.99  # 折扣因子（gamma），用于计算未来奖励的折扣，范围通常在0.9-0.999之间
 actor_update_frequency: 1  # Actor网络更新频率（每多少次critic更新后更新一次actor）
-critic_target_update_frequency: 4  # Critic目标网络更新频率（每多少次critic更新后更新一次目标网络）
+critic_target_update_frequency: 2  # Critic目标网络更新频率（每多少次critic更新后更新一次目标网络）
 
 # ==================== 共享训练参数 ====================
-training_iterations: 100  # 每次执行训练时，用随机抽取的批次数据更新模型training_iterations次
-batch_size: 4096  # 从经验池中随机抽取batch_size条经验作为一个训练批次来对模型参数进行更新
-buffer_size: 50000  # 重放缓冲区大小
+training_iterations: 200  # 每次执行训练时，用随机抽取的批次数据更新模型training_iterations次
+batch_size: 128  # 从经验池中随机抽取batch_size条经验作为一个训练批次来对模型参数进行更新
+buffer_size: 100000  # 重放缓冲区大小
 use_float64_for_buffer: true  # 是否在本地重放缓冲区中使用float64存储（true则使用float64；false则使用float32，推荐false以提升速度并降低内存占用）
 load_model: false  # 是否加载已有模型
 max_steps: 200  # 限制每个回合最多执行max_steps步操作，超过会强制结束回合（当max_steps_ratio=0时使用此固定值）
 max_steps_ratio: 0  # 每Episode最大步数比例 (max_steps = target_distance * max_steps_ratio)，当为0时使用固定值max_steps
 max_steps_min: 50  # 每Episode最小步数 (max_steps不会小于此值)
 save_every: 50  # 每多少次训练后保存一次模型
-report_every: 100  # 每多少个episode/回合打印一次统计报告
-max_training_count: 30000  # 最大训练次数（训练完成后自动停止）
+report_every: 1000  # 每多少个episode/回合打印一次统计报告
+max_training_count: 10000  # 最大训练次数（训练完成后自动停止）
 loss_window_size: 10  # 训练损失窗口大小，用于计算平均Critic损失
 total_eval_episodes: 1000  # 评估阶段采集的episode数量；>0时训练结束后进入评估并在完成后输出统一统计报告
 best_model_eligibility_threshold: 5.0  # 最好模型评比资格检查的target_dist阈值（过去report_every个episode中，至少best_model_eligibility_ratio比例的target_dist需大于等于此值才有资格）
-best_model_eligibility_ratio: 0.8  # 最好模型评比资格检查的比例阈值（0-1之间，例如0.8表示80%）
+best_model_eligibility_ratio: 0.9  # 最好模型评比资格检查的比例阈值（0-1之间，例如0.8表示80%）
 
 # ==================== 共享路径参数 ====================
 load_path: "/home/zc/DRL-Robot-Navigation-ROS2/models/multi_env_train_model/20251224_181328"  # 模型加载路径
