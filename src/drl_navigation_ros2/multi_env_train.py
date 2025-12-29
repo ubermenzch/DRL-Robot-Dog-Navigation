@@ -1074,13 +1074,15 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 if episode_discarded_due_to_nan_inf:
                     continue
                 
-                # 修复风险A：如果是因为timeout退出（步数达到上限且未发生goal/collision），将最后一个transition的done改为True
-                # 注意：如果同时达到max_steps和goal/collision，terminal已经是True，episode_ending会正确判断为Goal/Collision，无需修复
-                # 这避免了训练时bootstrap错误（time-limit bug）
+                # 修复风险A：如果是因为timeout退出（步数达到上限且未发生goal/collision），将最后一个transition的done改为False
+                # 注意：
+                # 1. timeout时episode确实会结束（退出内层循环，开启新的episode）
+                # 2. 但是done标志必须为False，这样在模型更新时会对后续回报的期望进行估计（bootstrap），而不是只使用即时回报
+                # 3. 如果同时达到max_steps和goal/collision，terminal已经是True，episode_ending会正确判断为Goal/Collision，无需修复
                 if episode_steps >= max_steps and not terminal and len(experiences) > 0:
-                    # 将最后一个transition的done标志改为True
+                    # 将最后一个transition的done标志改为False，确保训练时bootstrap下一个状态的价值估计
                     last_exp = experiences[-1]
-                    experiences[-1] = (last_exp[0], last_exp[1], last_exp[2], True, last_exp[4])
+                    experiences[-1] = (last_exp[0], last_exp[1], last_exp[2], False, last_exp[4])
                 
                 # 判断episode结束原因
                 if goal:
