@@ -143,11 +143,12 @@ class PhysicsClient(Node):
 class SetModelStateClient(Node):
     def __init__(self, env_id=0):
         super().__init__(f"set_entity_state_client_env_{env_id}")
+        self.env_id = env_id  # 保存环境ID用于日志输出
         self.get_logger().set_level(SEVERITY)
         self.client = self.create_client(SetEntityState, "/gazebo/set_entity_state")
         #print("SetModelStateClient::create_client Done")
         while not self.client.wait_for_service(timeout_sec=1.0):
-            print("SetModelStateClient::wait_for_service")
+            print(f"[ROS_env {self.env_id}] SetModelStateClient::wait_for_service")
             self.get_logger().info("Service not available, waiting again...")
         self.request = SetEntityState.Request()
 

@@ -16,7 +16,7 @@
 # 配置参数：
 # CRITIC_LOSS_THRESHOLD=50.0   # 前X次平均损失<50时才更新模型
 # AVG_LOSS_WINDOW_SIZE=5       # 计算前5次训练的平均损失
-
+export ROS_LOCALHOST_ONLY=1
 DEBUG_MODE=false
 DAEMON_MODE=false
 # CLI 参数解析
@@ -32,7 +32,7 @@ done
 # ===================== 环境变量初始化 =====================
 # 清除可能干扰的外部环境变量，确保脚本自包含，不依赖外部环境
 # 注意：这些unset操作不会影响外部终端，因为脚本在子shell中运行
-unset DISPLAY ROS_DOMAIN_ID CUDA_VISIBLE_DEVICES GAZEBO_IP GAZEBO_MASTER_URI GAZEBO_GUI 2>/dev/null || true
+unset DISPLAY ROS_DOMAIN_ID CUDA_VISIBLE_DEVICES GAZEBO_IP GAZEBO_MASTER_URI GAZEBO_GUI RMW_IMPLEMENTATION FASTRTPS_DEFAULT_PROFILES_FILE RMW_FASTRTPS_USE_QOS_FROM_XML 2>/dev/null || true
 unset GAZEBO_MODEL_PATH GAZEBO_RESOURCE_PATH TURTLEBOT3_MODEL 2>/dev/null || true
 unset ROS_PACKAGE_PATH AMENT_PREFIX_PATH COLCON_PREFIX_PATH 2>/dev/null || true
 
@@ -111,12 +111,16 @@ sudo mount -o remount,size=2G /dev/shm
 echo "共享内存重新挂载完成"
 
 echo "清理ROS2共享内存段..."
-sudo rm -f /dev/shm/fastrtps_*
+# 清理所有 FastRTPS 共享内存段（包括不同 ROS_DOMAIN_ID 的段）
+sudo rm -f /dev/shm/fastrtps_* 2>/dev/null || true
+# 也清理可能的 DDS 相关共享内存
+sudo rm -f /dev/shm/cyclonedds_* 2>/dev/null || true
 echo "共享内存清理完成"
 echo
 
 # ===================== 从YAML读取配置（为缺省做兜底） =====================
 NUM_ENVS=$(parse_yaml_value "num_envs")
+START_ROS_DOMAIN_ID=$(parse_yaml_value "start_ros_domain_id")
 MAX_STEPS_RATIO=$(parse_yaml_value "max_steps_ratio")
 MAX_STEPS_MIN=$(parse_yaml_value "max_steps_min")
 BATCH_SIZE=$(parse_yaml_value "batch_size")
@@ -163,9 +167,12 @@ LOAD_MODEL=$(parse_yaml_value "load_model")
 
 LOG_DIR=$(parse_yaml_value "multi_env_log_dir")
 GAZEBO_WAIT_TIME=$(parse_yaml_value "gazebo_wait_time")
+GAZEBO_START_INTERVAL=$(parse_yaml_value "gazebo_start_interval")
+GAZEBO_BASE_PORT=$(parse_yaml_value "gazebo_base_port")
 
 # 兜底默认值（若YAML缺项）
 NUM_ENVS=${NUM_ENVS:-4}
+START_ROS_DOMAIN_ID=${START_ROS_DOMAIN_ID:-1}
 MAX_STEPS_RATIO=${MAX_STEPS_RATIO:-100}
 MAX_STEPS_MIN=${MAX_STEPS_MIN:-50}
 BATCH_SIZE=${BATCH_SIZE:-40}
@@ -212,7 +219,13 @@ LOG_DIR_BASE=${LOG_DIR:-"$SCRIPT_DIR/log/multi_env_training"}
 LOG_DIR="$LOG_DIR_BASE/train_${TIMESTAMP}"
 LOGFILE="$LOG_DIR/train_${TIMESTAMP}.log"
 MODEL_SAVE_DIR_TS="${MODEL_SAVE_DIR%/}/$TIMESTAMP"
-GAZEBO_WAIT_TIME=${GAZEBO_WAIT_TIME:-15}
+# 确保 Gazebo 相关参数有有效值（处理空字符串的情况）
+GAZEBO_WAIT_TIME=${GAZEBO_WAIT_TIME:-30}
+[ -z "$GAZEBO_WAIT_TIME" ] && GAZEBO_WAIT_TIME=30
+GAZEBO_START_INTERVAL=${GAZEBO_START_INTERVAL:-3}
+[ -z "$GAZEBO_START_INTERVAL" ] && GAZEBO_START_INTERVAL=3
+GAZEBO_BASE_PORT=${GAZEBO_BASE_PORT:-11345}
+[ -z "$GAZEBO_BASE_PORT" ] && GAZEBO_BASE_PORT=11345
 export TRAINING_TIMESTAMP="$TIMESTAMP"
 
 # 定义临时目录（使用项目目录）
@@ -449,6 +462,10 @@ init_logging() {
     echo "运行模式: 后台模式（多环境并行训练）" >> "$LOGFILE"
     echo "配置参数:" >> "$LOGFILE"
     echo "  - 并行环境数: $NUM_ENVS" >> "$LOGFILE"
+    echo "  - 起始ROS_DOMAIN_ID: $START_ROS_DOMAIN_ID" >> "$LOGFILE"
+    echo "  - Gazebo端口基址: $GAZEBO_BASE_PORT (环境i使用端口 $((GAZEBO_BASE_PORT + 0))-$((GAZEBO_BASE_PORT + NUM_ENVS - 1)))" >> "$LOGFILE"
+    echo "  - Gazebo启动间隔: $GAZEBO_START_INTERVAL 秒（每个环境启动后等待时间）" >> "$LOGFILE"
+    echo "  - Gazebo等待时间: $GAZEBO_WAIT_TIME 秒（所有环境启动后的总等待时间）" >> "$LOGFILE"
     echo "  - 批次大小: $BATCH_SIZE" >> "$LOGFILE"
     echo "  - 每轮训练迭代次数: $TRAINING_ITERATIONS" >> "$LOGFILE"
     echo "  - 每Episode最大步数比例: $MAX_STEPS_RATIO (max_steps = target_distance * max_steps_ratio)" >> "$LOGFILE"
@@ -500,10 +517,34 @@ start_gazebo_instances() {
 # 环境 $i 的独立启动脚本
 
 # 清除可能干扰的环境变量（确保脚本自包含）
-unset DISPLAY ROS_DOMAIN_ID 2>/dev/null || true
+unset DISPLAY ROS_DOMAIN_ID RMW_IMPLEMENTATION FASTRTPS_DEFAULT_PROFILES_FILE RMW_FASTRTPS_USE_QOS_FROM_XML 2>/dev/null || true
 
 # 设置环境变量
-export ROS_DOMAIN_ID=$((i + 1))
+export ROS_DOMAIN_ID=$((START_ROS_DOMAIN_ID + i))
+
+# ===================== 跨容器 DDS 隔离配置 =====================
+# 问题：当多个 Docker 容器同时运行时，DDS/FastRTPS 会通过多播发现其他容器中的参与者
+# 这会导致跨容器的类型注册冲突：[PARTICIPANT Error] Type with the same name already exists
+#
+# 解决方案：
+# 1. 禁用 XML QoS 配置文件（避免共享配置导致的冲突）
+export RMW_FASTRTPS_USE_QOS_FROM_XML=0
+# 不设置 FASTRTPS_DEFAULT_PROFILES_FILE（让它使用默认值，而不是空字符串）
+# 如果设置为空字符串，FastRTPS 仍会尝试加载，导致 "filename empty" 错误
+unset FASTRTPS_DEFAULT_PROFILES_FILE 2>/dev/null || true
+#
+# 2. 重要：确保每个容器使用完全不同的 ROS_DOMAIN_ID 范围！
+#    例如：容器1使用 start_ros_domain_id=1，容器2使用 start_ros_domain_id=100
+#    这样可以避免跨容器的 DDS 发现冲突
+#
+# 3. FastRTPS 会根据 ROS_DOMAIN_ID 自动创建独立的共享内存段
+#    格式：/dev/shm/fastrtps_<participant_guid>
+#    每个 ROS_DOMAIN_ID 会生成不同的 participant_guid
+#
+# 4. 如果问题仍然存在，可以考虑：
+#    - 使用不同的 Docker 网络隔离容器
+#    - 切换到 Cyclone DDS（对多容器场景更友好）
+#    - 减少每个容器的环境数量
 
 # 设置ROS2环境
 source /opt/ros/foxy/setup.bash
@@ -538,7 +579,7 @@ export TURTLEBOT3_MODEL=waffle
 
 # 强制无头模式环境变量
 export GAZEBO_IP=127.0.0.1
-export GAZEBO_MASTER_URI=http://127.0.0.1:$((11345 + i)) # 不同的gazebo环境绑定不同的端口
+export GAZEBO_MASTER_URI=http://127.0.0.1:$((GAZEBO_BASE_PORT + i)) # 不同的gazebo环境绑定不同的端口
     export GAZEBO_GUI=0
 
 # 启动无头 Gazebo
@@ -552,8 +593,11 @@ EOF
         GAZEBO_PID=$!
         GAZEBO_PIDS+=($GAZEBO_PID)
         
-            log_output "启动无头Gazebo环境 $i (ROS_DOMAIN_ID=$((i + 1)), PID: $GAZEBO_PID)"
-        sleep 2
+            log_output "启动无头Gazebo环境 $i (ROS_DOMAIN_ID=$((START_ROS_DOMAIN_ID + i)), GAZEBO_PORT=$((GAZEBO_BASE_PORT + i)), PID: $GAZEBO_PID)"
+        # 确保 GAZEBO_START_INTERVAL 有有效值（处理空字符串的情况）
+        local sleep_time=${GAZEBO_START_INTERVAL:-3}
+        [ -z "$sleep_time" ] && sleep_time=3
+        sleep $sleep_time
     done
     
     # 等待所有Gazebo环境初始化
@@ -567,12 +611,12 @@ EOF
     # 检查ROS服务是否可用
     log_output "检查ROS服务状态..."
     for i in $(seq 0 $((NUM_ENVS-1))); do
-        log_output "检查环境 $i (ROS_DOMAIN_ID=$((i + 1))) 的ROS服务..."
+        log_output "检查环境 $i (ROS_DOMAIN_ID=$((START_ROS_DOMAIN_ID + i))) 的ROS服务..."
         
         # 创建临时检查脚本，确保在正确的ROS域中检查
         cat > "$TMP_DIR/check_services_env_${i}.sh" << EOF
 #!/bin/bash
-export ROS_DOMAIN_ID=$((i + 1))
+export ROS_DOMAIN_ID=$((START_ROS_DOMAIN_ID + i))
 source /opt/ros/foxy/setup.bash
 source $SCRIPT_DIR/install/setup.bash
 
@@ -737,7 +781,7 @@ if [ "$DAEMON_MODE" = true ]; then
     # 使用nohup在后台运行，重定向所有输出到日志文件
     # 导出必要的变量和函数到子shell
     export LOGFILE
-    export NUM_ENVS MAX_STEPS_RATIO MAX_STEPS_MIN BATCH_SIZE TRAINING_ITERATIONS
+    export NUM_ENVS START_ROS_DOMAIN_ID MAX_STEPS_RATIO MAX_STEPS_MIN BATCH_SIZE TRAINING_ITERATIONS
     export SAVE_EVERY BUFFER_SIZE REPORT_EVERY STATS_WINDOW_SIZE
     export MAX_TRAINING_COUNT CRITIC_LOSS_THRESHOLD ACTOR_UPDATE_FREQUENCY
     export CRITIC_TARGET_UPDATE_FREQUENCY HIDDEN_DIM HIDDEN_DEPTH AVG_LOSS_WINDOW_SIZE
@@ -746,7 +790,7 @@ if [ "$DAEMON_MODE" = true ]; then
     export TARGET_DIST_INCREASE TARGET_REACHED_DELTA COLLISION_DELTA WORLD_SIZE
     export OBS_MIN_DIST OBS_NUM ACTION_DIM MAX_ACTION STATE_DIM IS_CODE_DEBUG
     export MODEL_SAVE_DIR MODEL_LOAD_DIR LOAD_MODEL LOG_DIR
-    export GAZEBO_WAIT_TIME TRAINING_TIMESTAMP
+    export GAZEBO_WAIT_TIME GAZEBO_BASE_PORT TRAINING_TIMESTAMP
     export SCRIPT_DIR TIMESTAMP LOG_DIR_BASE MODEL_SAVE_DIR_TS DAEMON_MODE
     export TMP_DIR PID_FILE CONFIG_FILE
     # 外层直接重定向到日志，避免 nohup 提示输出到 nohup.out

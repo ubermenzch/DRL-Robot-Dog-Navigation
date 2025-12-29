@@ -691,7 +691,9 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
         print(f"环境 {env_id} 开始初始化...")
         
         # 设置正确的ROS域ID，确保与对应的Gazebo环境通信
-        ros_domain_id = env_id + 1  # 环境0使用域1，环境1使用域2...
+        # 从配置文件中读取起始ROS_DOMAIN_ID，如果没有则默认为1（向后兼容）
+        start_ros_domain_id = config.get('start_ros_domain_id', 1)
+        ros_domain_id = start_ros_domain_id + env_id  # 环境0使用start_ros_domain_id，环境1使用start_ros_domain_id+1...
         os.environ['ROS_DOMAIN_ID'] = str(ros_domain_id)
         print(f"环境 {env_id} 设置ROS_DOMAIN_ID={ros_domain_id}")
         
@@ -1617,6 +1619,16 @@ class ParallelMultiEnvTrainer:
         self.load_model = load_model
         self.config_path = config_path
         
+        # 加载配置文件以读取 start_ros_domain_id
+        if self.config_path and Path(self.config_path).exists():
+            try:
+                with open(self.config_path, 'r') as f:
+                    self._loaded_config = yaml.safe_load(f) or {}
+            except Exception as e:
+                print(f"警告: 读取配置文件失败: {e}")
+                self._loaded_config = {}
+        else:
+            self._loaded_config = {}
         
         # 创建目录
         self._setup_directories()
@@ -1826,6 +1838,8 @@ class ParallelMultiEnvTrainer:
             # 最好模型评比资格检查参数
             'best_model_eligibility_threshold': self.best_model_eligibility_threshold,
             'best_model_eligibility_ratio': self.best_model_eligibility_ratio,
+            # ROS域ID参数（从配置文件读取）
+            'start_ros_domain_id': self._loaded_config.get('start_ros_domain_id', 1),
         }
         
         # 初始化信息在 shell 脚本中已经完整打印过，这里只打一行简要提示，避免重复参数配置

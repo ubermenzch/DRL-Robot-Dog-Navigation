@@ -144,8 +144,40 @@ stop_process_list "gazebo" "Gazebo进程"
 
 # ===================== 5. 停止ROS2和RViz进程 =====================
 echo "[5/8] 停止ROS2和RViz进程..."
+
+# 停止 robot_state_publisher 进程（这些进程可能独立运行）
+pids=$(pgrep -f "robot_state_publisher" 2>/dev/null)
+if [ -n "$pids" ]; then
+    echo "  停止 robot_state_publisher 进程..."
+    for pid in $pids; do
+        kill -TERM $pid 2>/dev/null
+    done
+    sleep 2
+    pids=$(pgrep -f "robot_state_publisher" 2>/dev/null)
+    if [ -n "$pids" ]; then
+        for pid in $pids; do
+            kill -9 $pid 2>/dev/null
+        done
+        PROCESSES_STOPPED=1
+    fi
+fi
+
+# 停止其他 ROS2 相关进程
 stop_process_list "ros2" "ROS2进程"
 stop_process_list "rviz2" "RViz2进程"
+
+# 停止所有其他 ROS2 节点进程（通过进程名匹配）
+ROS2_NODES=("joint_state_publisher" "gazebo_ros_state" "turtlebot3_diff_drive" "turtlebot3_imu" "turtlebot3_joint_state")
+for node in "${ROS2_NODES[@]}"; do
+    pids=$(pgrep -f "$node" 2>/dev/null)
+    if [ -n "$pids" ]; then
+        echo "  停止 $node 进程..."
+        pkill -TERM -f "$node" 2>/dev/null
+        sleep 1
+        pkill -9 -f "$node" 2>/dev/null
+        PROCESSES_STOPPED=1
+    fi
+done
 
 # ===================== 6. 停止环境控制脚本进程 =====================
 echo "[6/8] 停止环境控制脚本进程..."
@@ -200,13 +232,29 @@ fi
 # ===================== 最终确认 =====================
 echo ""
 echo "最终检查残留进程..."
-PATTERN="train\.py|multi_env_train\.py|evaluate\.py|gazebo|ros2 launch turtlebot3_gazebo|start_gazebo_env|start_gazebo_eval_env|start_training\.sh|start_multi_env_training\.sh|start_evaluation\.sh"
+PATTERN="train\.py|multi_env_train\.py|evaluate\.py|gazebo|ros2 launch turtlebot3_gazebo|start_gazebo_env|start_gazebo_eval_env|start_training\.sh|start_multi_env_training\.sh|start_evaluation\.sh|robot_state_publisher|joint_state_publisher|gazebo_ros_state|turtlebot3_diff_drive|turtlebot3_imu|turtlebot3_joint_state"
 REMAINING=$(pgrep -f "$PATTERN" 2>/dev/null | wc -l)
 
 if [ "$REMAINING" -gt 0 ]; then
     echo "  ⚠ 警告: 仍有 $REMAINING 个相关进程在运行"
     echo "  进程列表:"
-    pgrep -f "$PATTERN" 2>/dev/null | xargs ps -p 2>/dev/null || true
+    pgrep -f "$PATTERN" 2>/dev/null | while read pid; do
+        ps -p "$pid" -o pid,user,cmd --no-headers 2>/dev/null || true
+    done
+    echo ""
+    echo "  尝试强制清理残留进程..."
+    # 再次尝试清理
+    pkill -9 -f "robot_state_publisher" 2>/dev/null || true
+    pkill -9 -f "joint_state_publisher" 2>/dev/null || true
+    pkill -9 -f "gazebo_ros_state" 2>/dev/null || true
+    pkill -9 -f "turtlebot3_" 2>/dev/null || true
+    sleep 1
+    REMAINING_AFTER=$(pgrep -f "$PATTERN" 2>/dev/null | wc -l)
+    if [ "$REMAINING_AFTER" -gt 0 ]; then
+        echo "  ⚠ 仍有 $REMAINING_AFTER 个进程无法清理，可能需要手动处理"
+    else
+        echo "  ✓ 残留进程已清理"
+    fi
 else
     echo "  ✓ 确认: 没有残留进程"
 fi

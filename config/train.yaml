@@ -7,14 +7,17 @@
 # ============================================================================
 
 # ==================== 多环境训练参数 ====================
-num_envs: 48  # 并行环境数量(一个环境要占用800m左右的显存)
+num_envs: 32  # 并行环境数量(一个环境要占用800m左右的显存)
+start_ros_domain_id: 101  # 起始ROS_DOMAIN_ID，多环境从此ID开始递增（例如：start_ros_domain_id=1, num_envs=4，则使用ROS_DOMAIN_ID 1,2,3,4）；重要：多个Docker容器同时运行时，每个容器必须使用不同的起始值以避免DDS类型冲突（例如：容器1用1，容器2用100）
 critic_loss_threshold: -1.0  # critic损失阈值，前X次平均损失小于此值时才更新模型；若值为-1，则无视该阈值，环境控制进程均使用最新模型
 enable_weight_consistency_check: false  # 是否进行模型权重一致性详细检验（为true时会在每个环境初始化时打印大量权重信息）
 
 # ==================== 多环境路径参数 ====================
 model_save_dir: "/home/zc/DRL-Robot-Navigation-ROS2/models/multi_env_train_model"  # 模型保存基目录，训练启动时会在此下创建时间戳子目录保存模型与config_used.yaml
 multi_env_log_dir: "/home/zc/DRL-Robot-Navigation-ROS2/log/multi_env_training"  # 日志保存基目录，启动训练时会在此下按时间戳创建子目录存放日志
-gazebo_wait_time: 5  # Gazebo启动等待时间（秒）
+gazebo_wait_time: 10  # Gazebo启动等待时间（秒），建议设置为30-60秒以确保所有环境完全启动；对于32个环境，建议至少30秒
+gazebo_start_interval: 5  # 每个Gazebo环境启动后的间隔时间（秒），建议设置为3-5秒以避免资源竞争；对于32个环境，建议至少3秒
+gazebo_base_port: 11345  # Gazebo Master端口基址，每个环境使用 gazebo_base_port + env_id 作为端口（例如：gazebo_base_port=11345, env_id=0 则使用端口11345）；不同容器应设置不同的基址以避免端口冲突
 
 # ============================================================================
 # 第二层：仅单环境使用参数
