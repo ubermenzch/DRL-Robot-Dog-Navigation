@@ -228,7 +228,7 @@ def main(args=None):
     
     hidden_dim = config.get('hidden_dim', 1024)
     hidden_depth = config.get('hidden_depth', 2)
-    discount_factor = config.get('discount_factor', 0.99)  # 折扣因子
+    discount_factor = config.get('discount_factor', 0.99)  # 折扣因子（gamma），从配置文件 train.yaml 读取，统一用于计算总回报和所有 Reward Detail 分项的折扣回报
     actor_update_frequency = config.get('actor_update_frequency', 1)
     critic_target_update_frequency = config.get('critic_target_update_frequency', 2)
     
@@ -311,6 +311,7 @@ def main(args=None):
     angle_base_penalty = config.get('angle_penalty_base', config.get('angle_base_penalty', 0.0))
     base_linear_penalty = config.get('linear_penalty_base', config.get('base_linear_penalty', -1.0))
     yawrate_penalty_base = config.get('yawrate_penalty_base', 0.0)
+    reward_scale = config.get('reward_scale', 1.0)  # 奖励缩放因子，用于控制每步整体奖励大小
     enable_obs_penalty = config.get('enable_obs_penalty', True)
     enable_yawrate_penalty = config.get('enable_yawrate_penalty', True)
     enable_angle_penalty = config.get('enable_angle_penalty', True)
@@ -410,6 +411,7 @@ def main(args=None):
         eval_sleep_time=eval_sleep_time,
         reset_step_count=reset_step_count,
         goals_per_map=goals_per_map,
+        reward_scale=reward_scale,  # 奖励缩放因子
     )  # instantiate ROS environment
     print("ROS Environment Initialized")
 
@@ -452,6 +454,29 @@ def main(args=None):
     total_reward = 0.0
     episode_reward = 0.0
     episode_steps_count = 0  # 记录当前episode的步数
+    gamma_power = 1.0  # 折扣因子幂次（γ^t），用于统一计算总回报和所有 Reward Detail 分项的折扣回报
+    
+    # 折扣后的奖励分项统计（用于 Reward Detail 显示，使用与总回报相同的折扣因子）
+    discounted_goal_sum = 0.0
+    discounted_collision_sum = 0.0
+    discounted_obs_sum = 0.0
+    discounted_yawrate_sum = 0.0
+    discounted_angle_sum = 0.0
+    discounted_linear_sum = 0.0
+    discounted_target_distance_sum = 0.0
+    discounted_linear_acc_osc_sum = 0.0
+    discounted_yawrate_osc_sum = 0.0
+    
+    # 上一 step 的奖励分项累计值（用于计算增量）
+    prev_goal_sum = 0.0
+    prev_collision_sum = 0.0
+    prev_obs_sum = 0.0
+    prev_yawrate_sum = 0.0
+    prev_angle_sum = 0.0
+    prev_linear_sum = 0.0
+    prev_target_distance_sum = 0.0
+    prev_linear_acc_osc_sum = 0.0
+    prev_yawrate_osc_sum = 0.0
     
     # 初始化历史state队列（仅在启用历史state时使用）
     state_history = deque(maxlen=state_history_steps) if state_history_steps > 0 else None
@@ -487,7 +512,45 @@ def main(args=None):
         latest_scan, distance, cos, sin, collision, goal, last_action, reward = ros.step(
             lin_velocity=ros_action[0], ang_velocity=ros_action[1]
         )  # get data from the environment
-        episode_reward += reward
+        
+        # 计算折扣回报：G_0 = r_0 + γ*r_1 + γ²*r_2 + ...（使用统一的 discount_factor）
+        episode_reward += gamma_power * reward
+        
+        # 计算各奖励分项的折扣累加值（用于 Reward Detail 显示，使用与总回报相同的 discount_factor）
+        # 获取当前 step 的累计值
+        curr_goal_sum = getattr(ros, "episode_goal_reward", 0.0)
+        curr_collision_sum = getattr(ros, "episode_collision_penalty", 0.0)
+        curr_obs_sum = getattr(ros, "episode_obs_penalty", 0.0)
+        curr_yawrate_sum = getattr(ros, "episode_yawrate_penalty", 0.0)
+        curr_angle_sum = getattr(ros, "episode_angle_penalty", 0.0)
+        curr_linear_sum = getattr(ros, "episode_linear_penalty", 0.0)
+        curr_target_distance_sum = getattr(ros, "episode_target_distance_penalty", 0.0)
+        curr_linear_acc_osc_sum = getattr(ros, "episode_linear_acceleration_oscillation_penalty", 0.0)
+        curr_yawrate_osc_sum = getattr(ros, "episode_yawrate_oscillation_penalty", 0.0)
+        
+        # 计算增量并应用折扣因子
+        discounted_goal_sum += gamma_power * (curr_goal_sum - prev_goal_sum)
+        discounted_collision_sum += gamma_power * (curr_collision_sum - prev_collision_sum)
+        discounted_obs_sum += gamma_power * (curr_obs_sum - prev_obs_sum)
+        discounted_yawrate_sum += gamma_power * (curr_yawrate_sum - prev_yawrate_sum)
+        discounted_angle_sum += gamma_power * (curr_angle_sum - prev_angle_sum)
+        discounted_linear_sum += gamma_power * (curr_linear_sum - prev_linear_sum)
+        discounted_target_distance_sum += gamma_power * (curr_target_distance_sum - prev_target_distance_sum)
+        discounted_linear_acc_osc_sum += gamma_power * (curr_linear_acc_osc_sum - prev_linear_acc_osc_sum)
+        discounted_yawrate_osc_sum += gamma_power * (curr_yawrate_osc_sum - prev_yawrate_osc_sum)
+        
+        # 更新上一 step 的累计值
+        prev_goal_sum = curr_goal_sum
+        prev_collision_sum = curr_collision_sum
+        prev_obs_sum = curr_obs_sum
+        prev_yawrate_sum = curr_yawrate_sum
+        prev_angle_sum = curr_angle_sum
+        prev_linear_sum = curr_linear_sum
+        prev_target_distance_sum = curr_target_distance_sum
+        prev_linear_acc_osc_sum = curr_linear_acc_osc_sum
+        prev_yawrate_osc_sum = curr_yawrate_osc_sum
+        
+        gamma_power *= discount_factor  # 更新折扣因子幂次
         episode_steps_count += 1
         #print("cos:", cos, "sin:", sin, "distance:", distance)
         next_state, terminal = model.prepare_state(
@@ -527,6 +590,27 @@ def main(args=None):
                 latest_scan, distance, cos, sin, collision, goal, last_action, reward = ros.reset()
                 episode_reward = 0.0
                 episode_steps_count = 0
+                gamma_power = 1.0  # 重置折扣因子幂次
+                # 重置折扣后的奖励分项统计
+                discounted_goal_sum = 0.0
+                discounted_collision_sum = 0.0
+                discounted_obs_sum = 0.0
+                discounted_yawrate_sum = 0.0
+                discounted_angle_sum = 0.0
+                discounted_linear_sum = 0.0
+                discounted_target_distance_sum = 0.0
+                discounted_linear_acc_osc_sum = 0.0
+                discounted_yawrate_osc_sum = 0.0
+                # 重置上一 step 的累计值
+                prev_goal_sum = 0.0
+                prev_collision_sum = 0.0
+                prev_obs_sum = 0.0
+                prev_yawrate_sum = 0.0
+                prev_angle_sum = 0.0
+                prev_linear_sum = 0.0
+                prev_target_distance_sum = 0.0
+                prev_linear_acc_osc_sum = 0.0
+                prev_yawrate_osc_sum = 0.0
                 steps = 0
                 # 重置历史state队列
                 if state_history is not None:
@@ -553,13 +637,13 @@ def main(args=None):
                     episode_ending= "Timeout"
                 
                 current_time = datetime.now()
-                # 从环境中读取本 episode 各奖励项累计值
-                goal_sum = getattr(ros, "episode_goal_reward", 0.0)
-                collision_sum = getattr(ros, "episode_collision_penalty", 0.0)
-                obs_sum = getattr(ros, "episode_obs_penalty", 0.0)
-                yaw_sum = getattr(ros, "episode_yawrate_penalty", 0.0)
-                angle_sum = getattr(ros, "episode_angle_penalty", 0.0)
-                linear_sum = getattr(ros, "episode_linear_penalty", 0.0)
+                # 使用折扣后的奖励分项值（已在每个 step 中计算）
+                goal_sum = discounted_goal_sum
+                collision_sum = discounted_collision_sum
+                obs_sum = discounted_obs_sum
+                yaw_sum = discounted_yawrate_sum
+                angle_sum = discounted_angle_sum
+                linear_sum = discounted_linear_sum
 
                 # 读取所有奖惩开关状态（确保所有开启的项都被打印）
                 enable_obs = getattr(ros, "enable_obs_penalty", False)
@@ -585,13 +669,13 @@ def main(args=None):
                 if enable_linear:
                     detail_parts.append(f"linear={linear_sum:.2f}")
                 if enable_target_distance:
-                    target_distance_sum = getattr(ros, "episode_target_distance_penalty", 0.0)
+                    target_distance_sum = discounted_target_distance_sum
                     detail_parts.append(f"target_distance={target_distance_sum:.2f}")
                 if enable_linear_acc_osc:
-                    linear_acc_osc_sum = getattr(ros, "episode_linear_acceleration_oscillation_penalty", 0.0)
+                    linear_acc_osc_sum = discounted_linear_acc_osc_sum
                     detail_parts.append(f"linear_acc_osc={linear_acc_osc_sum:.2f}")
                 if enable_yawrate_osc:
-                    yawrate_osc_sum = getattr(ros, "episode_yawrate_oscillation_penalty", 0.0)
+                    yawrate_osc_sum = discounted_yawrate_osc_sum
                     detail_parts.append(f"yawrate_osc={yawrate_osc_sum:.2f}")
 
                 # 将结束状态放在最前面，然后是总reward，最后是其他奖励分项
@@ -615,6 +699,27 @@ def main(args=None):
                 
                 episode_reward = 0.0
                 episode_steps_count = 0
+                gamma_power = 1.0  # 重置折扣因子幂次
+                # 重置折扣后的奖励分项统计
+                discounted_goal_sum = 0.0
+                discounted_collision_sum = 0.0
+                discounted_obs_sum = 0.0
+                discounted_yawrate_sum = 0.0
+                discounted_angle_sum = 0.0
+                discounted_linear_sum = 0.0
+                discounted_target_distance_sum = 0.0
+                discounted_linear_acc_osc_sum = 0.0
+                discounted_yawrate_osc_sum = 0.0
+                # 重置上一 step 的累计值
+                prev_goal_sum = 0.0
+                prev_collision_sum = 0.0
+                prev_obs_sum = 0.0
+                prev_yawrate_sum = 0.0
+                prev_angle_sum = 0.0
+                prev_linear_sum = 0.0
+                prev_target_distance_sum = 0.0
+                prev_linear_acc_osc_sum = 0.0
+                prev_yawrate_osc_sum = 0.0
                 episode += 1
                 
                 # 每report_every个episode打印统计报告

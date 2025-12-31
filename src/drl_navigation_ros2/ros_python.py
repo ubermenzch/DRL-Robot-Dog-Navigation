@@ -69,6 +69,8 @@ class ROS_env:
         # 震荡惩罚参数
         linear_acceleration_oscillation_penalty_base=-1.0,  # 线速度加速度震荡惩罚基础系数（负值表示惩罚）
         yawrate_oscillation_penalty_base=-1.0,  # 角速度震荡惩罚基础系数（负值表示惩罚）
+        # 奖励归一化参数
+        reward_scale=1.0,  # 奖励缩放因子，用于控制每步整体奖励大小；1.0表示不缩放，0.1表示缩小10倍，10.0表示放大10倍
         # 连通区域选择参数
         region_select_bias=1.0,  # 连通区域选择概率：1.0=总是选最大连通区域；0.8=80%概率选最大区域，否则从其余区域随机选
         # 时间控制参数
@@ -158,6 +160,8 @@ class ROS_env:
         # 震荡惩罚参数
         self.linear_acceleration_oscillation_penalty_base = linear_acceleration_oscillation_penalty_base
         self.yawrate_oscillation_penalty_base = yawrate_oscillation_penalty_base
+        # 奖励归一化参数
+        self.reward_scale = reward_scale
         # 记录上一step的线速度、角速度和加速度（用于震荡惩罚计算）
         self.prev_linear_velocity = None
         self.prev_angular_velocity = None
@@ -998,16 +1002,18 @@ class ROS_env:
         if goal:
             # return base_goal_reward*np.exp(-0.01 * self.step_count)  # 指数型奖励，用时越少奖励越高
             #print(f"Reached goal in {self.step_count} steps.")
-            # 记录本 episode 的目标奖励
+            # 记录本 episode 的目标奖励（记录原始值，不应用缩放）
             self.episode_goal_reward += self.goal_reward
-            return self.goal_reward
+            # 返回归一化后的奖励
+            return self.goal_reward * self.reward_scale
         elif collision:
             # 碰撞惩罚：每个 episode 只计算一次
             if not getattr(self, "_has_collision_this_episode", False):
-                # 第一次碰撞：记录惩罚
+                # 第一次碰撞：记录惩罚（记录原始值，不应用缩放）
                 self._has_collision_this_episode = True
                 self.episode_collision_penalty += self.collision_penalty_base
-                return self.collision_penalty_base
+                # 返回归一化后的惩罚
+                return self.collision_penalty_base * self.reward_scale
             else:
                 # 同一 episode 后续再次检测到 collision，不再重复扣分
                 return 0.0
@@ -1111,7 +1117,7 @@ class ROS_env:
                     # 计算当前距离与初始距离的比值
                     distance_ratio = distance_clipped / max(self.initial_target_distance, 1.0)
                     # 限制distance_ratio的最大值，防止数值溢出（最大比值设为100）
-                    distance_ratio = min(distance_ratio, 2.0)
+                    distance_ratio = min(distance_ratio, 1.0)
                     # 惩罚 = base * 距离比值（距离越远，比值越大，惩罚越大）
                     target_distance_penalty = self.target_distance_penalty_base * distance_ratio
                     # 最终检查：确保惩罚值是有限数值，防止NaN和inf
@@ -1197,7 +1203,9 @@ class ROS_env:
                     parts.append(f"yawrate_osc_penalty:{yawrate_oscillation_penalty:.4f}")
                 print(" | ".join(parts))
             
-            return yawrate_penalty + obs_penalty + angle_penalty + linear_penalty + target_distance_penalty + linear_acceleration_oscillation_penalty + yawrate_oscillation_penalty
+            # 计算所有惩罚项的总和，然后应用归一化
+            total_penalty = yawrate_penalty + obs_penalty + angle_penalty + linear_penalty + target_distance_penalty + linear_acceleration_oscillation_penalty + yawrate_oscillation_penalty
+            return total_penalty * self.reward_scale
 
     @staticmethod
     def cossin(vec1, vec2):

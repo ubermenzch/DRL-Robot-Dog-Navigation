@@ -460,14 +460,15 @@ class GlobalStatistics:
             
             return episode_number
     
-    def get_statistics(self, use_window=True, eligibility_threshold=None, eligibility_ratio=None, report_every=None):
+    def get_statistics(self, use_window=True, eligibility_threshold=None, eligibility_ratio=None, report_every=None, max_target_dist=None):
         """获取统计信息
         
         Args:
             use_window: 是否使用滑动窗口统计
-            eligibility_threshold: 最好模型评比资格检查的target_dist阈值（过去report_every个episode中，至少eligibility_ratio比例的target_dist需大于等于此值才有资格）
+            eligibility_threshold: 最好模型评比资格检查的阈值偏移量（过去report_every个episode中，至少eligibility_ratio比例的target_dist需大于等于max_target_dist-eligibility_threshold才有资格）
             eligibility_ratio: 最好模型评比资格检查的比例阈值（0-1之间，例如0.8表示80%）
             report_every: 报告间隔，用于检查最好模型评比资格
+            max_target_dist: 最大目标距离，用于计算资格检查的实际阈值
         """
         with self.lock:
             total_episodes_value = self.total_episodes.value
@@ -483,20 +484,22 @@ class GlobalStatistics:
                 }
             
             # 检查是否有资格参与最好模型评比
-            # 资格条件：过去 report_every 个 episode 中，至少 eligibility_ratio 比例的期望目标距离（ros_env.target_dist）大于等于 eligibility_threshold
+            # 资格条件：过去 report_every 个 episode 中，至少 eligibility_ratio 比例的期望目标距离（ros_env.target_dist）大于等于 (max_target_dist - eligibility_threshold)
             # 注意：这里比较的是生成episode时的期望目标距离（Target Distance），而非实际生成的终点距离（actual），实际距离有随机性
             eligible_for_best_model = False
-            if eligibility_threshold is not None and eligibility_ratio is not None and report_every is not None and len(self.recent_episodes) >= report_every:
+            if eligibility_threshold is not None and eligibility_ratio is not None and report_every is not None and max_target_dist is not None and len(self.recent_episodes) >= report_every:
+                # 计算实际阈值：max_target_dist - eligibility_threshold
+                actual_threshold = max_target_dist - eligibility_threshold
                 recent_eps = list(self.recent_episodes)[-report_every:]
                 match_count = 0
                 total_count = 0
                 for ep in recent_eps:
                     td = ep.get('target_dist', None)
                     total_count += 1
-                    # 检查是否大于等于 eligibility_threshold
-                    if td is not None and td >= eligibility_threshold:
+                    # 检查是否大于等于实际阈值 (max_target_dist - eligibility_threshold)
+                    if td is not None and td >= actual_threshold:
                         match_count += 1
-                # 至少eligibility_ratio比例的episode的target_dist大于等于threshold才有资格
+                # 至少eligibility_ratio比例的episode的target_dist大于等于实际阈值才有资格
                 eligible_for_best_model = (match_count / total_count) >= eligibility_ratio if total_count > 0 else False
             
             if use_window and len(self.recent_episodes) > 0:
@@ -750,6 +753,8 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             reward_debug=config.get('reward_debug', False),
             # 连通区域选择偏好
             region_select_bias=config.get('region_select_bias', 1.0),
+            # 奖励归一化参数
+            reward_scale=config.get('reward_scale', 1.0),  # 奖励缩放因子，用于控制每步整体奖励大小
         )
         print(f"环境 {env_id} ROS环境初始化完成")
         
@@ -910,6 +915,7 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
         
         total_steps = 0
         last_training_count = 0  # 记录上次更新时的训练次数
+        discount_factor = config.get('discount_factor', 0.99)  # 折扣因子（gamma），从配置文件 train.yaml 读取，统一用于计算总回报和所有 Reward Detail 分项的折扣回报
 
         # 历史state设置（长度为 state_history_steps + 1，用于存储 [s_{t-k}, ..., s_t]）
         # 即使 state_history_steps 为 0，也保持长度为 1，此时等价于只使用当前 state
@@ -998,8 +1004,32 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 
                 episode_reward = 0
                 episode_steps = 0
+                gamma_power = 1.0  # 折扣因子幂次（γ^t），用于统一计算总回报和所有 Reward Detail 分项的折扣回报
                 experiences = []
                 episode_discarded_due_to_nan_inf = False  # 标记是否因NaN/Inf而丢弃episode
+                
+                # 折扣后的奖励分项统计（用于 Reward Detail 显示，使用与总回报相同的折扣因子）
+                discounted_goal_sum = 0.0
+                discounted_collision_sum = 0.0
+                discounted_obs_sum = 0.0
+                discounted_yawrate_sum = 0.0
+                discounted_angle_sum = 0.0
+                discounted_linear_sum = 0.0
+                discounted_target_distance_sum = 0.0
+                discounted_linear_acc_osc_sum = 0.0
+                discounted_yawrate_osc_sum = 0.0
+                
+                # 上一 step 的奖励分项累计值（用于计算增量）
+                prev_goal_sum = 0.0
+                prev_collision_sum = 0.0
+                prev_obs_sum = 0.0
+                prev_yawrate_sum = 0.0
+                prev_angle_sum = 0.0
+                prev_linear_sum = 0.0
+                prev_target_distance_sum = 0.0
+                prev_linear_acc_osc_sum = 0.0
+                prev_yawrate_osc_sum = 0.0
+                
                 # 清空并用 s0 填满历史队列（state_history_steps+1 个 s0）
                 state_history.clear()
                 for _ in range(state_history_steps + 1):
@@ -1052,7 +1082,44 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                         terminal = True  # 设置terminal为True以退出内层循环
                         break
                     
-                    episode_reward += reward
+                    # 计算折扣回报：G_0 = r_0 + γ*r_1 + γ²*r_2 + ...（使用统一的 discount_factor）
+                    episode_reward += gamma_power * reward
+                    
+                    # 计算各奖励分项的折扣累加值（用于 Reward Detail 显示，使用与总回报相同的 discount_factor）
+                    # 获取当前 step 的累计值
+                    curr_goal_sum = getattr(ros_env, "episode_goal_reward", 0.0)
+                    curr_collision_sum = getattr(ros_env, "episode_collision_penalty", 0.0)
+                    curr_obs_sum = getattr(ros_env, "episode_obs_penalty", 0.0)
+                    curr_yawrate_sum = getattr(ros_env, "episode_yawrate_penalty", 0.0)
+                    curr_angle_sum = getattr(ros_env, "episode_angle_penalty", 0.0)
+                    curr_linear_sum = getattr(ros_env, "episode_linear_penalty", 0.0)
+                    curr_target_distance_sum = getattr(ros_env, "episode_target_distance_penalty", 0.0)
+                    curr_linear_acc_osc_sum = getattr(ros_env, "episode_linear_acceleration_oscillation_penalty", 0.0)
+                    curr_yawrate_osc_sum = getattr(ros_env, "episode_yawrate_oscillation_penalty", 0.0)
+                    
+                    # 计算增量并应用折扣因子
+                    discounted_goal_sum += gamma_power * (curr_goal_sum - prev_goal_sum)
+                    discounted_collision_sum += gamma_power * (curr_collision_sum - prev_collision_sum)
+                    discounted_obs_sum += gamma_power * (curr_obs_sum - prev_obs_sum)
+                    discounted_yawrate_sum += gamma_power * (curr_yawrate_sum - prev_yawrate_sum)
+                    discounted_angle_sum += gamma_power * (curr_angle_sum - prev_angle_sum)
+                    discounted_linear_sum += gamma_power * (curr_linear_sum - prev_linear_sum)
+                    discounted_target_distance_sum += gamma_power * (curr_target_distance_sum - prev_target_distance_sum)
+                    discounted_linear_acc_osc_sum += gamma_power * (curr_linear_acc_osc_sum - prev_linear_acc_osc_sum)
+                    discounted_yawrate_osc_sum += gamma_power * (curr_yawrate_osc_sum - prev_yawrate_osc_sum)
+                    
+                    # 更新上一 step 的累计值
+                    prev_goal_sum = curr_goal_sum
+                    prev_collision_sum = curr_collision_sum
+                    prev_obs_sum = curr_obs_sum
+                    prev_yawrate_sum = curr_yawrate_sum
+                    prev_angle_sum = curr_angle_sum
+                    prev_linear_sum = curr_linear_sum
+                    prev_target_distance_sum = curr_target_distance_sum
+                    prev_linear_acc_osc_sum = curr_linear_acc_osc_sum
+                    prev_yawrate_osc_sum = curr_yawrate_osc_sum
+                    
+                    gamma_power *= discount_factor  # 更新折扣因子幂次
                     episode_steps += 1
                     total_steps += 1
                     
@@ -1158,16 +1225,16 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 current_time = datetime.now()
                 
                 
-                # 读取本 episode 奖励分项（所有开启的项都要打印，保持与单环境一致的明细格式）
-                goal_sum = getattr(ros_env, "episode_goal_reward", 0.0)
-                collision_sum = getattr(ros_env, "episode_collision_penalty", 0.0)
-                obs_sum = getattr(ros_env, "episode_obs_penalty", 0.0)
-                yaw_sum = getattr(ros_env, "episode_yawrate_penalty", 0.0)
-                angle_sum = getattr(ros_env, "episode_angle_penalty", 0.0)
-                linear_sum = getattr(ros_env, "episode_linear_penalty", 0.0)
-                target_distance_sum = getattr(ros_env, "episode_target_distance_penalty", 0.0)
-                linear_acc_osc_sum = getattr(ros_env, "episode_linear_acceleration_oscillation_penalty", 0.0)
-                yawrate_osc_sum = getattr(ros_env, "episode_yawrate_oscillation_penalty", 0.0)
+                # 使用折扣后的奖励分项值（已在每个 step 中计算）
+                goal_sum = discounted_goal_sum
+                collision_sum = discounted_collision_sum
+                obs_sum = discounted_obs_sum
+                yaw_sum = discounted_yawrate_sum
+                angle_sum = discounted_angle_sum
+                linear_sum = discounted_linear_sum
+                target_distance_sum = discounted_target_distance_sum
+                linear_acc_osc_sum = discounted_linear_acc_osc_sum
+                yawrate_osc_sum = discounted_yawrate_osc_sum
 
                 # 读取所有奖惩开关状态（确保所有开启的项都被打印）
                 enable_obs = getattr(ros_env, "enable_obs_penalty", False)
@@ -1273,9 +1340,20 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                             pulled_any = True
                 pull_time = time.time() - pull_start_time if pulled_any else 0.0
                 
-                # 检查本地缓冲区是否有数据进行训练（即使不足batch_size也进行训练）
+                # 检查本地缓冲区是否有足够数据进行训练
                 buffer_size = local_buffer.size()
-                if buffer_size > 0:
+                batch_size = config['batch_size']
+                min_batches_for_training = config.get('min_batches_for_training', 0)  # 从配置文件读取，默认值为0（只要有数据就训练）
+                
+                # 如果 min_batches_for_training 为 0，则只要有数据就训练；否则需要至少 min_batches_for_training * batch_size 个样本
+                if min_batches_for_training == 0:
+                    can_train = buffer_size > 0
+                    min_buffer_size_for_training = 1  # 用于日志显示
+                else:
+                    min_buffer_size_for_training = min_batches_for_training * batch_size
+                    can_train = buffer_size >= min_buffer_size_for_training
+                
+                if can_train:
                     
                     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     print(
@@ -1288,7 +1366,6 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                     # 直接使用主进程的模型进行训练
                     # sample_batch方法内部会获取lock，训练完成后自动释放
                     training_iterations = config.get('training_iterations', 200)
-                    batch_size = config['batch_size']
                     samples_this_training = training_iterations * batch_size  # 本次训练抽样的样本数
                     
                     start_time = time.time()
@@ -1393,6 +1470,15 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                         model_manager.model.save(filename="SAC", directory=config['model_save_dir'])
                 else:
                     # 缓冲区数据不足，短暂等待
+                    # 只在第一次或每100次检查时打印一次，避免日志过多
+                    if not hasattr(training_thread, '_wait_count'):
+                        training_thread._wait_count = 0
+                    training_thread._wait_count += 1
+                    if training_thread._wait_count == 1 or training_thread._wait_count % 100 == 0:
+                        if min_batches_for_training == 0:
+                            print(f"训练线程等待数据收集：当前缓冲区大小={buffer_size}，需要至少1个样本")
+                        else:
+                            print(f"训练线程等待数据收集：当前缓冲区大小={buffer_size}，需要至少{min_buffer_size_for_training}（{min_batches_for_training}个batch）")
                     time.sleep(0.1)
                 
                 # 短暂休息，避免过度占用CPU
@@ -1767,6 +1853,7 @@ class ParallelMultiEnvTrainer:
             'training_iterations': training_iterations,
             'save_every': save_every,
             'buffer_size': buffer_size,
+            'min_batches_for_training': self._loaded_config.get('min_batches_for_training', 0),  # 训练开始前需要收集的最少batch数量（0表示只要有数据就训练）
             'report_every': report_every,
             'model_save_dir': self.model_save_dir,
             'max_velocity': max_velocity,
@@ -1876,8 +1963,10 @@ class ParallelMultiEnvTrainer:
                 current_episode = stats.get('total_episodes', 0)
                 eligibility_threshold = self.config.get('best_model_eligibility_threshold', 5.0)
                 eligibility_ratio = self.config.get('best_model_eligibility_ratio', 0.8)
+                max_target_dist = self.config.get('max_target_dist', 15.0)
+                actual_threshold = max_target_dist - eligibility_threshold
                 if current_episode - self.last_eligibility_warning_episode >= 100:
-                    print(f"[最好模型检查] Episode {current_episode}: 当前统计不具备参与最好模型评比的资格（资格要求：过去report_every个episode中至少{eligibility_ratio*100:.0f}%的target_dist >= {eligibility_threshold}）")
+                    print(f"[最好模型检查] Episode {current_episode}: 当前统计不具备参与最好模型评比的资格（资格要求：过去report_every个episode中至少{eligibility_ratio*100:.0f}%的target_dist >= {actual_threshold:.2f} (max_target_dist={max_target_dist:.2f} - threshold={eligibility_threshold:.2f})）")
                     self.last_eligibility_warning_episode = current_episode
                 return
             
@@ -1967,7 +2056,8 @@ class ParallelMultiEnvTrainer:
                     stats = self.global_stats.get_statistics(
                         eligibility_threshold=self.config.get('best_model_eligibility_threshold', 5.0),
                         eligibility_ratio=self.config.get('best_model_eligibility_ratio', 0.8),
-                        report_every=self.config.get('report_every', 20)
+                        report_every=self.config.get('report_every', 20),
+                        max_target_dist=self.config.get('max_target_dist', 15.0)
                     )
                     # 打印统计报告（主进程统一负责）
                     _print_statistics_report(stats)
@@ -2216,7 +2306,7 @@ def main():
     hidden_depth = args.hidden_depth if hasattr(args, 'hidden_depth') and args.hidden_depth is not None else config.get('hidden_depth', 3)
     
     # 训练算法参数
-    discount_factor = config.get('discount_factor', 0.99)  # 折扣因子
+    discount_factor = config.get('discount_factor', 0.99)  # 折扣因子（gamma），从配置文件 train.yaml 读取，统一用于计算总回报和所有 Reward Detail 分项的折扣回报
     critic_loss_threshold = args.critic_loss_threshold if hasattr(args, 'critic_loss_threshold') and args.critic_loss_threshold is not None else config.get('critic_loss_threshold', 100.0)
     actor_update_frequency = args.actor_update_frequency if hasattr(args, 'actor_update_frequency') and args.actor_update_frequency is not None else config.get('actor_update_frequency', 1)
     critic_target_update_frequency = args.critic_target_update_frequency if hasattr(args, 'critic_target_update_frequency') and args.critic_target_update_frequency is not None else config.get('critic_target_update_frequency', 4)

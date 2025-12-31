@@ -7,7 +7,7 @@
 # ============================================================================
 
 # ==================== 多环境训练参数 ====================
-num_envs: 32  # 并行环境数量(一个环境要占用800m左右的显存)
+num_envs: 64  # 并行环境数量(一个环境要占用800m左右的显存)
 start_ros_domain_id: 1  # 起始ROS_DOMAIN_ID，多环境从此ID开始递增（例如：start_ros_domain_id=1, num_envs=4，则使用ROS_DOMAIN_ID 1,2,3,4）；重要：多个Docker容器同时运行时，每个容器必须使用不同的起始值以避免DDS类型冲突（例如：容器1用1，容器2用100）
 critic_loss_threshold: -1.0  # critic损失阈值，前X次平均损失小于此值时才更新模型；若值为-1，则无视该阈值，环境控制进程均使用最新模型
 enable_weight_consistency_check: false  # 是否进行模型权重一致性详细检验（为true时会在每个环境初始化时打印大量权重信息）
@@ -17,7 +17,7 @@ model_save_dir: "/home/zc/DRL-Robot-Navigation-ROS2/models/multi_env_train_model
 multi_env_log_dir: "/home/zc/DRL-Robot-Navigation-ROS2/log/multi_env_training"  # 日志保存基目录，启动训练时会在此下按时间戳创建子目录存放日志
 gazebo_wait_time: 10  # Gazebo启动等待时间（秒），建议设置为30-60秒以确保所有环境完全启动；对于32个环境，建议至少30秒
 gazebo_start_interval: 5  # 每个Gazebo环境启动后的间隔时间（秒），建议设置为3-5秒以避免资源竞争；对于32个环境，建议至少3秒
-gazebo_base_port: 11111  # Gazebo Master端口基址，每个环境使用 gazebo_base_port + env_id 作为端口（例如：gazebo_base_port=11345, env_id=0 则使用端口11345）；不同容器应设置不同的基址以避免端口冲突
+gazebo_base_port: 10001  # Gazebo Master端口基址，每个环境使用 gazebo_base_port + env_id 作为端口（例如：gazebo_base_port=11345, env_id=0 则使用端口11345）；不同容器应设置不同的基址以避免端口冲突
 
 # ============================================================================
 # 第二层：仅单环境使用参数
@@ -53,7 +53,7 @@ max_deceleration: -5.0  # 最大减速度（m/s^2，建议填负值表示减速�
 max_yawrate: 30.0  # 最大偏航率（单位：度/秒）
 neglect_angle: 0  # 前方视野左右两边忽略的角度（单位：度）
 scan_range: 10  # 激光雷达扫描范围
-max_target_dist: 3.0  # 最大目标距离
+max_target_dist: 6.0  # 最大目标距离
 init_target_distance: 1.0  # 初始目标距离
 target_dist_increase: 0.01  # 目标距离增加量
 target_reached_delta: 0.4  # 判定到达目标的阈值
@@ -61,7 +61,7 @@ collision_delta: 0.3  # 碰撞检测阈值
 world_size: 10  # 世界尺寸（米）
 goals_per_map: 4  # 每张地图的目标点数量（即一张地图可以用来产生多少个episode）；当机器人完成一个episode后，如果不达到此数量，则不重新生成地图（障碍物），只将机器人重置到最近的空格子中心并重新生成目标点；达到此数量后才重新生成新地图
 obs_min_dist: 1.0  # 障碍物圆心最小距离（米）
-obs_num: 0  # 障碍物数量
+obs_num: 25  # 障碍物数量
 obs_distribution_mode: "random"  # 障碍物生成方式："uniform"=均匀分布（默认），"random"=随机分布
 costmap_resolution: 1.0  # costmap 分辨率（米/格）
 obstacle_size: 1.0  # costmap 中障碍物等效边长（米，默认正方形）
@@ -73,18 +73,19 @@ max_action: 1  # 输出动作的最大绝对值
 base_state_dim: 25  # 基础状态维度（单个时间步的状态向量长度），用于计算包含历史信息时的最终state_dim；最终state_dim = base_state_dim * (1 + state_history_steps) 当state_history_steps > 0时，否则 state_dim = base_state_dim
 state_history_steps: 100  # 包含历史多少step的state信息（例如：2表示包含当前step和之前2个step，共3个step的状态信息）；当state_history_steps > 0时启用历史state，state_dim = base_state_dim * (1 + state_history_steps)；当为0时不启用历史state，state_dim = base_state_dim
 device: "auto"  # 设备选择："auto"自动选择，"cuda"使用GPU，"cpu"使用CPU
-hidden_dim: 1024  # 神经网络隐藏层维度
-hidden_depth: 3  # 神经网络隐藏层深度
+hidden_dim: 512  # 神经网络隐藏层维度
+hidden_depth: 2  # 神经网络隐藏层深度
 
 # ==================== 训练算法参数 ====================
-discount_factor: 0.99  # 折扣因子（gamma），用于计算未来奖励的折扣，范围通常在0.9-0.999之间
+discount_factor: 0.995  # 折扣因子（gamma），用于计算未来奖励的折扣，范围通常在0.9-0.999之间
 actor_update_frequency: 1  # Actor网络更新频率（每多少次critic更新后更新一次actor）
-critic_target_update_frequency: 2  # Critic目标网络更新频率（每多少次critic更新后更新一次目标网络）
+critic_target_update_frequency: 1  # Critic目标网络更新频率（每多少次critic更新后更新一次目标网络）
 
 # ==================== 共享训练参数 ====================
-training_iterations: 200  # 每次执行训练时，用随机抽取的批次数据更新模型training_iterations次
-batch_size: 1024  # 从经验池中随机抽取batch_size条经验作为一个训练批次来对模型参数进行更新
+training_iterations: 100  # 每次执行训练时，用随机抽取的批次数据更新模型training_iterations次
+batch_size: 32  # 从经验池中随机抽取batch_size条经验作为一个训练批次来对模型参数进行更新
 buffer_size: 100000  # 重放缓冲区大小
+min_batches_for_training: 1  # 训练开始前需要收集的最少batch数量（0表示只要有数据就训练；1表示需要至少1个batch的数据，即batch_size个样本；5表示需要至少5个batch的数据，即5*batch_size个样本）
 use_float64_for_buffer: true  # 是否在本地重放缓冲区中使用float64存储（true则使用float64；false则使用float32，推荐false以提升速度并降低内存占用）
 load_model: true  # 是否加载已有模型
 max_steps: 100  # 限制每个回合最多执行max_steps步操作，超过会强制结束回合（当max_steps_ratio=0时使用此固定值）
@@ -95,7 +96,7 @@ report_every: 1000  # 每多少个episode/回合打印一次统计报告
 max_training_count: 10000  # 最大训练次数（训练完成后自动停止）
 loss_window_size: 10  # 训练损失窗口大小，用于计算平均Critic损失
 total_eval_episodes: 1000  # 评估阶段采集的episode数量；>0时训练结束后进入评估并在完成后输出统一统计报告
-best_model_eligibility_threshold: 2.5  # 最好模型评比资格检查的target_dist阈值（过去report_every个episode中，至少best_model_eligibility_ratio比例的target_dist需大于等于此值才有资格）
+best_model_eligibility_threshold: 0.5  # 最好模型评比资格检查的阈值偏移量（过去report_every个episode中，至少best_model_eligibility_ratio比例的target_dist需大于等于max_target_dist-best_model_eligibility_threshold才有资格；例如max_target_dist=3.0，threshold=2.5，则要求target_dist>=0.5）
 best_model_eligibility_ratio: 0.95  # 最好模型评比资格检查的比例阈值（0-1之间，例如0.8表示80%）
 
 # ==================== 共享路径参数 ====================
@@ -112,10 +113,10 @@ enable_linear_acceleration_oscillation_penalty: false  # 是否启用线速度�
 enable_yawrate_oscillation_penalty: false  # 是否启用角速度震荡惩罚
 reward_debug: false  # 是否打印奖励/惩罚明细
 
-goal_reward: 150.0  # 到达目标的奖励
-collision_penalty_base: -150.0  # 碰撞惩罚系数（负值惩罚）
-angle_penalty_base: -0.2  # 角度偏差基础惩罚
-linear_penalty_base: -0.075  # 线速度基础惩罚
+goal_reward: 300.0  # 到达目标的奖励
+collision_penalty_base: -400.0  # 碰撞惩罚系数（负值惩罚）
+angle_penalty_base: -0.3  # 角度偏差基础惩罚
+linear_penalty_base: -0.3  # 线速度基础惩罚
 yawrate_penalty_base: -0.5  # 角速度惩罚系数（负值惩罚，0为无惩罚）
 
 # ==================== 障碍物距离惩罚参数 ====================
@@ -128,11 +129,14 @@ obs_penalty_low_weight: 0.4  # 两侧低权重区域惩罚权重
 obs_penalty_middle_ratio: 0.4  # 中间高权重区域比例（0-1）
 
 # ==================== 终点距离惩罚参数 ====================
-target_distance_penalty_base: -0.1  # 终点距离惩罚基础系数（负值表示惩罚）；惩罚 = base * (当前距离 / 初始距离)
+target_distance_penalty_base: -0.4  # 终点距离惩罚基础系数（负值表示惩罚）；惩罚 = base * (当前距离 / 初始距离)
 
 # ==================== 震荡惩罚参数 ====================
 linear_acceleration_oscillation_penalty_base: -1.0  # 线速度加速度震荡惩罚基础系数（负值表示惩罚）；当加速度符号改变时，惩罚 = base * |当前加速度 - 上一加速度|
 yawrate_oscillation_penalty_base: -1.0  # 角速度震荡惩罚基础系数（负值表示惩罚）；当角速度符号改变时，惩罚 = base * |当前角速度 - 上一角速度|
+
+# ==================== 奖励归一化参数 ====================
+reward_scale: 0.5  # 奖励缩放因子，用于控制每步整体奖励大小；1.0表示不缩放，0.1表示缩小10倍，10.0表示放大10倍；统一应用于所有奖励（goal_reward、collision_penalty、各惩罚项）
 
 # ==================== 时间控制参数 ====================
 sim_time: 2.0  # 仿真步长，用于速度相关的动态阈值等计算
