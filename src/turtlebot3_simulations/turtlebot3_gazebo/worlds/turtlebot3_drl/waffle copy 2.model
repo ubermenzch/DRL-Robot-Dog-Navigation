@@ -117,7 +117,110 @@
     <include>
       <uri>model://10by10</uri>
     </include>
-    
+
+    <!-- 25 个圆柱障碍物（半径0.5，高度1），基于 obstacle5 模型 -->
+    <!-- 这里仅定义模型实例，具体位置在仿真运行时可由 ROS 节点通过 /gazebo/set_entity_state 动态设置 -->
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle1</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle2</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle3</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle4</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle5</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle6</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle7</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle8</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle9</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle10</name>
+    </include>
+
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle11</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle12</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle13</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle14</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle15</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle16</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle17</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle18</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle19</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle20</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle21</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle22</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle23</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle24</name>
+    </include>
+    <include>
+      <uri>model://obstacle5</uri>
+      <name>obstacle25</name>
+    </include>
     <!-- <include>
       <uri>model://obstacle_cylinder_small</uri>
       <name>obstacle31</name>

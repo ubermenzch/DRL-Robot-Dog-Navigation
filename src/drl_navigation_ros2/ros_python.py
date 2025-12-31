@@ -1027,8 +1027,11 @@ class ROS_env:
                     threshold = self.obs_penalty_threshold
                 
                 def calc_penalty(dist):
-                    if dist < threshold:
-                        return self.obs_penalty_base * np.power(threshold - dist, self.obs_penalty_power)
+                    # 检查dist是否为有效数值，且小于阈值
+                    if np.isfinite(dist) and dist < threshold:
+                        penalty_value = self.obs_penalty_base * np.power(threshold - dist, self.obs_penalty_power)
+                        # 确保返回值为有限数值
+                        return penalty_value if np.isfinite(penalty_value) else 0.0
                     return 0.0
 
                 # 拆分雷达：中间40%为高权重，两侧各20%为低权重
@@ -1067,15 +1070,16 @@ class ROS_env:
 
             # ================计算角度偏移惩罚================
             # 计算当前角度（弧度）
+            # sin和cos是机器人朝向与目标方向夹角的正弦和余弦值
             current_angle = math.atan2(sin, cos)
-            # 理想角度（正对目标点）
-            target_angle = 0.0
-            # 计算最小角度差（考虑圆周性）
-            angle_diff = abs(math.atan2(math.sin(current_angle - target_angle), 
-                                    math.cos(current_angle - target_angle)))
-            # 角度惩罚（假设角度差在0到π范围内，超过π则取反）
+            # 理想角度（正对目标点）为0，角度差就是current_angle的绝对值
+            # atan2已经将角度规范化到[-π, π]范围，直接取绝对值即可
+            angle_diff = abs(current_angle)
+            # 角度惩罚（角度差在0到π范围内）
+            # 将 (1 - cos(angle_diff)) 从 [0, 2] 归一化到 [0, 1]
             if self.enable_angle_penalty:
-                angle_penalty = self.angle_penalty_base * (1 - math.cos(angle_diff)) / 2
+                normalized_angle_value = (1 - math.cos(angle_diff)) / 2.0
+                angle_penalty = self.angle_penalty_base * normalized_angle_value
             else:
                 angle_penalty = 0
             # ================计算角度偏移惩罚==========================
@@ -1083,7 +1087,14 @@ class ROS_env:
             # ================线速度惩罚================
             if self.enable_linear_penalty:
                 # 线速度越接近最大速度，惩罚越小
-                linear_penalty = self.linear_penalty_base * (self.max_velocity - action[0])
+                # 将 action[0] 裁剪到 [0, max_velocity] 范围，然后归一化到 [0, 1]
+                if self.max_velocity > 0:
+                    clipped_action = np.clip(action[0], 0, self.max_velocity)
+                    normalized_value = (self.max_velocity - clipped_action) / self.max_velocity
+                else:
+                    # 如果 max_velocity 为 0，使用默认归一化值
+                    normalized_value = 1.0 if action[0] <= 0 else 0.0
+                linear_penalty = self.linear_penalty_base * normalized_value
             else:
                 linear_penalty = 0
             # ================线速度惩罚================
@@ -1100,7 +1111,7 @@ class ROS_env:
                     # 计算当前距离与初始距离的比值
                     distance_ratio = distance_clipped / max(self.initial_target_distance, 1.0)
                     # 限制distance_ratio的最大值，防止数值溢出（最大比值设为100）
-                    distance_ratio = min(distance_ratio, 5.0)
+                    distance_ratio = min(distance_ratio, 2.0)
                     # 惩罚 = base * 距离比值（距离越远，比值越大，惩罚越大）
                     target_distance_penalty = self.target_distance_penalty_base * distance_ratio
                     # 最终检查：确保惩罚值是有限数值，防止NaN和inf
@@ -1118,6 +1129,10 @@ class ROS_env:
             if self.enable_linear_acceleration_oscillation_penalty:
                 current_linear_velocity = action[0]
                 step_time = self.step_sleep_time  # 每个step的持续时间
+                
+                # 防止除零错误
+                if step_time <= 0:
+                    step_time = 0.1  # 使用默认值
                 
                 if self.prev_linear_velocity is not None:
                     # 计算当前加速度

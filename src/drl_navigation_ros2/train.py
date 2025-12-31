@@ -275,6 +275,7 @@ def main(args=None):
     pretraining_iterations = config.get('pretraining_iterations', 50)
     load_model = config.get('load_model', True)
     save_every = config.get('save_every', 10)
+    enable_action_noise = config.get('enable_action_noise', False)  # 是否开启动作噪声
     
     # ==================== 路径参数 ====================
     load_path = Path(config.get('load_path', "/home/zc/DRL-Robot-Navigation-ROS2/src/drl_navigation_ros2/models/SAC"))
@@ -470,9 +471,9 @@ def main(args=None):
         # 如果启用历史state，拼接历史state
         if state_history is not None:
             state_with_history = concatenate_state_history(state, state_history, state_history_steps, base_state_dim)
-            model_action = model.get_action(state_with_history, True)  # 使用拼接后的state
+            model_action = model.get_action(state_with_history, enable_action_noise)  # 使用拼接后的state，根据配置决定是否添加噪声
         else:
-            model_action = model.get_action(state, True)  # get an action from the model
+            model_action = model.get_action(state, enable_action_noise)  # get an action from the model，根据配置决定是否添加噪声
         ros_action = utils.transfor_action(
             model_action,
             max_velocity=max_velocity,

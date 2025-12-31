@@ -68,7 +68,7 @@ setup_ros2_env
 
 # ===================== DISPLAY 设置 =====================
 setup_display() {
-    local candidates=(":77.0" ":0.0" ":0" ":1.0" ":1")
+    local candidates=(":0.0" ":0" ":1.0" ":1")
     local found=false
     
     for candidate in "${candidates[@]}"; do
@@ -94,8 +94,8 @@ setup_display() {
     done < <(find /tmp/.X11-unix -maxdepth 1 -name "X*" -type s 2>/dev/null)
     
     [ "$found" = false ] && {
-        export DISPLAY=:77.0
-        echo "警告: 未检测到可用的 DISPLAY，默认使用 DISPLAY=:77.0" >&2
+        export DISPLAY=:0.0
+        echo "警告: 未检测到可用的 DISPLAY，默认使用 DISPLAY=:0.0" >&2
     }
     
     xdpyinfo >/dev/null 2>&1 && echo "DISPLAY=$DISPLAY 验证通过" || \
@@ -121,8 +121,10 @@ if [ -f "$CONFIG_FILE" ]; then
     RUN_MODE=$(parse_yaml_value "run_mode")
     GPU_ID=$(parse_yaml_value "gpu_id")
     LOG_DIR=$(parse_yaml_value "single_env_log_dir")
+    ROS_DOMAIN_ID_CONFIG=$(parse_yaml_value "single_env_ros_domain_id")
 fi
-ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-77}
+# 优先使用配置文件中的值，其次使用环境变量，最后使用默认值0
+ROS_DOMAIN_ID=${ROS_DOMAIN_ID_CONFIG:-${ROS_DOMAIN_ID:-0}}
 RUN_MODE=${RUN_MODE:-1}
 [ -n "$CLI_RUN_MODE" ] && RUN_MODE="$CLI_RUN_MODE"
 
@@ -185,7 +187,7 @@ init_logging() {
     > "$LOGFILE"
     echo "===== 训练启动 - $(date '+%Y-%m-%d %H:%M:%S') =====" | tee -a "$LOGFILE"
     echo "日志文件: $LOGFILE" | tee -a "$LOGFILE"
-    echo "ROS_DOMAIN_ID: $ROS_DOMAIN_ID (默认值: 77)" >> "$LOGFILE"
+    echo "ROS_DOMAIN_ID: $ROS_DOMAIN_ID (默认值: 0，可从train.yaml中配置)" >> "$LOGFILE"
 }
 
 # ===================== 启动 Gazebo =====================
@@ -199,7 +201,7 @@ start_gazebo() {
     setup_gazebo_paths
     
     if [ "$RUN_MODE" = "1" ]; then
-        [ -z "$DISPLAY" ] && export DISPLAY=:77.0
+        [ -z "$DISPLAY" ] && export DISPLAY=:0.0
         xdpyinfo >/dev/null 2>&1 || {
             echo "错误: DISPLAY=$DISPLAY 不可用，Gazebo GUI 无法启动" | tee -a "$LOGFILE"
             return 1

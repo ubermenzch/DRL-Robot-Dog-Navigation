@@ -8,7 +8,7 @@
 
 # ==================== 多环境训练参数 ====================
 num_envs: 32  # 并行环境数量(一个环境要占用800m左右的显存)
-start_ros_domain_id: 101  # 起始ROS_DOMAIN_ID，多环境从此ID开始递增（例如：start_ros_domain_id=1, num_envs=4，则使用ROS_DOMAIN_ID 1,2,3,4）；重要：多个Docker容器同时运行时，每个容器必须使用不同的起始值以避免DDS类型冲突（例如：容器1用1，容器2用100）
+start_ros_domain_id: 1  # 起始ROS_DOMAIN_ID，多环境从此ID开始递增（例如：start_ros_domain_id=1, num_envs=4，则使用ROS_DOMAIN_ID 1,2,3,4）；重要：多个Docker容器同时运行时，每个容器必须使用不同的起始值以避免DDS类型冲突（例如：容器1用1，容器2用100）
 critic_loss_threshold: -1.0  # critic损失阈值，前X次平均损失小于此值时才更新模型；若值为-1，则无视该阈值，环境控制进程均使用最新模型
 enable_weight_consistency_check: false  # 是否进行模型权重一致性详细检验（为true时会在每个环境初始化时打印大量权重信息）
 
@@ -17,7 +17,7 @@ model_save_dir: "/home/zc/DRL-Robot-Navigation-ROS2/models/multi_env_train_model
 multi_env_log_dir: "/home/zc/DRL-Robot-Navigation-ROS2/log/multi_env_training"  # 日志保存基目录，启动训练时会在此下按时间戳创建子目录存放日志
 gazebo_wait_time: 10  # Gazebo启动等待时间（秒），建议设置为30-60秒以确保所有环境完全启动；对于32个环境，建议至少30秒
 gazebo_start_interval: 5  # 每个Gazebo环境启动后的间隔时间（秒），建议设置为3-5秒以避免资源竞争；对于32个环境，建议至少3秒
-gazebo_base_port: 11345  # Gazebo Master端口基址，每个环境使用 gazebo_base_port + env_id 作为端口（例如：gazebo_base_port=11345, env_id=0 则使用端口11345）；不同容器应设置不同的基址以避免端口冲突
+gazebo_base_port: 11111  # Gazebo Master端口基址，每个环境使用 gazebo_base_port + env_id 作为端口（例如：gazebo_base_port=11345, env_id=0 则使用端口11345）；不同容器应设置不同的基址以避免端口冲突
 
 # ============================================================================
 # 第二层：仅单环境使用参数
@@ -25,11 +25,13 @@ gazebo_base_port: 11345  # Gazebo Master端口基址，每个环境使用 gazebo
 
 # ==================== 单环境基础参数 ====================
 run_mode: 2  # 运行模式：1=后台模式（不向终端输出，终端关闭训练不停止）；2=可视化模式（VNC/本机显示）
+single_env_ros_domain_id: 0  # ROS_DOMAIN_ID，用于隔离不同的ROS2网络域，默认为0
 
 # ==================== 单环境训练参数 ====================
-train_every_n: 2  # 每train_every_n个回合后执行一次训练
+train_every_n: 100  # 每train_every_n个回合后执行一次训练
 pretrain: false  # 是否执行预训练（为true时会加载预存经验池并进行预训练；为false时不加载预存经验池）
 pretraining_iterations: 50  # 预训练迭代次数
+enable_action_noise: true  # 是否开启动作噪声（为true时在get_action中添加噪声；为false时get_action不添加噪声）
 
 # ==================== 单环境路径参数 ====================
 save_path: "/home/zc/DRL-Robot-Navigation-ROS2/models/single_env_train_model"  # 模型保存基础目录（训练启动时会在此目录下创建时间戳子目录）
@@ -51,7 +53,7 @@ max_deceleration: -5.0  # 最大减速度（m/s^2，建议填负值表示减速�
 max_yawrate: 30.0  # 最大偏航率（单位：度/秒）
 neglect_angle: 0  # 前方视野左右两边忽略的角度（单位：度）
 scan_range: 10  # 激光雷达扫描范围
-max_target_dist: 6.0  # 最大目标距离
+max_target_dist: 3.0  # 最大目标距离
 init_target_distance: 1.0  # 初始目标距离
 target_dist_increase: 0.01  # 目标距离增加量
 target_reached_delta: 0.4  # 判定到达目标的阈值
@@ -59,7 +61,7 @@ collision_delta: 0.3  # 碰撞检测阈值
 world_size: 10  # 世界尺寸（米）
 goals_per_map: 4  # 每张地图的目标点数量（即一张地图可以用来产生多少个episode）；当机器人完成一个episode后，如果不达到此数量，则不重新生成地图（障碍物），只将机器人重置到最近的空格子中心并重新生成目标点；达到此数量后才重新生成新地图
 obs_min_dist: 1.0  # 障碍物圆心最小距离（米）
-obs_num: 25  # 障碍物数量
+obs_num: 0  # 障碍物数量
 obs_distribution_mode: "random"  # 障碍物生成方式："uniform"=均匀分布（默认），"random"=随机分布
 costmap_resolution: 1.0  # costmap 分辨率（米/格）
 obstacle_size: 1.0  # costmap 中障碍物等效边长（米，默认正方形）
@@ -81,11 +83,11 @@ critic_target_update_frequency: 2  # Critic目标网络更新频率（每多少�
 
 # ==================== 共享训练参数 ====================
 training_iterations: 200  # 每次执行训练时，用随机抽取的批次数据更新模型training_iterations次
-batch_size: 128  # 从经验池中随机抽取batch_size条经验作为一个训练批次来对模型参数进行更新
+batch_size: 1024  # 从经验池中随机抽取batch_size条经验作为一个训练批次来对模型参数进行更新
 buffer_size: 100000  # 重放缓冲区大小
 use_float64_for_buffer: true  # 是否在本地重放缓冲区中使用float64存储（true则使用float64；false则使用float32，推荐false以提升速度并降低内存占用）
-load_model: false  # 是否加载已有模型
-max_steps: 200  # 限制每个回合最多执行max_steps步操作，超过会强制结束回合（当max_steps_ratio=0时使用此固定值）
+load_model: true  # 是否加载已有模型
+max_steps: 100  # 限制每个回合最多执行max_steps步操作，超过会强制结束回合（当max_steps_ratio=0时使用此固定值）
 max_steps_ratio: 0  # 每Episode最大步数比例 (max_steps = target_distance * max_steps_ratio)，当为0时使用固定值max_steps
 max_steps_min: 50  # 每Episode最小步数 (max_steps不会小于此值)
 save_every: 50  # 每多少次训练后保存一次模型
@@ -93,11 +95,11 @@ report_every: 1000  # 每多少个episode/回合打印一次统计报告
 max_training_count: 10000  # 最大训练次数（训练完成后自动停止）
 loss_window_size: 10  # 训练损失窗口大小，用于计算平均Critic损失
 total_eval_episodes: 1000  # 评估阶段采集的episode数量；>0时训练结束后进入评估并在完成后输出统一统计报告
-best_model_eligibility_threshold: 5.0  # 最好模型评比资格检查的target_dist阈值（过去report_every个episode中，至少best_model_eligibility_ratio比例的target_dist需大于等于此值才有资格）
-best_model_eligibility_ratio: 0.9  # 最好模型评比资格检查的比例阈值（0-1之间，例如0.8表示80%）
+best_model_eligibility_threshold: 2.5  # 最好模型评比资格检查的target_dist阈值（过去report_every个episode中，至少best_model_eligibility_ratio比例的target_dist需大于等于此值才有资格）
+best_model_eligibility_ratio: 0.95  # 最好模型评比资格检查的比例阈值（0-1之间，例如0.8表示80%）
 
 # ==================== 共享路径参数 ====================
-load_path: "/home/zc/DRL-Robot-Navigation-ROS2/models/multi_env_train_model/20251224_181328"  # 模型加载路径
+load_path: "/home/zc/DRL-Robot-Navigation-ROS2/models/multi_env_train_model/best_sc538/train_20251229_213440/best"  # 模型加载路径
 
 # ==================== 奖励函数参数 ====================
 # 奖励/惩罚开关
