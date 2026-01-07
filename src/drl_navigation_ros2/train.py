@@ -226,11 +226,14 @@ def main(args=None):
         state_dim = base_state_dim
         print(f"未启用历史state模式: state_dim={state_dim}")
     
-    hidden_dim = config.get('hidden_dim', 1024)
-    hidden_depth = config.get('hidden_depth', 2)
+    hidden_layers = config.get('hidden_layers', [1024, 512])
     discount_factor = config.get('discount_factor', 0.99)  # 折扣因子（gamma），从配置文件 train.yaml 读取，统一用于计算总回报和所有 Reward Detail 分项的折扣回报
     actor_update_frequency = config.get('actor_update_frequency', 1)
     critic_target_update_frequency = config.get('critic_target_update_frequency', 2)
+    # 学习率相关参数（从配置文件读取，若未配置则使用默认值）
+    actor_lr = config.get('actor_lr', 1e-4)
+    critic_lr = config.get('critic_lr', 1e-4)
+    alpha_lr = config.get('alpha_lr', 1e-4)
     
     # 设备选择
     # 注意：如果通过环境变量 CUDA_VISIBLE_DEVICES 设置了 GPU，PyTorch 视角下 GPU 索引从 0 开始
@@ -349,22 +352,28 @@ def main(args=None):
     # ==================== 动作噪声参数 ====================
     action_noise_std = config.get('action_noise_std', 0.2)
     
+    actor_grad_clip_value = config.get('actor_grad_clip_value', 0.0)
+    critic_grad_clip_value = config.get('critic_grad_clip_value', 0.0)
     model = SAC(
         state_dim=state_dim,
         action_dim=action_dim,
         max_action=max_action,
         device=device,
         discount=discount_factor,  # 传递折扣因子
+        actor_lr=actor_lr,  # 传递Actor学习率
+        critic_lr=critic_lr,  # 传递Critic学习率
+        alpha_lr=alpha_lr,  # 传递温度参数学习率
         save_every=save_every,
         load_model=load_model,
         save_directory=save_path,
         load_directory=load_path,
         action_noise_std=action_noise_std,
-        hidden_dim=hidden_dim,
-        hidden_depth=hidden_depth,
+        hidden_layers=hidden_layers,
         actor_update_frequency=actor_update_frequency,
         critic_target_update_frequency=critic_target_update_frequency,
         base_state_dim=base_state_dim,  # 传递base_state_dim给SAC模型
+        actor_grad_clip_value=actor_grad_clip_value,  # 传递Actor梯度裁剪值
+        critic_grad_clip_value=critic_grad_clip_value,  # 传递Critic梯度裁剪值
     )  # instantiate a model
     print("Model Loaded")
     ros = ROS_env(
@@ -420,7 +429,12 @@ def main(args=None):
         pretraining = Pretraining(
             file_names=[pretrain_data_path],
             model=model,
-            replay_buffer=ReplayBuffer(buffer_size=buffer_size, random_seed=42),
+            replay_buffer=ReplayBuffer(
+                buffer_size=buffer_size, 
+                random_seed=42,
+                recent_buffer_ratio=config.get('recent_buffer_ratio', 0.1),
+                recent_batch_ratio=config.get('recent_batch_ratio', 0.3)
+            ),
             reward_function=ros.get_reward,
         )  # instantiate pre-trainind
         print("Replay Buffer Loading")
@@ -438,7 +452,10 @@ def main(args=None):
         print("Load Saved Buffer Done")
     else:
         replay_buffer = ReplayBuffer(
-            buffer_size=buffer_size, random_seed=42
+            buffer_size=buffer_size, 
+            random_seed=42,
+            recent_buffer_ratio=config.get('recent_buffer_ratio', 0.1),
+            recent_batch_ratio=config.get('recent_batch_ratio', 0.3)
         )  # if not experiences are loaded, instantiate an empty buffer
     
     # 初始化统计管理器
@@ -744,7 +761,7 @@ def main(args=None):
                     train_start_time = time.time()
                     
                     # 训练模型并获取损失值
-                    avg_critic_loss, critic_losses, avg_actor_loss, actor_losses = model.train(
+                    avg_critic_loss, critic_losses, avg_actor_loss, actor_losses, avg_critic_grad, avg_actor_grad, avg_entropy, avg_alpha_grad = model.train(
                         replay_buffer=replay_buffer,
                         iterations=training_iterations,
                         batch_size=batch_size,

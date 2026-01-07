@@ -41,24 +41,40 @@ def weight_init(m):
 
 class MLP(nn.Module):
     def __init__(
-        self, input_dim, hidden_dim, output_dim, hidden_depth, output_mod=None
+        self, input_dim, hidden_layers, output_dim, output_mod=None
     ):
         super().__init__()
-        self.trunk = mlp(input_dim, hidden_dim, output_dim, hidden_depth, output_mod)
+        self.trunk = mlp(input_dim, hidden_layers, output_dim, output_mod)
         self.apply(weight_init)
 
     def forward(self, x):
         return self.trunk(x)
 
 
-def mlp(input_dim, hidden_dim, output_dim, hidden_depth, output_mod=None):
-    if hidden_depth == 0:
-        mods = [nn.Linear(input_dim, output_dim)]
+def mlp(input_dim, hidden_layers, output_dim, output_mod=None):
+    """
+    构建多层感知机网络
+    
+    Args:
+        input_dim: 输入维度
+        hidden_layers: 隐藏层结构，列表形式，例如 [1024, 512] 表示两层，第一层1024个神经元，第二层512个神经元
+        output_dim: 输出维度
+        output_mod: 可选的输出层修改（如激活函数等）
+    """
+    mods = []
+    if len(hidden_layers) == 0:
+        # 如果没有隐藏层，直接从输入到输出
+        mods.append(nn.Linear(input_dim, output_dim))
     else:
-        mods = [nn.Linear(input_dim, hidden_dim), nn.ReLU(inplace=True)]
-        for i in range(hidden_depth - 1):
-            mods += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU(inplace=True)]
-        mods.append(nn.Linear(hidden_dim, output_dim))
+        # 第一层：从输入到第一个隐藏层
+        mods.append(nn.Linear(input_dim, hidden_layers[0]))
+        mods.append(nn.ReLU(inplace=True))
+        # 中间隐藏层
+        for i in range(len(hidden_layers) - 1):
+            mods.append(nn.Linear(hidden_layers[i], hidden_layers[i + 1]))
+            mods.append(nn.ReLU(inplace=True))
+        # 最后一层：从最后一个隐藏层到输出
+        mods.append(nn.Linear(hidden_layers[-1], output_dim))
     if output_mod is not None:
         mods.append(output_mod)
     trunk = nn.Sequential(*mods)

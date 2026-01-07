@@ -3,6 +3,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from statistics import mean
 import SAC.SAC_utils as utils
@@ -36,11 +37,12 @@ class SAC(object):
         save_directory=Path("src/drl_navigation_ros2/models/SAC"),
         model_name="SAC",
         load_directory=Path("src/drl_navigation_ros2/models/SAC"),
-        hidden_dim=1024,
-        hidden_depth=2,
+        hidden_layers=[1024, 512],
         action_noise_std=0.2,  # 动作噪声标准差
         base_state_dim=None,  # 基础状态维度（单个时间步的状态向量长度），当使用历史state时使用
         actor_only=False,  # 是否只创建actor模型（用于数据收集进程，节省显存）
+        actor_grad_clip_value=0.0,  # Actor网络梯度裁剪值（>0时启用梯度裁剪，将梯度裁剪到[-actor_grad_clip_value, actor_grad_clip_value]范围；0或负数表示不进行梯度裁剪）
+        critic_grad_clip_value=0.0,  # Critic网络梯度裁剪值（>0时启用梯度裁剪，将梯度裁剪到[-critic_grad_clip_value, critic_grad_clip_value]范围；0或负数表示不进行梯度裁剪）
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -61,15 +63,25 @@ class SAC(object):
         # 记录一次训练中采样与更新的耗时（秒），用于性能分析
         self.last_sample_time = 0.0
         self.last_update_time = 0.0
+
+        def _init_weights_he(module: nn.Module):
+            """使用 He(Kaiming) 初始化线性层权重（仅在不加载已有模型时使用）"""
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.kaiming_normal_(m.weight, a=0.0, mode="fan_in", nonlinearity="relu")
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
         
         # 创建actor模型（总是需要）
         self.actor = actor_model(
             obs_dim=self.state_dim,
             action_dim=action_dim,
-            hidden_dim=hidden_dim,
-            hidden_depth=hidden_depth,
+            hidden_layers=hidden_layers,
             log_std_bounds=[-5, 2],
         ).to(self.device)
+        # 若不加载已有模型，则对 Actor 使用 He 初始化
+        if not load_model:
+            _init_weights_he(self.actor)
         # print(f"Actor model initialized")
         
         # 只有在非actor_only模式下才创建critic和target_critic
@@ -77,21 +89,24 @@ class SAC(object):
             self.critic = critic_model(
                 obs_dim=self.state_dim,
                 action_dim=action_dim,
-                hidden_dim=hidden_dim,
-                hidden_depth=hidden_depth,
+                hidden_layers=hidden_layers,
             ).to(self.device)
+            # 若不加载已有模型，则对 Critic 使用 He 初始化
+            if not load_model:
+                _init_weights_he(self.critic)
             # print(f"Critic model initialized")
-
+        
             self.critic_target = critic_model(
                 obs_dim=self.state_dim,
                 action_dim=action_dim,
-                hidden_dim=hidden_dim,
-                hidden_depth=hidden_depth,
+                hidden_layers=hidden_layers,
             ).to(self.device)
+            # 初始时让 target_critic 与 critic 保持一致（无论是否使用 He 初始化）
             self.critic_target.load_state_dict(self.critic.state_dict())
             # print(f"Critic target model initialized")
 
             if load_model:
+                # 当需要加载已有模型时，不再额外进行 He 初始化，直接加载权重
                 self.load(filename=self.model_name, directory=load_directory)
 
             self.log_alpha = torch.tensor(np.log(init_temperature)).to(self.device)
@@ -130,6 +145,8 @@ class SAC(object):
         
         self.step = 0
         self.action_noise_std = action_noise_std
+        self.actor_grad_clip_value = actor_grad_clip_value if actor_grad_clip_value > 0 else None  # 只有>0时才启用梯度裁剪
+        self.critic_grad_clip_value = critic_grad_clip_value if critic_grad_clip_value > 0 else None  # 只有>0时才启用梯度裁剪
     
         # print(f"SAC initialized")
 
@@ -168,11 +185,15 @@ class SAC(object):
     def train(self, replay_buffer, iterations, batch_size):
         critic_losses = []
         actor_losses = []
+        critic_grads = []
+        actor_grads = []
+        entropies = []
+        alpha_grads = []
         sample_time_total = 0.0
         update_time_total = 0.0
         
         for _ in range(iterations):
-            critic_loss, actor_loss, sample_dt, total_dt = self.update(
+            critic_loss, actor_loss, critic_grad, actor_grad, entropy, alpha_grad, sample_dt, total_dt = self.update(
                 replay_buffer=replay_buffer, step=self.step, batch_size=batch_size
             )
             sample_time_total += sample_dt
@@ -181,6 +202,14 @@ class SAC(object):
                 critic_losses.append(critic_loss)
             if actor_loss is not None:
                 actor_losses.append(actor_loss)
+            if critic_grad is not None:
+                critic_grads.append(critic_grad)
+            if actor_grad is not None:
+                actor_grads.append(actor_grad)
+            if entropy is not None:
+                entropies.append(entropy)
+            if alpha_grad is not None:
+                alpha_grads.append(alpha_grad)
 
         self.step += 1
 
@@ -195,7 +224,36 @@ class SAC(object):
         avg_critic_loss = sum(critic_losses) / len(critic_losses) if critic_losses else 0.0
         avg_actor_loss = sum(actor_losses) / len(actor_losses) if actor_losses else None
         
-        return avg_critic_loss, critic_losses, avg_actor_loss, actor_losses
+        # 计算平均梯度（裁剪前后的总体L2范数）
+        if critic_grads:
+            # 收集每次迭代的裁剪前后值，计算平均值
+            avg_critic_grad_before = sum(g['before'] for g in critic_grads) / len(critic_grads)
+            avg_critic_grad_after = sum(g['after'] for g in critic_grads) / len(critic_grads)
+            avg_critic_grad = {
+                'before': avg_critic_grad_before,
+                'after': avg_critic_grad_after
+            }
+        else:
+            avg_critic_grad = None
+        
+        if actor_grads:
+            # 收集每次迭代的裁剪前后值，计算平均值
+            avg_actor_grad_before = sum(g['before'] for g in actor_grads) / len(actor_grads)
+            avg_actor_grad_after = sum(g['after'] for g in actor_grads) / len(actor_grads)
+            avg_actor_grad = {
+                'before': avg_actor_grad_before,
+                'after': avg_actor_grad_after
+            }
+        else:
+            avg_actor_grad = None
+        
+        # 计算平均熵值
+        avg_entropy = sum(entropies) / len(entropies) if entropies else None
+        
+        # 计算平均alpha梯度范数
+        avg_alpha_grad = sum(alpha_grads) / len(alpha_grads) if alpha_grads else None
+        
+        return avg_critic_loss, critic_losses, avg_actor_loss, actor_losses, avg_critic_grad, avg_actor_grad, avg_entropy, avg_alpha_grad
 
     @property
     def alpha(self):
@@ -259,9 +317,46 @@ class SAC(object):
         # Optimize the critic
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        
+        # 全局L2范数裁剪（Global Norm Clipping）：将所有参数梯度拼接成一个向量，计算总体L2范数
+        # 如果超过阈值，按比例缩放所有梯度（保持相对比例不变）
+        if self.critic_grad_clip_value is not None:
+            # clip_grad_norm_会执行裁剪，并返回裁剪前的总范数
+            # 注意：clip_grad_norm_内部计算范数的方式可能与手动计算有细微差别（浮点数精度）
+            # 因此使用clip_grad_norm_返回的值作为裁剪前的范数，这样更准确
+            grad_norm_before = torch.nn.utils.clip_grad_norm_(
+                self.critic.parameters(), 
+                self.critic_grad_clip_value,
+                error_if_nonfinite=False  # 允许非有限值，避免抛出异常
+            ).item()
+            
+            # clip_grad_norm_的行为：
+            # - 如果总L2范数 > max_norm，则按比例缩放所有梯度，使得总L2范数 = max_norm
+            # - 如果总L2范数 <= max_norm，则不进行任何操作
+            # 因此，如果裁剪前范数 > 阈值，裁剪后应该等于阈值；否则应该等于裁剪前
+            if grad_norm_before > self.critic_grad_clip_value:
+                grad_norm_after = self.critic_grad_clip_value
+            else:
+                grad_norm_after = grad_norm_before
+        else:
+            # 如果没有启用裁剪，手动计算总体L2范数
+            total_norm_squared = 0.0
+            for param in self.critic.parameters():
+                if param.grad is not None:
+                    param_norm_squared = param.grad.data.norm(2) ** 2
+                    total_norm_squared += param_norm_squared.item()
+            grad_norm_before = total_norm_squared ** (1. / 2) if total_norm_squared > 0 else 0.0
+            grad_norm_after = grad_norm_before
+        
+        # 返回裁剪前后的总体L2范数作为统计值
+        critic_grad_norm = {
+            'before': grad_norm_before,
+            'after': grad_norm_after
+        }
+        
         self.critic_optimizer.step()
         
-        return critic_loss.item()
+        return critic_loss.item(), critic_grad_norm
 
     def update_actor_and_alpha(self, obs, step):
         dist = self.actor(obs)
@@ -275,17 +370,70 @@ class SAC(object):
         # optimize the actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        
+        # 全局L2范数裁剪（Global Norm Clipping）：将所有参数梯度拼接成一个向量，计算总体L2范数
+        # 如果超过阈值，按比例缩放所有梯度（保持相对比例不变）
+        if self.actor_grad_clip_value is not None:
+            # clip_grad_norm_会执行裁剪，并返回裁剪前的总范数
+            # 注意：clip_grad_norm_内部计算范数的方式可能与手动计算有细微差别（浮点数精度）
+            # 因此使用clip_grad_norm_返回的值作为裁剪前的范数，这样更准确
+            grad_norm_before = torch.nn.utils.clip_grad_norm_(
+                self.actor.parameters(), 
+                self.actor_grad_clip_value,
+                error_if_nonfinite=False  # 允许非有限值，避免抛出异常
+            ).item()
+            
+            # clip_grad_norm_的行为：
+            # - 如果总L2范数 > max_norm，则按比例缩放所有梯度，使得总L2范数 = max_norm
+            # - 如果总L2范数 <= max_norm，则不进行任何操作
+            # 因此，如果裁剪前范数 > 阈值，裁剪后应该等于阈值；否则应该等于裁剪前
+            if grad_norm_before > self.actor_grad_clip_value:
+                grad_norm_after = self.actor_grad_clip_value
+            else:
+                grad_norm_after = grad_norm_before
+        else:
+            # 如果没有启用裁剪，手动计算总体L2范数
+            total_norm_squared = 0.0
+            for param in self.actor.parameters():
+                if param.grad is not None:
+                    param_norm_squared = param.grad.data.norm(2) ** 2
+                    total_norm_squared += param_norm_squared.item()
+            grad_norm_before = total_norm_squared ** (1. / 2) if total_norm_squared > 0 else 0.0
+            grad_norm_after = grad_norm_before
+        
+        # 返回裁剪前后的总体L2范数作为统计值
+        actor_grad_norm = {
+            'before': grad_norm_before,
+            'after': grad_norm_after
+        }
+        
         self.actor_optimizer.step()
 
+        # 计算熵值（entropy = -log_prob的平均值）
+        entropy = -log_prob.mean().item()
+        
+        # 计算alpha梯度的L2范数
+        # 注意：log_alpha是一个标量参数（只有一个元素），所以其L2范数就是其绝对值的平方根
+        # 对于单个标量，L2范数 = |grad|，这与actor/critic的全局L2范数计算方式一致（只是只有一个参数）
+        alpha_grad_norm = None
         if self.learnable_temperature:
             self.log_alpha_optimizer.zero_grad()
             alpha_loss = (
                 self.alpha * (-log_prob - self.target_entropy).detach()
             ).mean()
             alpha_loss.backward()
+            
+            # 计算log_alpha参数的梯度L2范数
+            # log_alpha是标量参数，所以直接计算其梯度的L2范数（对于标量，就是绝对值）
+            if self.log_alpha.grad is not None:
+                # 使用与actor/critic相同的方式计算L2范数（虽然只有一个参数，但保持一致性）
+                alpha_grad_norm = self.log_alpha.grad.data.norm(2).item()
+            else:
+                alpha_grad_norm = 0.0
+            
             self.log_alpha_optimizer.step()
         
-        return actor_loss.item()
+        return actor_loss.item(), actor_grad_norm, entropy, alpha_grad_norm
 
     def update(self, replay_buffer, step, batch_size):
         t0 = time.time()
@@ -293,7 +441,7 @@ class SAC(object):
         sample_dt = time.time() - t0
         if batch_data is None:
             print(f"警告: 缓冲区大小({replay_buffer.size()})小于批次大小({batch_size})，跳过训练")
-            return None, sample_dt, time.time() - t0
+            return None, None, None, None, sample_dt, time.time() - t0
         (
             batch_states,
             batch_actions,
@@ -308,17 +456,20 @@ class SAC(object):
         reward = torch.Tensor(batch_rewards).to(self.device)
         done = torch.Tensor(batch_dones).to(self.device)
 
-        critic_loss = self.update_critic(state, action, reward, next_state, done, step)
+        critic_loss, critic_grad = self.update_critic(state, action, reward, next_state, done, step)
 
         actor_loss = None
+        actor_grad = None
+        entropy = None
+        alpha_grad = None
         if step % self.actor_update_frequency == 0:
-            actor_loss = self.update_actor_and_alpha(state, step)
+            actor_loss, actor_grad, entropy, alpha_grad = self.update_actor_and_alpha(state, step)
 
         if step % self.critic_target_update_frequency == 0:
             utils.soft_update_params(self.critic, self.critic_target, self.critic_tau)
         
         total_dt = time.time() - t0
-        return critic_loss, actor_loss, sample_dt, total_dt
+        return critic_loss, actor_loss, critic_grad, actor_grad, entropy, alpha_grad, sample_dt, total_dt
 
     def prepare_state(self, latest_scan, distance, cos, sin, collision, goal, action):
         # update the returned data from ROS into a form used for learning in the current model

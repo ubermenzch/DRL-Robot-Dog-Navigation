@@ -133,8 +133,19 @@ MAX_TRAINING_COUNT=$(parse_yaml_value "max_training_count")
 CRITIC_LOSS_THRESHOLD=$(parse_yaml_value "critic_loss_threshold")
 ACTOR_UPDATE_FREQUENCY=$(parse_yaml_value "actor_update_frequency")
 CRITIC_TARGET_UPDATE_FREQUENCY=$(parse_yaml_value "critic_target_update_frequency")
-HIDDEN_DIM=$(parse_yaml_value "hidden_dim")
-HIDDEN_DEPTH=$(parse_yaml_value "hidden_depth")
+# 读取hidden_layers并转换为JSON字符串
+HIDDEN_LAYERS=$(python3 - "$CONFIG_FILE" <<PY
+import yaml, sys, json
+cfg_path = sys.argv[1]
+try:
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        cfg = yaml.safe_load(f)
+    hidden_layers = cfg.get('hidden_layers', [1024, 512])
+    print(json.dumps(hidden_layers))
+except Exception as e:
+    print(json.dumps([1024, 512]))  # 默认值
+PY
+)
 AVG_LOSS_WINDOW_SIZE=$(parse_yaml_value "avg_loss_window_size")
 GPU_ID=$(parse_yaml_value "gpu_id")
 
@@ -156,8 +167,6 @@ MAX_ACTION=$(parse_yaml_value "max_action")
 STATE_DIM=$(parse_yaml_value "state_dim")
 
 IS_CODE_DEBUG=$(parse_yaml_value "is_code_debug")
-
-MODEL_SAVE_DIR=$(parse_yaml_value "model_save_dir")
 # 优先使用 load_path，如果没有则使用 model_load_dir（向后兼容）
 MODEL_LOAD_DIR=$(parse_yaml_value "load_path")
 if [ -z "$MODEL_LOAD_DIR" ]; then
@@ -165,7 +174,7 @@ MODEL_LOAD_DIR=$(parse_yaml_value "model_load_dir")
 fi
 LOAD_MODEL=$(parse_yaml_value "load_model")
 
-LOG_DIR=$(parse_yaml_value "multi_env_log_dir")
+LOG_DIR=$(parse_yaml_value "multi_env_log_model_dir")
 GAZEBO_WAIT_TIME=$(parse_yaml_value "gazebo_wait_time")
 GAZEBO_START_INTERVAL=$(parse_yaml_value "gazebo_start_interval")
 GAZEBO_BASE_PORT=$(parse_yaml_value "gazebo_base_port")
@@ -208,8 +217,6 @@ MAX_ACTION=${MAX_ACTION:-1}
 STATE_DIM=${STATE_DIM:-25}
 
 IS_CODE_DEBUG=${IS_CODE_DEBUG:-false}
-
-MODEL_SAVE_DIR=${MODEL_SAVE_DIR:-"/home/zc/DRL-Robot-Navigation-ROS2/models/multi_env_SAC"}
 MODEL_LOAD_DIR=${MODEL_LOAD_DIR:-"/home/zc/DRL-Robot-Navigation-ROS2/src/drl_navigation_ros2/models/SAC"}
 LOAD_MODEL=${LOAD_MODEL:-true}
 
@@ -218,7 +225,6 @@ TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
 LOG_DIR_BASE=${LOG_DIR:-"$SCRIPT_DIR/log/multi_env_training"}
 LOG_DIR="$LOG_DIR_BASE/train_${TIMESTAMP}"
 LOGFILE="$LOG_DIR/train_${TIMESTAMP}.log"
-MODEL_SAVE_DIR_TS="${MODEL_SAVE_DIR%/}/$TIMESTAMP"
 # 确保 Gazebo 相关参数有有效值（处理空字符串的情况）
 GAZEBO_WAIT_TIME=${GAZEBO_WAIT_TIME:-30}
 [ -z "$GAZEBO_WAIT_TIME" ] && GAZEBO_WAIT_TIME=30
@@ -232,9 +238,8 @@ export TRAINING_TIMESTAMP="$TIMESTAMP"
 TMP_DIR="$SCRIPT_DIR/tmp"
 PID_FILE="$TMP_DIR/multi_env_training.pid"
 
-# 预先创建日志、模型和临时目录（在首次 tee 之前）
+# 预先创建日志和临时目录（在首次 tee 之前）
 mkdir -p "$LOG_DIR"
-mkdir -p "$MODEL_SAVE_DIR_TS"
 mkdir -p "$TMP_DIR"
 
 # ===================== 输出函数 =====================
@@ -495,7 +500,6 @@ init_logging() {
     echo "调试参数:" >> "$LOGFILE"
     echo "  - 调试模式: $IS_CODE_DEBUG" >> "$LOGFILE"
     echo "模型配置:" >> "$LOGFILE"
-    echo "  - 模型保存目录: $MODEL_SAVE_DIR" >> "$LOGFILE"
     echo "  - 模型加载目录: $MODEL_LOAD_DIR" >> "$LOGFILE"
     echo "  - 加载已有模型: $LOAD_MODEL" >> "$LOGFILE"
     echo "  - 模型文件名: SAC_actor.pth, SAC_critic.pth, SAC_critic_target.pth" >> "$LOGFILE"
@@ -670,8 +674,7 @@ start_multi_env_training() {
         --critic_loss_threshold $CRITIC_LOSS_THRESHOLD \
         --actor_update_frequency $ACTOR_UPDATE_FREQUENCY \
         --critic_target_update_frequency $CRITIC_TARGET_UPDATE_FREQUENCY \
-        --hidden_dim $HIDDEN_DIM \
-        --hidden_depth $HIDDEN_DEPTH \
+        --hidden_layers "$HIDDEN_LAYERS" \
         --avg_loss_window_size $AVG_LOSS_WINDOW_SIZE \
         --max_velocity $MAX_VELOCITY \
         --neglect_angle $NEGLECT_ANGLE \
@@ -688,7 +691,6 @@ start_multi_env_training() {
         --action_dim $ACTION_DIM \
         --max_action $MAX_ACTION \
         --is_code_debug $IS_CODE_DEBUG \
-        --model_save_dir "$MODEL_SAVE_DIR" \
         --model_load_dir "$MODEL_LOAD_DIR" \
         --load_model $LOAD_MODEL \
         >> "$LOGFILE" 2>&1 &
@@ -789,9 +791,9 @@ if [ "$DAEMON_MODE" = true ]; then
     export NEGLECT_ANGLE MAX_YAWRATE SCAN_RANGE MAX_TARGET_DIST INIT_TARGET_DISTANCE
     export TARGET_DIST_INCREASE TARGET_REACHED_DELTA COLLISION_DELTA WORLD_SIZE
     export OBS_MIN_DIST OBS_NUM ACTION_DIM MAX_ACTION STATE_DIM IS_CODE_DEBUG
-    export MODEL_SAVE_DIR MODEL_LOAD_DIR LOAD_MODEL LOG_DIR
+    export MODEL_LOAD_DIR LOAD_MODEL LOG_DIR
     export GAZEBO_WAIT_TIME GAZEBO_BASE_PORT TRAINING_TIMESTAMP
-    export SCRIPT_DIR TIMESTAMP LOG_DIR_BASE MODEL_SAVE_DIR_TS DAEMON_MODE
+    export SCRIPT_DIR TIMESTAMP LOG_DIR_BASE DAEMON_MODE
     export TMP_DIR PID_FILE CONFIG_FILE
     # 外层直接重定向到日志，避免 nohup 提示输出到 nohup.out
     nohup bash -c "

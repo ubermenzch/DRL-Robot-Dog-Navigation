@@ -21,6 +21,7 @@ import torch.nn.functional as F
 import sys
 import os
 import yaml
+import json
 from datetime import datetime
 from collections import deque
 from typing import Optional
@@ -139,6 +140,89 @@ def _is_valid_env_return(latest_scan, distance, cos, sin, collision, goal, last_
     return True
 
 
+def verify_actor_weight_consistency(local_model, latest_model_state, env_id, config):
+    """验证actor网络权重一致性（只匹配actor网络）
+    
+    Args:
+        local_model: 本地模型实例
+        latest_model_state: 从文件加载的模型状态字典（只包含actor权重）
+        env_id: 环境ID（用于日志）
+        config: 配置字典（用于检查enable_weight_consistency_check）
+    
+    Returns:
+        bool: True表示权重匹配，False表示权重不匹配（仅在启用检查时返回有意义的值）
+    """
+    # 只有在配置中启用权重一致性检查时才进行验证
+    if not config.get('enable_weight_consistency_check', False):
+        return True
+    
+    weight_log(f"环境 {env_id} 验证加载后的模型权重:")
+    # actor_only模式下只返回actor权重
+    local_state_dict_for_log = local_model.state_dict(actor_only=True)
+    
+    # 打印模型结构概览
+    weight_log(f"环境 {env_id} 从文件加载的模型结构概览:")
+    for key, value in local_state_dict_for_log.items():
+        if hasattr(value, 'shape') and value.numel() > 0:
+            try:
+                weight_log(f"  环境 {env_id} {key} 形状: {value.shape}, 均值: {value.mean().item():.2f}, 标准差: {value.std().item():.2f}")
+            except Exception:
+                weight_log(f"  环境 {env_id} {key} 形状: {value.shape}, 类型: {type(value)}")
+        elif isinstance(value, dict):
+            weight_log(f"  环境 {env_id} {key} 子键: {list(value.keys())}")
+            for subkey, subvalue in value.items():
+                if hasattr(subvalue, 'shape') and subvalue.numel() > 0:
+                    try:
+                        weight_log(f"    环境 {env_id} {key}.{subkey} 形状: {subvalue.shape}, 均值: {subvalue.mean().item():.2f}, 标准差: {subvalue.std().item():.2f}")
+                    except Exception:
+                        weight_log(f"    环境 {env_id} {key}.{subkey} 形状: {subvalue.shape}, 类型: {type(subvalue)}")
+                else:
+                    weight_log(f"    环境 {env_id} {key}.{subkey} 形状: {subvalue.shape}, 类型: {type(subvalue)}")
+        else:
+            weight_log(f"  环境 {env_id} {key} 值: {value}, 类型: {type(value)}")
+    
+    # 权重一致性验证（只验证actor权重）
+    weight_log(f"环境 {env_id} 权重一致性验证:")
+    local_state_dict = local_model.state_dict(actor_only=True)  # actor_only模式下只返回actor权重
+    weights_match = True
+    
+    for key, value in latest_model_state.items():
+        if isinstance(value, dict):  # actor权重是一个字典
+            # 验证actor的每个子权重
+            if key in local_state_dict:
+                for subkey, subvalue in value.items():
+                    if hasattr(subvalue, 'shape') and subvalue.numel() > 0:
+                        local_subvalue = local_state_dict[key][subkey]
+                        if torch.allclose(subvalue, local_subvalue, atol=1e-6):
+                            weight_log(f"  ✓ {key}.{subkey} 权重完全匹配")
+                        else:
+                            weight_log(f"  ✗ {key}.{subkey} 权重不匹配!")
+                            weight_log(f"    文件权重均值: {subvalue.mean().item():.2f}, 本地权重均值: {local_subvalue.mean().item():.2f}")
+                            weight_log(f"    文件权重标准差: {subvalue.std().item():.2f}, 本地权重标准差: {local_subvalue.std().item():.2f}")
+                            weights_match = False
+            else:
+                weight_log(f"  警告: 键 {key} 不在本地模型状态字典中")
+        elif hasattr(value, 'shape') and value.numel() > 0:
+            # 直接是tensor的情况（不应该出现在actor_only模式下）
+            if key in local_state_dict:
+                local_value = local_state_dict[key]
+                if torch.allclose(value, local_value, atol=1e-6):
+                    weight_log(f"  ✓ {key} 权重完全匹配")
+                else:
+                    weight_log(f"  ✗ {key} 权重不匹配!")
+                    weight_log(f"    文件权重均值: {value.mean().item():.2f}, 本地权重均值: {local_value.mean().item():.2f}")
+                    weight_log(f"    文件权重标准差: {value.std().item():.2f}, 本地权重标准差: {local_value.std().item():.2f}")
+                    weights_match = False
+    
+    # 输出汇总结果
+    if weights_match:
+        weight_log(f"环境 {env_id} ✓ 所有权重完全匹配!")
+    else:
+        weight_log(f"环境 {env_id} ✗ 发现权重不匹配!")
+    
+    return weights_match
+
+
 class SharedReplayBuffer:
     """多进程共享的重放缓冲区 - 真正的并行版本"""
     
@@ -243,13 +327,15 @@ class LocalReplayBuffer:
     - 保持与旧版 LocalReplayBuffer.sample_batch 接口兼容
     """
     
-    def __init__(self, max_size: int, dtype=np.float32):
+    def __init__(self, max_size: int, dtype=np.float32, recent_buffer_ratio=0.1, recent_batch_ratio=0.3):
         self.max_size = max_size
         self.count = 0          # 当前有效样本数量
         self.write_pos = 0      # 循环写入指针
         self.initialized = False
         self.dtype = dtype
         self.filtered_count = 0  # 统计被过滤的无效经验数量
+        self.recent_buffer_ratio = recent_buffer_ratio  # 最新数据比例
+        self.recent_batch_ratio = recent_batch_ratio    # batch中来自最新数据的比例
         
         # 延迟初始化实际存储数组（直到拿到第一条经验，才能知道 state_dim / action_dim）
         self.states = None          # shape: (max_size, state_dim)
@@ -368,6 +454,7 @@ class LocalReplayBuffer:
     
     def sample_batch(self, batch_size):
         """从本地缓冲区采样一个批次；不足 batch_size 时使用所有可用样本
+        支持分层采样：batch的recent_batch_ratio比例来自最新的recent_buffer_ratio部分
         
         返回：
             states:      np.ndarray, shape (B, state_dim),  dtype float32
@@ -387,8 +474,62 @@ class LocalReplayBuffer:
             # 无放回使用全部样本
             indices = np.arange(buf_len, dtype=np.int64)
         else:
-            # 随机无放回采样
-            indices = np.random.choice(buf_len, actual_batch_size, replace=False)
+            # 分层采样：batch的recent_batch_ratio比例来自最新的recent_buffer_ratio部分
+            # 计算最新数据的范围
+            recent_size = max(1, int(buf_len * self.recent_buffer_ratio))
+            old_size = buf_len - recent_size
+            
+            # 计算从两部分采样的数量
+            recent_batch_size = max(1, int(actual_batch_size * self.recent_batch_ratio))
+            old_batch_size = actual_batch_size - recent_batch_size
+            
+            # 获取最新数据的逻辑索引（在环形缓冲区中的实际位置）
+            if self.count < self.max_size:
+                # 缓冲区未满，数据在[0, count)范围内，最新数据在右侧
+                recent_start_idx = buf_len - recent_size
+                recent_indices_logical = np.arange(recent_start_idx, buf_len, dtype=np.int64)
+                old_indices_logical = np.arange(0, recent_start_idx, dtype=np.int64)
+            else:
+                # 缓冲区已满，需要处理环形
+                # 最新数据在write_pos往前推的位置
+                # 最旧数据在write_pos位置（下一个要覆盖的位置）
+                recent_start_pos = (self.write_pos - recent_size) % self.max_size
+                if recent_start_pos < self.write_pos:
+                    # 不跨越边界：最新数据在[recent_start_pos, write_pos)
+                    recent_indices_logical = np.arange(recent_start_pos, self.write_pos, dtype=np.int64)
+                    # 旧数据是[write_pos, max_size)和[0, recent_start_pos)
+                    if recent_start_pos > 0:
+                        part1 = np.arange(self.write_pos, self.max_size, dtype=np.int64)
+                        part2 = np.arange(0, recent_start_pos, dtype=np.int64)
+                        old_indices_logical = np.concatenate([part1, part2])
+                    else:
+                        # recent_start_pos == 0，旧数据就是[write_pos, max_size)
+                        old_indices_logical = np.arange(self.write_pos, self.max_size, dtype=np.int64)
+                else:
+                    # 跨越边界：最新数据跨越了0位置
+                    # 最新数据是[recent_start_pos, max_size)和[0, write_pos)
+                    part1 = np.arange(recent_start_pos, self.max_size, dtype=np.int64)
+                    part2 = np.arange(0, self.write_pos, dtype=np.int64)
+                    recent_indices_logical = np.concatenate([part1, part2])
+                    # 旧数据是[write_pos, recent_start_pos)
+                    old_indices_logical = np.arange(self.write_pos, recent_start_pos, dtype=np.int64)
+            
+            # 从最新部分采样
+            if len(recent_indices_logical) >= recent_batch_size:
+                recent_selected_logical = np.random.choice(recent_indices_logical, recent_batch_size, replace=False)
+            else:
+                recent_selected_logical = recent_indices_logical
+            
+            # 从旧数据部分采样
+            if len(old_indices_logical) >= old_batch_size:
+                old_selected_logical = np.random.choice(old_indices_logical, old_batch_size, replace=False)
+            else:
+                old_selected_logical = old_indices_logical
+            
+            # 合并两部分索引（逻辑索引就是实际索引，因为使用NumPy数组）
+            indices = np.concatenate([recent_selected_logical, old_selected_logical])
+            # 随机打乱顺序
+            np.random.shuffle(indices)
         
         # 关键优化：一次性在 NumPy 层完成索引，避免 Python for 循环
         states = self.states[indices]
@@ -596,25 +737,34 @@ class SharedModelManager:
     
     def get_model_state_dict_for_inference(self):
         """获取用于推理的模型状态字典（子进程使用）"""
-        if os.path.exists(self.model_file_path):
-            # 获取目标设备（数据收集进程的设备）
-            # 使用更安全的方法获取设备
-            try:
-                if hasattr(self.model, 'device'):
-                    target_device = self.model.device
-                elif hasattr(self.model, 'parameters'):
-                    target_device = next(self.model.parameters()).device
-                else:
-                    # 如果无法获取设备，使用CPU
-                    target_device = torch.device('cpu')
-            except:
+        if not os.path.exists(self.model_file_path):
+            return None
+        
+        # 获取目标设备（数据收集进程的设备）
+        # 使用更安全的方法获取设备
+        try:
+            if hasattr(self.model, 'device'):
+                target_device = self.model.device
+            elif hasattr(self.model, 'parameters'):
+                target_device = next(self.model.parameters()).device
+            else:
+                # 如果无法获取设备，使用CPU
                 target_device = torch.device('cpu')
-            
-            # 直接从文件加载到目标设备（GPU或CPU）
+        except Exception:
+            target_device = torch.device('cpu')
+        
+        # 从文件加载模型状态字典到目标设备（GPU或CPU）
+        # 添加异常处理，防止文件损坏或权限问题导致进程崩溃
+        try:
             device_model_state = torch.load(self.model_file_path, map_location=target_device)
-            
+            # 验证加载的数据是否为字典类型（state_dict应该是字典）
+            if not isinstance(device_model_state, dict):
+                print(f"警告: 从文件 {self.model_file_path} 加载的数据不是字典类型，类型: {type(device_model_state)}")
+                return None
             return device_model_state
-        return None
+        except Exception as e:
+            print(f"错误: 从文件 {self.model_file_path} 加载模型权重失败: {e}")
+            return None
     
     def _convert_from_serializable(self, obj):
         """递归转换对象从可序列化格式"""
@@ -786,13 +936,14 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             discount=config.get('discount_factor', 0.99),  # 传递折扣因子
             actor_update_frequency=config.get('actor_update_frequency', 1),
             critic_target_update_frequency=config.get('critic_target_update_frequency', 4),
-            hidden_dim=config.get('hidden_dim', 1024),
-            hidden_depth=config.get('hidden_depth', 3),
+            hidden_layers=config.get('hidden_layers', [1024, 512]),
             save_every=0,  # 不自动保存
             load_model=False,  # 数据收集进程不加载模型，使用共享模型状态
             action_noise_std=config.get('action_noise_std', 0.2),
             base_state_dim=base_state_dim,  # 确保prepare_state使用单步状态长度
             actor_only=True,  # 只创建actor模型，不创建critic和target_critic，节省显存
+            actor_grad_clip_value=config.get('actor_grad_clip_value', 0.0),  # 传递Actor梯度裁剪值（虽然actor_only模式下不会训练，但保持参数一致性）
+            critic_grad_clip_value=config.get('critic_grad_clip_value', 0.0),  # 传递Critic梯度裁剪值（虽然actor_only模式下不会训练，但保持参数一致性）
         )
         
         # 验证：确认只创建了actor模型，没有创建critic
@@ -820,85 +971,12 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             if latest_model_state and len(latest_model_state) > 0:
                 weight_log(f"环境 {env_id} 获取到模型权重，键: {list(latest_model_state.keys())}")
                 
-                # 仅在明确启用时打印子进程模型结构，默认不打印以减少冗余
-                if config.get('log_env_model_structure', False):
-                    weight_log(f"环境 {env_id} 从文件加载的模型结构概览:")
-                    for key, value in latest_model_state.items():
-                        if isinstance(value, dict):
-                            weight_log(f"  环境 {env_id} {key} 子键: {list(value.keys())}")
-                        elif hasattr(value, 'shape'):
-                            weight_log(f"  环境 {env_id} {key} 形状: {value.shape}")
-                        else:
-                            weight_log(f"  环境 {env_id} {key} 类型: {type(value)}")
-                
                 # 加载模型权重到本地模型
                 local_model.load_state_dict(latest_model_state)
                 weight_log(f"环境 {env_id} 模型权重同步完成")
                 
-                # 验证加载后的模型权重
-                # 是否进行详细的权重一致性检验由配置控制
-                # 默认认为权重是一致的，只有在开启一致性检查并发现不一致时才置为 False
-                weights_match = True
-                if config.get('enable_weight_consistency_check', False):
-                    weight_log(f"环境 {env_id} 验证加载后的模型权重:")
-                    # actor_only模式下只返回actor权重
-                    local_state_dict_for_log = local_model.state_dict(actor_only=True)
-                    for key, value in local_state_dict_for_log.items():
-                        if hasattr(value, 'shape') and value.numel() > 0:
-                            try:
-                                weight_log(f"  环境 {env_id} {key} 形状: {value.shape}, 均值: {value.mean().item():.2f}, 标准差: {value.std().item():.2f}")
-                            except Exception:
-                                weight_log(f"  环境 {env_id} {key} 形状: {value.shape}, 类型: {type(value)}")
-                        elif isinstance(value, dict):
-                            weight_log(f"  环境 {env_id} {key} 子键: {list(value.keys())}")
-                            for subkey, subvalue in value.items():
-                                if hasattr(subvalue, 'shape') and subvalue.numel() > 0:
-                                    try:
-                                        weight_log(f"    环境 {env_id} {key}.{subkey} 形状: {subvalue.shape}, 均值: {subvalue.mean().item():.2f}, 标准差: {subvalue.std().item():.2f}")
-                                    except Exception:
-                                        weight_log(f"    环境 {env_id} {key}.{subkey} 形状: {subvalue.shape}, 类型: {type(subvalue)}")
-                                else:
-                                    weight_log(f"    环境 {env_id} {key}.{subkey} 形状: {subvalue.shape}, 类型: {type(subvalue)}")
-                        else:
-                            weight_log(f"  环境 {env_id} {key} 值: {value}, 类型: {type(value)}")
-                    
-                    # 权重一致性验证（只验证actor权重，因为actor_only模式下只有actor）
-                    weight_log(f"环境 {env_id} 权重一致性验证:")
-                    local_state_dict = local_model.state_dict(actor_only=True)  # actor_only模式下只返回actor权重
-                    for key, value in latest_model_state.items():
-                        if isinstance(value, dict):  # actor权重是一个字典
-                            # 验证actor的每个子权重
-                            if key in local_state_dict:
-                                for subkey, subvalue in value.items():
-                                    if hasattr(subvalue, 'shape') and subvalue.numel() > 0:
-                                        local_subvalue = local_state_dict[key][subkey]
-                                        if torch.allclose(subvalue, local_subvalue, atol=1e-6):
-                                            weight_log(f"  ✓ {key}.{subkey} 权重完全匹配")
-                                        else:
-                                            weight_log(f"  ✗ {key}.{subkey} 权重不匹配!")
-                                            weight_log(f"    文件权重均值: {subvalue.mean().item():.2f}, 本地权重均值: {local_subvalue.mean().item():.2f}")
-                                            weight_log(f"    文件权重标准差: {subvalue.std().item():.2f}, 本地权重标准差: {local_subvalue.std().item():.2f}")
-                                            weights_match = False
-                            else:
-                                weight_log(f"  警告: 键 {key} 不在本地模型状态字典中")
-                        elif hasattr(value, 'shape') and value.numel() > 0:
-                            # 直接是tensor的情况（不应该出现在actor_only模式下）
-                            if key in local_state_dict:
-                                local_value = local_state_dict[key]
-                                if torch.allclose(value, local_value, atol=1e-6):
-                                    weight_log(f"  ✓ {key} 权重完全匹配")
-                                else:
-                                    weight_log(f"  ✗ {key} 权重不匹配!")
-                                    weight_log(f"    文件权重均值: {value.mean().item():.2f}, 本地权重均值: {local_value.mean().item():.2f}")
-                                    weight_log(f"    文件权重标准差: {value.std().item():.2f}, 本地权重标准差: {local_value.std().item():.2f}")
-                                    weights_match = False
-                
-                # 只有在启用了权重一致性检查时才输出汇总结果
-                if config.get('enable_weight_consistency_check', False):
-                    if weights_match:
-                        weight_log(f"环境 {env_id} ✓ 所有权重完全匹配!")
-                    else:
-                        weight_log(f"环境 {env_id} ✗ 发现权重不匹配!")
+                # 验证actor网络权重一致性
+                verify_actor_weight_consistency(local_model, latest_model_state, env_id, config)
                 
                 break
             time.sleep(0.1)  # 等待0.1秒
@@ -944,6 +1022,8 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 if latest_model_state:
                     local_model.load_state_dict(latest_model_state)
                     weight_log(f"环境 {env_id} 评估阶段模型同步完成")
+                    # 验证actor网络权重一致性
+                    verify_actor_weight_consistency(local_model, latest_model_state, env_id, config)
                 eval_model_synced = True
 
             try:
@@ -982,6 +1062,8 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                         if latest_model_state:
                             local_model.load_state_dict(latest_model_state)
                             last_training_count = current_training_count
+                            # 验证actor网络权重一致性
+                            verify_actor_weight_consistency(local_model, latest_model_state, env_id, config)
                         else:
                             print(f"环境 {env_id} 警告: 未能获取到模型权重")
                 
@@ -1246,27 +1328,27 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 enable_yawrate_osc = getattr(ros_env, "enable_yawrate_oscillation_penalty", False)
 
                 detail_parts = [
-                    f"goal={goal_sum:.2f}",
-                    f"collision={collision_sum:.2f}",
+                    f"goal={goal_sum:.6f}",
+                    f"collision={collision_sum:.6f}",
                 ]
                 # 所有开启的奖惩项都要打印（即使值为0也要显示）
                 if enable_obs:
-                    detail_parts.append(f"obs={obs_sum:.2f}")
+                    detail_parts.append(f"obs={obs_sum:.6f}")
                 if enable_yawrate:
-                    detail_parts.append(f"yawrate={yaw_sum:.2f}")
+                    detail_parts.append(f"yawrate={yaw_sum:.6f}")
                 if enable_angle:
-                    detail_parts.append(f"angle={angle_sum:.2f}")
+                    detail_parts.append(f"angle={angle_sum:.6f}")
                 if enable_linear:
-                    detail_parts.append(f"linear={linear_sum:.2f}")
+                    detail_parts.append(f"linear={linear_sum:.6f}")
                 if enable_target_distance:
-                    detail_parts.append(f"target_distance={target_distance_sum:.2f}")
+                    detail_parts.append(f"target_distance={target_distance_sum:.6f}")
                 if enable_linear_acc_osc:
-                    detail_parts.append(f"linear_acc_osc={linear_acc_osc_sum:.2f}")
+                    detail_parts.append(f"linear_acc_osc={linear_acc_osc_sum:.6f}")
                 if enable_yawrate_osc:
-                    detail_parts.append(f"yawrate_osc={yawrate_osc_sum:.2f}")
+                    detail_parts.append(f"yawrate_osc={yawrate_osc_sum:.6f}")
 
                 # 将结束状态放在最前面，然后是总reward，最后是其他奖励分项
-                detail_parts_with_total = [f"end={episode_ending}", f"total_reward={episode_reward:.2f}"] + detail_parts
+                detail_parts_with_total = [f"end={episode_ending}", f"total_reward={episode_reward:.6f}"] + detail_parts
                 detail_str = ", ".join(detail_parts_with_total)
 
                 # 输出详细的episode信息（含奖励明细），时间戳放在最前面，便于与训练日志对齐
@@ -1317,7 +1399,12 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
         # 容量与全局buffer_size一致；精度由配置控制（float32 / float64）
         use_float64 = config.get('use_float64_for_buffer', False)
         buffer_dtype = np.float64 if use_float64 else np.float32
-        local_buffer = LocalReplayBuffer(config.get('buffer_size', 50000), dtype=buffer_dtype)
+        local_buffer = LocalReplayBuffer(
+            config.get('buffer_size', 50000), 
+            dtype=buffer_dtype,
+            recent_buffer_ratio=config.get('recent_buffer_ratio', 0.1),
+            recent_batch_ratio=config.get('recent_batch_ratio', 0.3)
+        )
         
         while True:
             try:
@@ -1369,7 +1456,7 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                     samples_this_training = training_iterations * batch_size  # 本次训练抽样的样本数
                     
                     start_time = time.time()
-                    avg_critic_loss, critic_losses, avg_actor_loss, actor_losses = model_manager.model.train(
+                    avg_critic_loss, critic_losses, avg_actor_loss, actor_losses, avg_critic_grad, avg_actor_grad, avg_entropy, avg_alpha_grad = model_manager.model.train(
                         replay_buffer=local_buffer,
                         iterations=training_iterations,
                         batch_size=batch_size
@@ -1408,12 +1495,27 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                     # 先将当前损失添加到列表中（这样计算窗口平均时会包括当前这次）
                     model_manager.add_critic_loss(avg_critic_loss)
                     
-                    # 行3：Critic损失（本次训练的平均 + 窗口平均）
+                    # 行3：Critic损失（本次训练的平均 + 窗口平均 + 全局参数梯度L2范数）
                     window_avg_critic_loss = model_manager.get_average_critic_loss(loss_window_size)
                     if window_avg_critic_loss != float('inf'):
-                        print(f"  本次训练的平均critic网络损失: {avg_critic_loss:.2f} | 前{loss_window_size}次训练的平均critic网络损失: {window_avg_critic_loss:.2f}")
+                        if avg_critic_grad is not None:
+                            if isinstance(avg_critic_grad, dict):
+                                grad_info = f" | critic全局参数梯度L2范数(裁剪前:{avg_critic_grad['before']:.6f}, 裁剪后:{avg_critic_grad['after']:.6f})"
+                            else:
+                                # 向后兼容
+                                grad_info = f" | critic全局参数梯度L2范数: {avg_critic_grad:.6f}"
+                        else:
+                            grad_info = ""
+                        print(f"  本次训练的平均critic网络损失: {avg_critic_loss:.6f}{grad_info}")
                     else:
-                        print(f"  本次训练的平均critic网络损失: {avg_critic_loss:.2f}")
+                        if avg_critic_grad is not None:
+                            if isinstance(avg_critic_grad, dict):
+                                grad_info = f" | critic全局参数梯度L2范数(裁剪前:{avg_critic_grad['before']:.6f}, 裁剪后:{avg_critic_grad['after']:.6f})"
+                            else:
+                                grad_info = f" | critic全局参数梯度L2范数: {avg_critic_grad:.6f}"
+                        else:
+                            grad_info = ""
+                        print(f"  本次训练的平均critic网络损失: {avg_critic_loss:.6f}{grad_info}")
                     
                     # 行4：Actor损失（本次训练的平均 + 窗口平均）
                     if avg_actor_loss is not None:
@@ -1429,18 +1531,42 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                                 window_avg_actor_loss = sum(recent_actor_losses[-loss_window_size:]) / loss_window_size
                             else:
                                 window_avg_actor_loss = sum(recent_actor_losses) / len(recent_actor_losses)
-                            print(f"  本次训练的平均actor网络损失: {avg_actor_loss:.2f} | 前{loss_window_size}次训练的平均actor网络损失: {window_avg_actor_loss:.2f}")
+                            if avg_actor_grad is not None:
+                                if isinstance(avg_actor_grad, dict):
+                                    grad_info = f" | actor全局参数梯度L2范数(裁剪前:{avg_actor_grad['before']:.6f}, 裁剪后:{avg_actor_grad['after']:.6f})"
+                                else:
+                                    # 向后兼容
+                                    grad_info = f" | actor全局参数梯度L2范数: {avg_actor_grad:.6f}"
+                            else:
+                                grad_info = ""
+                            print(f"  本次训练的平均actor网络损失: {avg_actor_loss:.6f}{grad_info}")
                         else:
-                            print(f"  本次训练的平均actor网络损失: {avg_actor_loss:.2f}")
+                            if avg_actor_grad is not None:
+                                if isinstance(avg_actor_grad, dict):
+                                    grad_info = f" | actor全局参数梯度L2范数(裁剪前:{avg_actor_grad['before']:.6f}, 裁剪后:{avg_actor_grad['after']:.6f})"
+                                else:
+                                    grad_info = f" | actor全局参数梯度L2范数: {avg_actor_grad:.6f}"
+                            else:
+                                grad_info = ""
+                            print(f"  本次训练的平均actor网络损失: {avg_actor_loss:.6f}{grad_info}")
+                    
+                    # 行5：熵值和alpha梯度范数统计
+                    entropy_info = ""
+                    if avg_entropy is not None:
+                        entropy_info = f" | 熵值: {avg_entropy:.6f}"
+                    if avg_alpha_grad is not None:
+                        entropy_info += f" | alpha梯度L2范数: {avg_alpha_grad:.6f}"
+                    if entropy_info:
+                        print(f"  熵值统计:{entropy_info}")
 
-                    # 行5：本次训练整体耗时（使用“采样耗时总计 + 前向/反向耗时”的和，而不是墙钟时间）
+                    # 行6：本次训练整体耗时（使用"采样耗时总计 + 前向/反向耗时"的和，而不是墙钟时间）
                     # 注意：total_sample_time 和 compute_time 仅在 sample_time / update_time 可用时才有意义
                     if sample_time is not None and update_time is not None:
                         total_sample_time = pull_time + sample_time
                         total_train_log_time = total_sample_time + compute_time if compute_time is not None else total_sample_time
                         print(f"  训练耗时: {total_train_log_time:.2f}秒")
                         
-                        # 行6+: 采样与前向/反向耗时的细分
+                        # 行7+: 采样与前向/反向耗时的细分
                         print(
                             f"  采样耗时总计: {total_sample_time:.2f}秒 "
                             f"(拉取到本地buffer: {pull_time:.2f}秒, 从本地buffer随机采样: {sample_time:.2f}秒)"
@@ -1467,7 +1593,10 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                     
                     # 定期保存模型（基于训练次数）
                     if training_count % config.get('save_every', 50) == 0:
-                        model_manager.model.save(filename="SAC", directory=config['model_save_dir'])
+                        # 确保保存目录存在
+                        save_dir = Path(config['model_save_dir'])
+                        save_dir.mkdir(parents=True, exist_ok=True)
+                        model_manager.model.save(filename="SAC", directory=save_dir)
                 else:
                     # 缓冲区数据不足，短暂等待
                     # 只在第一次或每100次检查时打印一次，避免日志过多
@@ -1547,8 +1676,7 @@ class ParallelMultiEnvTrainer:
                  critic_loss_threshold=100.0,
                  actor_update_frequency=1,
                  critic_target_update_frequency=4,
-                 hidden_dim=1024,
-                 hidden_depth=3,
+                 hidden_layers=[1024, 512],
                  avg_loss_window_size=5,
                  total_eval_episodes=0,
                  # 奖励函数参数
@@ -1587,7 +1715,8 @@ class ParallelMultiEnvTrainer:
                  config_path=None,
                  best_model_eligibility_threshold=5.0,
                  best_model_eligibility_ratio=0.8,
-                 discount_factor=0.99):
+                 discount_factor=0.99,
+                 reward_scale=1.0):  # 奖励缩放因子，用于控制每步整体奖励大小
         
         def _to_bool(val, default=True):
             if isinstance(val, bool):
@@ -1635,8 +1764,7 @@ class ParallelMultiEnvTrainer:
         self.critic_loss_threshold = critic_loss_threshold
         self.actor_update_frequency = actor_update_frequency
         self.critic_target_update_frequency = critic_target_update_frequency
-        self.hidden_dim = hidden_dim
-        self.hidden_depth = hidden_depth
+        self.hidden_layers = hidden_layers
         self.avg_loss_window_size = avg_loss_window_size
         self.reward_debug = reward_debug
         self.base_state_dim = base_state_dim
@@ -1675,6 +1803,8 @@ class ParallelMultiEnvTrainer:
         self.reset_step_count = reset_step_count
         # 动作噪声参数
         self.action_noise_std = action_noise_std
+        # 奖励归一化参数
+        self.reward_scale = reward_scale
         # 最好模型评比资格检查参数
         self.best_model_eligibility_threshold = best_model_eligibility_threshold
         self.best_model_eligibility_ratio = best_model_eligibility_ratio
@@ -1696,11 +1826,28 @@ class ParallelMultiEnvTrainer:
             self.device = torch.device("cpu")
             print("CUDA不可用，使用CPU")
         
-        # 模型配置
-        base_save_dir = Path(model_save_dir) if model_save_dir else Path("src/drl_navigation_ros2/models/SAC")
-        timestamp_env = os.environ.get('TRAINING_TIMESTAMP')
+        # ==================== 日志与模型保存目录配置 ====================
+        # 优先使用外部脚本(start_multi_env_training.sh)传入的 LOG_DIR 和 TRAINING_TIMESTAMP，
+        # 确保模型与配置都保存在对应的日志子目录中，例如：
+        #   /log/multi_env_training/train_20260103_102344/model
+        #   /log/multi_env_training/train_20260103_102344/best_model
+        log_dir_env = os.environ.get('LOG_DIR', None)
+        timestamp_env = os.environ.get('TRAINING_TIMESTAMP', None)
         timestamp = timestamp_env if timestamp_env else datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.model_save_dir = base_save_dir / timestamp
+        self.timestamp = timestamp
+
+        if log_dir_env:
+            # 日志目录由启动脚本创建，这里只在其下创建子目录
+            self.log_dir = Path(log_dir_env)
+            self.model_save_dir = self.log_dir / "model"
+            self.best_model_save_dir = self.log_dir / "best_model"
+        else:
+            # 兼容旧逻辑：仍然按照模型基目录 + 时间戳创建保存目录
+            base_save_dir = Path(model_save_dir) if model_save_dir else Path("src/drl_navigation_ros2/models/SAC")
+            self.log_dir = None
+            self.model_save_dir = base_save_dir / timestamp
+            self.best_model_save_dir = self.model_save_dir / "best"
+
         self.model_load_dir = Path(model_load_dir) if model_load_dir else Path("src/drl_navigation_ros2/models/SAC")
         self.load_model = load_model
         self.config_path = config_path
@@ -1718,10 +1865,18 @@ class ParallelMultiEnvTrainer:
         
         # 创建目录
         self._setup_directories()
-        # 保存本次训练使用的配置快照
+        # 保存本次训练使用的配置快照：
+        #   - 若存在日志目录，则保存在日志目录根下，文件名带时间戳
+        #   - 否则，保存在模型保存目录下，文件名同样带时间戳
         if self.config_path and Path(self.config_path).exists():
             try:
-                shutil.copy(self.config_path, self.model_save_dir / "config_used.yaml")
+                if self.log_dir is not None:
+                    config_save_dir = self.log_dir
+                else:
+                    config_save_dir = self.model_save_dir
+                config_save_dir.mkdir(parents=True, exist_ok=True)
+                config_filename = f"config_{self.timestamp}.yaml"
+                shutil.copy(self.config_path, config_save_dir / config_filename)
             except Exception as e:
                 print(f"警告: 复制配置到保存目录失败: {e}")
         
@@ -1735,22 +1890,32 @@ class ParallelMultiEnvTrainer:
         else:
             print(f"创建新的随机初始化模型")
         # 初始化模型
+        actor_grad_clip_value = self._loaded_config.get('actor_grad_clip_value', 0.0)
+        critic_grad_clip_value = self._loaded_config.get('critic_grad_clip_value', 0.0)
+        # 学习率相关参数（从配置文件读取，若未配置则使用默认值）
+        actor_lr = self._loaded_config.get('actor_lr', 1e-4)
+        critic_lr = self._loaded_config.get('critic_lr', 1e-4)
+        alpha_lr = self._loaded_config.get('alpha_lr', 1e-4)
         self.model = SAC(
             state_dim=state_dim_effective,
             action_dim=action_dim,
             max_action=max_action,
             device=self.device,
             discount=discount_factor,  # 传递折扣因子
+            actor_lr=actor_lr,  # 传递Actor学习率
+            critic_lr=critic_lr,  # 传递Critic学习率
+            alpha_lr=alpha_lr,  # 传递温度参数学习率
             actor_update_frequency=actor_update_frequency,
             critic_target_update_frequency=critic_target_update_frequency,
-            hidden_dim=hidden_dim,
-            hidden_depth=hidden_depth,
+            hidden_layers=hidden_layers,
             save_every=0,  # 不自动保存
             load_model=self.load_model,
             save_directory=self.model_save_dir,
             load_directory=self.model_load_dir,
             action_noise_std=self.action_noise_std,
             base_state_dim=base_state_dim,  # 传递base_state_dim给SAC模型
+            actor_grad_clip_value=actor_grad_clip_value,  # 传递Actor梯度裁剪值
+            critic_grad_clip_value=critic_grad_clip_value,  # 传递Critic梯度裁剪值
         )
         print(f"初始化SAC模型完成")
         
@@ -1781,22 +1946,19 @@ class ParallelMultiEnvTrainer:
         self.model_manager.shared_model_dict['shared_temp_dir'] = self.model_manager.temp_dir
         
         # 打印主进程模型结构概要（层级与参数形状）
-        def _describe_mlp(input_dim, hidden_dim_val, output_dim, depth):
+        def _describe_mlp(input_dim, hidden_layers_list, output_dim):
             layers = [("输入层", input_dim)]
-            if depth == 0:
-                layers.append(("输出层", output_dim))
-                return layers
-            for idx in range(depth):
-                layers.append((f"隐含层{idx + 1}", hidden_dim_val))
+            for idx, hidden_size in enumerate(hidden_layers_list):
+                layers.append((f"隐含层{idx + 1}", hidden_size))
             layers.append(("输出层", output_dim))
             return layers
 
         weight_log("主进程模型结构概览:")
         # actor 结构: trunk 输出为 action_dim 的均值和对数方差，故输出维度为 2 * action_dim
-        actor_layers = _describe_mlp(state_dim_effective, hidden_dim, 2 * action_dim, hidden_depth)
+        actor_layers = _describe_mlp(state_dim_effective, hidden_layers, 2 * action_dim)
         weight_log(f"  主进程 actor 层级神经元: " + " -> ".join([f"{name}:{size}" for name, size in actor_layers]))
         # critic 结构: Q1/Q2 两个 MLP，输入为 state_dim+action_dim，输出为标量 Q 值
-        critic_layers = _describe_mlp(state_dim_effective + action_dim, hidden_dim, 1, hidden_depth)
+        critic_layers = _describe_mlp(state_dim_effective + action_dim, hidden_layers, 1)
         weight_log(f"  主进程 critic(Q1/Q2) 层级神经元: " + " -> ".join([f"{name}:{size}" for name, size in critic_layers]))
         for key, value in self.model.state_dict().items():
             if isinstance(value, dict):
@@ -1881,8 +2043,7 @@ class ParallelMultiEnvTrainer:
             'critic_loss_threshold': critic_loss_threshold,
             'actor_update_frequency': actor_update_frequency,
             'critic_target_update_frequency': critic_target_update_frequency,
-            'hidden_dim': hidden_dim,
-            'hidden_depth': hidden_depth,
+            'hidden_layers': hidden_layers,
             'avg_loss_window_size': avg_loss_window_size,
             'gpu_id': gpu_id,  # 添加GPU ID到配置中
             'reward_debug': self.reward_debug,
@@ -1922,6 +2083,8 @@ class ParallelMultiEnvTrainer:
             'action_noise_std': action_noise_std,
             # 连通区域选择参数（从 train.yaml 读取）
             'region_select_bias': self.region_select_bias,
+            # 奖励归一化参数
+            'reward_scale': self.reward_scale,
             # 最好模型评比资格检查参数
             'best_model_eligibility_threshold': self.best_model_eligibility_threshold,
             'best_model_eligibility_ratio': self.best_model_eligibility_ratio,
@@ -1938,8 +2101,10 @@ class ParallelMultiEnvTrainer:
         try:
             self.model_save_dir.mkdir(parents=True, exist_ok=True)
             print(f"模型保存目录已准备: {self.model_save_dir}")
-            # 创建best模型保存目录（作为子目录）
-            self.best_model_save_dir = self.model_save_dir / "best"
+            # 创建最好模型保存目录（不再强制为 model 子目录，而是使用预先配置的路径）
+            if not hasattr(self, 'best_model_save_dir') or self.best_model_save_dir is None:
+                # 兜底：若未显式设置，则仍旧在模型目录下创建 best 子目录
+                self.best_model_save_dir = self.model_save_dir / "best"
             self.best_model_save_dir.mkdir(parents=True, exist_ok=True)
             print(f"最好模型保存目录已准备: {self.best_model_save_dir}")
         except PermissionError:
@@ -1987,6 +2152,8 @@ class ParallelMultiEnvTrainer:
                 
                 # 保存最好模型
                 try:
+                    # 确保保存目录存在
+                    self.best_model_save_dir.mkdir(parents=True, exist_ok=True)
                     self.model.save(filename="SAC", directory=self.best_model_save_dir)
                     print(f"\n{'='*60}")
                     print(f"保存最好模型到: {self.best_model_save_dir}")
@@ -2113,6 +2280,8 @@ class ParallelMultiEnvTrainer:
                         p.kill()
             
             # 保存最终模型
+            # 确保保存目录存在
+            self.model_save_dir.mkdir(parents=True, exist_ok=True)
             self.model.save(filename="SAC", directory=self.model_save_dir)
             print(f"最终模型已保存到 {self.model_save_dir}")
             
@@ -2185,8 +2354,7 @@ def parse_args():
     parser.add_argument('--critic_loss_threshold', type=float, default=None, help='critic损失阈值（覆盖配置文件）')
     parser.add_argument('--actor_update_frequency', type=int, default=None, help='Actor网络更新频率（覆盖配置文件）')
     parser.add_argument('--critic_target_update_frequency', type=int, default=None, help='Critic目标网络更新频率（覆盖配置文件）')
-    parser.add_argument('--hidden_dim', type=int, default=None, help='神经网络隐藏层维度（覆盖配置文件）')
-    parser.add_argument('--hidden_depth', type=int, default=None, help='神经网络隐藏层深度（覆盖配置文件）')
+    parser.add_argument('--hidden_layers', type=str, default=None, help='神经网络隐藏层结构（覆盖配置文件，JSON格式，例如：[1024,512]）')
     parser.add_argument('--avg_loss_window_size', type=int, default=None, help='平均损失计算窗口大小（覆盖配置文件，向后兼容参数名）')
     parser.add_argument('--loss_window_size', type=int, default=None, help='训练损失窗口大小（覆盖配置文件）')
     
@@ -2302,8 +2470,14 @@ def main():
     gpu_id = args.gpu_id if hasattr(args, 'gpu_id') and args.gpu_id is not None else config.get('gpu_id', 0)
     
     # 网络结构参数
-    hidden_dim = args.hidden_dim if hasattr(args, 'hidden_dim') and args.hidden_dim is not None else config.get('hidden_dim', 1024)
-    hidden_depth = args.hidden_depth if hasattr(args, 'hidden_depth') and args.hidden_depth is not None else config.get('hidden_depth', 3)
+    if hasattr(args, 'hidden_layers') and args.hidden_layers is not None and args.hidden_layers.strip() != '':
+        try:
+            hidden_layers = json.loads(args.hidden_layers)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"警告: 无法解析 --hidden_layers 参数 '{args.hidden_layers}'，使用配置文件中的值。错误: {e}")
+            hidden_layers = config.get('hidden_layers', [1024, 512])
+    else:
+        hidden_layers = config.get('hidden_layers', [1024, 512])
     
     # 训练算法参数
     discount_factor = config.get('discount_factor', 0.99)  # 折扣因子（gamma），从配置文件 train.yaml 读取，统一用于计算总回报和所有 Reward Detail 分项的折扣回报
@@ -2320,8 +2494,8 @@ def main():
     # 为了向后兼容，同时设置avg_loss_window_size
     avg_loss_window_size = loss_window_size
     
-    # 路径参数
-    model_save_dir = args.model_save_dir if hasattr(args, 'model_save_dir') and args.model_save_dir is not None else config.get('model_save_dir', None)
+    # 路径参数（只允许通过命令行参数指定模型保存目录，不再从配置文件读取）
+    model_save_dir = args.model_save_dir if hasattr(args, 'model_save_dir') and args.model_save_dir is not None else None
     # 优先使用 load_path，如果没有则使用 model_load_dir（向后兼容）
     model_load_dir = args.model_load_dir if hasattr(args, 'model_load_dir') and args.model_load_dir is not None else config.get('load_path', config.get('model_load_dir', None))
     # 优先使用 load_model，如果没有则使用 load_existing_model（向后兼容）
@@ -2358,6 +2532,9 @@ def main():
     linear_acceleration_oscillation_penalty_base = config.get('linear_acceleration_oscillation_penalty_base', -1.0)
     yawrate_oscillation_penalty_base = config.get('yawrate_oscillation_penalty_base', -1.0)
     
+    # 奖励归一化参数
+    reward_scale = config.get('reward_scale', 1.0)  # 奖励缩放因子，用于控制每步整体奖励大小
+    
     # 时间控制参数
     sim_time = config.get('sim_time', 0.1)
     step_sleep_time = args.step_sleep_time if hasattr(args, 'step_sleep_time') and args.step_sleep_time is not None else config.get('step_sleep_time', 0.1)
@@ -2384,6 +2561,18 @@ def main():
     
     # 缓冲区参数（仅来自配置文件）
     use_float64_for_buffer = parse_bool(config.get('use_float64_for_buffer', False), False)
+    
+    # ==================== 日志目录与模型保存目录同步 ====================
+    # 若外部脚本提供了 LOG_DIR，则将实时模型保存目录固定为：
+    #   LOG_DIR/model
+    # 这样可以保证：
+    #   /log/multi_env_training/train_YYYYmmdd_HHMMSS/model        —— 实时模型
+    #   /log/multi_env_training/train_YYYYmmdd_HHMMSS/best_model   —— 最好模型
+    log_dir_env_main = os.environ.get('LOG_DIR', None)
+    if log_dir_env_main:
+        model_save_dir = str(Path(log_dir_env_main) / "model")
+        # 同时更新config中的model_save_dir，供训练线程等直接使用
+        config['model_save_dir'] = model_save_dir
     
     # 创建训练器
     trainer = ParallelMultiEnvTrainer(
@@ -2431,8 +2620,7 @@ def main():
         critic_loss_threshold=critic_loss_threshold,
         actor_update_frequency=actor_update_frequency,
         critic_target_update_frequency=critic_target_update_frequency,
-        hidden_dim=hidden_dim,
-        hidden_depth=hidden_depth,
+        hidden_layers=hidden_layers,
         avg_loss_window_size=avg_loss_window_size,
         goal_reward=goal_reward,
         base_collision_penalty=base_collision_penalty,
@@ -2467,6 +2655,7 @@ def main():
         best_model_eligibility_threshold=best_model_eligibility_threshold,
         best_model_eligibility_ratio=best_model_eligibility_ratio,
         discount_factor=discount_factor,
+        reward_scale=reward_scale,  # 奖励缩放因子
     )
     
     # 开始训练

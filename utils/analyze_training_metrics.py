@@ -83,6 +83,11 @@ try:
     # 设置中文字体
     matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans', 'SimHei', 'Arial Unicode MS']
     matplotlib.rcParams['axes.unicode_minus'] = False
+    # 优化matplotlib性能设置
+    matplotlib.rcParams['path.simplify'] = True  # 简化路径以提高渲染速度
+    matplotlib.rcParams['path.simplify_threshold'] = 1.0  # 简化阈值（值越大简化越多）
+    matplotlib.rcParams['agg.path.chunksize'] = 10000  # 分块处理大数据集
+    matplotlib.rcParams['figure.max_open_warning'] = 0  # 禁用警告
 except ImportError:
     HAS_MATPLOTLIB = False
     print("警告: matplotlib未安装，将跳过绘图功能")
@@ -111,22 +116,83 @@ class TeeOutput:
 class TrainingMetricsAnalyzer:
     def __init__(self, log_file: str):
         self.log_file = Path(log_file)
-        self.training_records = []  # (training_step, critic_loss, actor_loss, avg_sample_times)
-        self.episodes = []  # (episode_num, env_id, end_status, reward_details, steps)
+        # training_records: (training_step, critic_loss, actor_loss, avg_sample_times, 
+        #                   critic_grad_before, critic_grad_after, actor_grad_before, actor_grad_after,
+        #                   entropy, alpha_grad)
+        self.training_records = []
+        self.episodes = []  # (episode_num, env_id, end_status, reward_details, steps, timestamp)
         # reward_details: Dict with keys: goal, collision, angle, linear, target_distance, obs, yawrate
         # steps: int, episode的步数
+        # timestamp: datetime, episode产生的时间戳
+        self.best_model_records = []  # (episode_num, success_rate, collision_rate, save_path)
+        # 训练耗时记录
+        self.training_durations = []  # 每次训练的耗时（秒）
+        self.total_sample_count = []  # 每次训练的总抽样数
+        self.total_sample_steps = []  # 每次训练的总样本数（step数）
+        # 用于跟踪最高成功率
+        self.best_success_rate = 0.0
+        self.best_model_info = None  # (episode_num, success_rate, collision_rate, save_path)
         
+        # 预编译正则表达式以提高性能
+        self._compile_regex_patterns()
+    
+    def _compile_regex_patterns(self):
+        """预编译所有正则表达式以提高性能"""
+        # 训练记录相关
+        self.regex_training_step = re.compile(r'第(\d+)次训练完成')
+        self.regex_sample_times = re.compile(r'样本平均抽样次数:\s+([\d.]+)')
+        self.regex_critic_loss = re.compile(r'本次训练的平均critic网络损失:\s+([-\d.]+)')
+        self.regex_actor_loss = re.compile(r'本次训练的平均actor网络损失:\s+([-\d.]+)')
+        self.regex_critic_grad = re.compile(r'critic全局参数梯度L2范数\(裁剪前:([\d.]+),\s*裁剪后:([\d.]+)\)')
+        self.regex_actor_grad = re.compile(r'actor梯度\(裁剪前:([\d.]+),\s*裁剪后:([\d.]+)\)')
+        self.regex_entropy = re.compile(r'熵值:\s+([-\d.]+)')
+        self.regex_alpha_grad = re.compile(r'alpha梯度L2范数:\s+([\d.]+)')
+        self.regex_training_duration = re.compile(r'训练耗时:\s+([\d.]+)秒')
+        self.regex_total_sample_count = re.compile(r'总抽样数:\s+(\d+)')
+        self.regex_total_sample_steps = re.compile(r'总样本数:\s+(\d+)')
+        # 时间戳格式：2026-01-07 11:49:47
+        self.regex_timestamp = re.compile(r'^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})')
+        
+        # Episode相关
+        self.regex_episode_env = re.compile(r'环境\s+(\d+)\s+Episode:\s+(\d+)')
+        self.regex_episode_steps = re.compile(r'Steps:\s+(\d+)')
+        self.regex_end_status = re.compile(r'end=(Goal|Collision|Timeout)')
+        self.regex_episode_old = re.compile(r'环境\s+(\d+)\s+Episode:\s+(\d+).*?End:\s+(Goal|Collision|Timeout)')
+        
+        # Reward Detail相关
+        self.regex_reward_patterns = {
+            'goal': re.compile(r'goal=(-?\d+\.?\d*)'),
+            'collision': re.compile(r'collision=(-?\d+\.?\d*)'),
+            'angle': re.compile(r'angle=(-?\d+\.?\d*)'),
+            'linear': re.compile(r'linear=(-?\d+\.?\d*)'),
+            'target_distance': re.compile(r'target_distance=(-?\d+\.?\d*)'),
+            'obs': re.compile(r'obs=(-?\d+\.?\d*)'),
+            'yawrate': re.compile(r'yawrate=(-?\d+\.?\d*)'),
+        }
+        
+        # 最好模型相关
+        self.regex_best_model_path = re.compile(r'保存最好模型到:\s+(.+)')
+        self.regex_best_model_success = re.compile(r'成功率=([\d.]+)\s*\(')
+        self.regex_best_model_collision = re.compile(r'碰撞率=([\d.]+)\s*\(')
+    
     def parse_training_record(self, line: str) -> Optional[Tuple]:
         """解析训练完成记录"""
         # 格式：第X次训练完成
-        match = re.search(r'第(\d+)次训练完成', line)
+        match = self.regex_training_step.search(line)
         if match:
             training_step = int(match.group(1))
             return ('training_start', training_step)
         return None
     
     def parse_training_details(self, lines: List[str], start_idx: int) -> Optional[Tuple]:
-        """解析训练详细信息（多行）"""
+        """解析训练详细信息（多行）
+        直接匹配5行模式，不依赖训练完成行
+        第1行：总抽样数、总样本数、样本平均抽样次数
+        第2行：Critic损失和梯度
+        第3行：Actor损失和梯度
+        第4行：熵值统计（可选）
+        第5行：训练耗时
+        """
         if start_idx + 2 >= len(lines):
             return None
         
@@ -134,28 +200,94 @@ class TrainingMetricsAnalyzer:
             # 第一行：总抽样数、总样本数、样本平均抽样次数
             # 格式：  总抽样数: X | 总样本数: Y | 样本平均抽样次数: Z.ZZ
             line1 = lines[start_idx].strip()
-            sample_match = re.search(r'样本平均抽样次数:\s+([\d.]+)', line1)
+            sample_match = self.regex_sample_times.search(line1)
             if not sample_match:
                 return None
             avg_sample_times = float(sample_match.group(1))
             
-            # 第二行：critic和actor网络损失
-            # 格式：  本次训练的平均critic网络损失: X.XX | 前10次训练的平均critic网络损失: Y.YY
+            # 尝试从第一行或前面的行中提取训练步数（如果有训练完成行）
+            training_step = None
+            # 向前查找最多5行，寻找训练完成行
+            for lookback in range(1, min(6, start_idx + 1)):
+                prev_line = lines[start_idx - lookback].strip()
+                training_match = self.regex_training_step.search(prev_line)
+                if training_match:
+                    training_step = int(training_match.group(1))
+                    break
+            # 如果找不到，使用已解析的训练记录数量+1作为训练步数
+            if training_step is None:
+                training_step = len(self.training_records) + 1
+            
+            # 第二行：critic和actor网络损失，可能包含梯度信息
+            # 格式：  本次训练的平均critic网络损失: X.XX | 前10次训练的平均critic网络损失: Y.YY | critic全局参数梯度L2范数(裁剪前:XX.XX, 裁剪后:YY.YY)
             line2 = lines[start_idx + 1].strip()
-            critic_match = re.search(r'本次训练的平均critic网络损失:\s+([-\d.]+)', line2)
+            critic_match = self.regex_critic_loss.search(line2)
             if not critic_match:
                 return None
             critic_loss = float(critic_match.group(1))
             
-            # 第三行：actor网络损失
-            # 格式：  本次训练的平均actor网络损失: X.XX | 前10次训练的平均actor网络损失: Y.YY
+            # 提取critic梯度信息（裁剪前后）
+            critic_grad_before = None
+            critic_grad_after = None
+            critic_grad_match = self.regex_critic_grad.search(line2)
+            if critic_grad_match:
+                critic_grad_before = float(critic_grad_match.group(1))
+                critic_grad_after = float(critic_grad_match.group(2))
+            
+            # 第三行：actor网络损失，可能包含梯度信息
+            # 格式：  本次训练的平均actor网络损失: X.XX | 前10次训练的平均actor网络损失: Y.YY | actor梯度(裁剪前:XX.XX, 裁剪后:YY.YY)
             line3 = lines[start_idx + 2].strip()
-            actor_match = re.search(r'本次训练的平均actor网络损失:\s+([-\d.]+)', line3)
+            actor_match = self.regex_actor_loss.search(line3)
             if not actor_match:
                 return None
             actor_loss = float(actor_match.group(1))
             
-            return ('training_details', avg_sample_times, critic_loss, actor_loss)
+            # 提取actor梯度信息（裁剪前后）
+            actor_grad_before = None
+            actor_grad_after = None
+            actor_grad_match = self.regex_actor_grad.search(line3)
+            if actor_grad_match:
+                actor_grad_before = float(actor_grad_match.group(1))
+                actor_grad_after = float(actor_grad_match.group(2))
+            
+            # 第四行：熵值统计（可能不存在）
+            # 格式：  熵值统计: | 熵值: X.XX | alpha梯度L2范数: Y.YY
+            entropy = None
+            alpha_grad = None
+            if start_idx + 3 < len(lines):
+                line4 = lines[start_idx + 3].strip()
+                if '熵值统计' in line4:
+                    entropy_match = self.regex_entropy.search(line4)
+                    if entropy_match:
+                        entropy = float(entropy_match.group(1))
+                    alpha_grad_match = self.regex_alpha_grad.search(line4)
+                    if alpha_grad_match:
+                        alpha_grad = float(alpha_grad_match.group(1))
+            
+            # 解析训练耗时、总抽样数、总样本数
+            training_duration = None
+            total_sample_count = None
+            total_sample_steps = None
+            # 从第一行提取总抽样数和总样本数
+            sample_count_match = self.regex_total_sample_count.search(line1)
+            if sample_count_match:
+                total_sample_count = int(sample_count_match.group(1))
+            sample_steps_match = self.regex_total_sample_steps.search(line1)
+            if sample_steps_match:
+                total_sample_steps = int(sample_steps_match.group(1))
+            # 查找训练耗时（可能在熵值统计行之后，即第5行或更后面）
+            # 检查第4行（如果有熵值统计）或第4行之后
+            check_start = start_idx + 3 if (start_idx + 3 < len(lines) and '熵值统计' in lines[start_idx + 3].strip()) else start_idx + 2
+            for idx in range(check_start, min(start_idx + 7, len(lines))):
+                line_check = lines[idx].strip()
+                duration_match = self.regex_training_duration.search(line_check)
+                if duration_match:
+                    training_duration = float(duration_match.group(1))
+                    break
+            
+            return ('training_details', training_step, avg_sample_times, critic_loss, actor_loss, 
+                   critic_grad_before, critic_grad_after, actor_grad_before, actor_grad_after,
+                   entropy, alpha_grad, training_duration, total_sample_count, total_sample_steps)
         except (IndexError, ValueError, AttributeError):
             return None
     
@@ -163,18 +295,9 @@ class TrainingMetricsAnalyzer:
         """解析Reward Detail行"""
         # 格式：  Reward Detail: end=Status, total_reward=X.XX, goal=Y.YY, collision=Z.ZZ, angle=W.WW, linear=V.VV, target_distance=U.UU
         detail = {}
-        # 使用更精确的正则表达式，确保匹配的是浮点数格式（包含可选负号和数字+小数点）
-        patterns = {
-            'goal': r'goal=(-?\d+\.?\d*)',
-            'collision': r'collision=(-?\d+\.?\d*)',
-            'angle': r'angle=(-?\d+\.?\d*)',
-            'linear': r'linear=(-?\d+\.?\d*)',
-            'target_distance': r'target_distance=(-?\d+\.?\d*)',
-            'obs': r'obs=(-?\d+\.?\d*)',
-            'yawrate': r'yawrate=(-?\d+\.?\d*)',
-        }
-        for key, pattern in patterns.items():
-            match = re.search(pattern, line)
+        # 使用预编译的正则表达式
+        for key, pattern in self.regex_reward_patterns.items():
+            match = pattern.search(line)
             if match:
                 try:
                     detail[key] = float(match.group(1))
@@ -184,33 +307,80 @@ class TrainingMetricsAnalyzer:
                 detail[key] = 0.0  # 如果没有找到，默认为0
         return detail
     
+    def parse_best_model_record(self, lines: List[str], start_idx: int) -> Optional[Tuple]:
+        """解析保存最好模型的记录"""
+        # 格式：
+        # ============================================================
+        # 保存最好模型到: /path/to/best_model
+        # 当前最好统计: 成功率=0.1270 (12.70%), 碰撞率=0.2910 (29.10%)
+        # ============================================================
+        if start_idx + 2 >= len(lines):
+            return None
+        
+        try:
+            # 检查是否是保存最好模型的记录（strip()去除换行符和空格）
+            line1 = lines[start_idx + 1].strip() if start_idx + 1 < len(lines) else ""
+            if '保存最好模型到:' not in line1:
+                return None
+            
+            # 提取保存路径
+            path_match = self.regex_best_model_path.search(line1)
+            if not path_match:
+                return None
+            save_path = path_match.group(1).strip()
+            
+            # 提取成功率和碰撞率
+            stats_line = lines[start_idx + 2].strip() if start_idx + 2 < len(lines) else ""
+            success_match = self.regex_best_model_success.search(stats_line)
+            collision_match = self.regex_best_model_collision.search(stats_line)
+            
+            if not success_match or not collision_match:
+                return None
+            
+            success_rate = float(success_match.group(1))
+            collision_rate = float(collision_match.group(1))
+            
+            # 尝试从上下文获取episode编号（从之前的episode记录中推断）
+            # 如果找不到，使用当前已解析的最后一个episode编号
+            episode_num = 0
+            if self.episodes:
+                episode_num = self.episodes[-1][0]
+            
+            return ('best_model', episode_num, success_rate, collision_rate, save_path)
+        except (IndexError, ValueError, AttributeError):
+            return None
+    
     def parse_episode(self, line: str, prev_line: str = "") -> Optional[Tuple]:
         """解析episode信息"""
         # 检查是否是Reward Detail行
         if 'Reward Detail:' in line:
             # 从Reward Detail行提取end状态和reward details
-            end_match = re.search(r'end=(Goal|Collision|Timeout)', line)
+            end_match = self.regex_end_status.search(line)
             reward_detail = self.parse_reward_detail(line)
             
             if end_match and prev_line:
                 # 从上一行提取episode编号、环境ID和Steps
                 # 匹配格式：环境 X Episode: Y Target Distance: A.AA (actual: B.BB) Steps: N
-                pattern1 = r'环境\s+(\d+)\s+Episode:\s+(\d+)'
-                steps_pattern = r'Steps:\s+(\d+)'
-                
-                match = re.search(pattern1, prev_line)
-                steps_match = re.search(steps_pattern, prev_line)
+                match = self.regex_episode_env.search(prev_line)
+                steps_match = self.regex_episode_steps.search(prev_line)
                 if match:
                     env_id = int(match.group(1))
                     episode_num = int(match.group(2))
                     end_status = end_match.group(1)
                     # 提取Steps信息，如果没有找到则默认为0
                     steps = int(steps_match.group(1)) if steps_match else 0
-                    return ('episode', env_id, episode_num, end_status, reward_detail, steps)
+                    # 提取时间戳
+                    timestamp = None
+                    timestamp_match = self.regex_timestamp.search(prev_line)
+                    if timestamp_match:
+                        try:
+                            timestamp = datetime.strptime(timestamp_match.group(1), '%Y-%m-%d %H:%M:%S')
+                        except ValueError:
+                            timestamp = None
+                    return ('episode', env_id, episode_num, end_status, reward_detail, steps, timestamp)
         
         # 向后兼容：尝试匹配旧格式
-        pattern_old = r'环境\s+(\d+)\s+Episode:\s+(\d+).*?End:\s+(Goal|Collision|Timeout)'
-        match = re.search(pattern_old, line)
+        match = self.regex_episode_old.search(line)
         if match:
             env_id = int(match.group(1))
             episode_num = int(match.group(2))
@@ -220,85 +390,219 @@ class TrainingMetricsAnalyzer:
                            'target_distance': 0.0, 'obs': 0.0, 'yawrate': 0.0}
             # 旧格式没有steps信息，默认为0
             steps = 0
-            return ('episode', env_id, episode_num, end_status, reward_detail, steps)
+            # 提取时间戳
+            timestamp = None
+            timestamp_match = self.regex_timestamp.search(line)
+            if timestamp_match:
+                try:
+                    timestamp = datetime.strptime(timestamp_match.group(1), '%Y-%m-%d %H:%M:%S')
+                except ValueError:
+                    timestamp = None
+            return ('episode', env_id, episode_num, end_status, reward_detail, steps, timestamp)
         
         return None
     
     def parse_log(self):
-        """解析日志文件"""
+        """解析日志文件（优化版本，使用预编译正则表达式和优化的循环）"""
         print(f"正在解析日志文件: {self.log_file}")
         
+        # 读取文件（对于大文件，可以考虑分块读取，但这里一次性读取更简单）
         with open(self.log_file, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         
         print(f"日志文件总行数: {len(lines)}")
         
+        # 预分配列表以提高性能（如果可能的话）
         current_training_step = None
         prev_line = ""
         
+        # 使用更高效的循环（减少函数调用开销）
         i = 0
-        while i < len(lines):
+        lines_len = len(lines)
+        
+        while i < lines_len:
+            # 直接访问，减少函数调用
             line = lines[i].strip()
             
-            # 解析训练记录
-            training_start = self.parse_training_record(line)
-            if training_start:
-                current_training_step = training_start[1]
-                # 尝试解析接下来的训练详细信息
-                if i + 3 < len(lines):
-                    training_details = self.parse_training_details(lines, i + 1)
-                    if training_details:
-                        _, avg_sample_times, critic_loss, actor_loss = training_details
-                        self.training_records.append((
-                            current_training_step, critic_loss, actor_loss, avg_sample_times
-                        ))
-                        i += 4  # 跳过已解析的行
-                        continue
+            # 直接尝试解析训练详细信息（不依赖训练完成行）
+            # 匹配模式：第1行（总抽样数等）-> 第2行（Critic损失）-> 第3行（Actor损失）-> 第4行（熵值，可选）-> 第5行（训练耗时）
+            if i + 2 < lines_len:
+                training_details = self.parse_training_details(lines, i)
+                if training_details:
+                    _, training_step, avg_sample_times, critic_loss, actor_loss, critic_grad_before, critic_grad_after, actor_grad_before, actor_grad_after, entropy, alpha_grad, training_duration, total_sample_count, total_sample_steps = training_details
+                    self.training_records.append((
+                        training_step, critic_loss, actor_loss, avg_sample_times,
+                        critic_grad_before, critic_grad_after, actor_grad_before, actor_grad_after,
+                        entropy, alpha_grad
+                    ))
+                    # 保存训练耗时、总抽样数、总样本数
+                    if training_duration is not None:
+                        self.training_durations.append(training_duration)
+                    if total_sample_count is not None:
+                        self.total_sample_count.append(total_sample_count)
+                    if total_sample_steps is not None:
+                        self.total_sample_steps.append(total_sample_steps)
+                    # 计算需要跳过的行数
+                    # 我们已经解析了第1-3行（总抽样数、Critic损失、Actor损失）
+                    skip_lines = 3  # 至少跳过3行
+                    # 检查是否有熵值统计（在第4行，即i+3）
+                    if i + 3 < lines_len and '熵值统计' in lines[i + 3].strip():
+                        skip_lines = 4  # 如果有熵值统计，跳过4行（包括熵值统计行）
+                    # 训练耗时可能在熵值统计行之后，但我们不需要跳过它，因为下一轮循环会自然跳过
+                    i += skip_lines
+                    continue
             
-            # 解析Episode
-            episode_info = self.parse_episode(line, prev_line)
-            if episode_info and episode_info[0] == 'episode':
-                _, env_id, episode_num, end_status, reward_detail, steps = episode_info
-                self.episodes.append((episode_num, env_id, end_status, reward_detail, steps))
+            # 解析保存最好模型的记录（使用字符串查找优化）
+            if '============================================================' in line and i + 3 < lines_len:
+                best_model_info = self.parse_best_model_record(lines, i)
+                if best_model_info and best_model_info[0] == 'best_model':
+                    _, episode_num, success_rate, collision_rate, save_path = best_model_info
+                    self.best_model_records.append((episode_num, success_rate, collision_rate, save_path))
+                    # 更新最高成功率信息
+                    if success_rate > self.best_success_rate:
+                        self.best_success_rate = success_rate
+                        self.best_model_info = (episode_num, success_rate, collision_rate, save_path)
+                    i += 4  # 跳过已解析的行（包括分隔线和空行）
+                    continue
+            
+            # 解析Episode（优化：先检查是否包含关键词）
+            if 'Reward Detail:' in line or 'Episode:' in line:
+                episode_info = self.parse_episode(line, prev_line)
+                if episode_info and episode_info[0] == 'episode':
+                    _, env_id, episode_num, end_status, reward_detail, steps, timestamp = episode_info
+                    self.episodes.append((episode_num, env_id, end_status, reward_detail, steps, timestamp))
             
             prev_line = line
             i += 1
         
-        # 按训练步数和episode编号排序
-        self.training_records.sort(key=lambda x: x[0])
-        self.episodes.sort(key=lambda x: x[0])
+        # 使用numpy进行排序（对于大数据集更快）
+        if self.training_records:
+            self.training_records.sort(key=lambda x: x[0])
+        if self.episodes:
+            self.episodes.sort(key=lambda x: x[0])
+        if self.best_model_records:
+            self.best_model_records.sort(key=lambda x: x[0])
         
         print(f"成功解析 {len(self.training_records)} 个训练记录")
         print(f"成功解析 {len(self.episodes)} 个episode")
+        print(f"成功解析 {len(self.best_model_records)} 个最好模型保存记录")
     
     def calculate_sliding_window(self, data: List[float], window_size: int) -> List[float]:
-        """计算滑动窗口平均值"""
+        """计算滑动窗口平均值（使用numpy向量化优化）"""
         if not data:
             return []
         
-        result = []
-        for i in range(len(data)):
-            start_idx = max(0, i - window_size + 1)
-            window_data = data[start_idx:i+1]
-            avg = np.mean(window_data) if window_data else 0
-            result.append(avg)
-        return result
+        # 转换为numpy数组以提高性能
+        arr = np.array(data, dtype=np.float64)
+        n = len(arr)
+        
+        if n == 0:
+            return []
+        
+        # 使用numpy的cumsum和数组索引进行向量化计算
+        # 对于每个位置i，计算从max(0, i-window_size+1)到i的平均值
+        cumsum = np.cumsum(arr, dtype=np.float64)
+        
+        # 预计算所有窗口长度
+        indices = np.arange(n)
+        start_indices = np.maximum(0, indices - window_size + 1)
+        window_lens = indices - start_indices + 1
+        
+        # 向量化计算：对于每个位置，使用cumsum计算窗口和
+        # 当start_idx > 0时，需要减去前面的累积和
+        result = np.zeros(n, dtype=np.float64)
+        mask = start_indices > 0
+        result[~mask] = cumsum[~mask] / window_lens[~mask]
+        if np.any(mask):
+            result[mask] = (cumsum[mask] - cumsum[start_indices[mask] - 1]) / window_lens[mask]
+        
+        return result.tolist()
+    
+    def downsample_for_plot(self, x_data: List, y_data: List, max_points: int = 5000) -> Tuple[List, List]:
+        """对绘图数据进行降采样以提高性能（保留首尾和关键点）"""
+        if len(x_data) <= max_points:
+            return x_data, y_data
+        
+        # 转换为numpy数组
+        x_arr = np.array(x_data)
+        y_arr = np.array(y_data)
+        
+        # 计算步长
+        step = max(1, len(x_data) // max_points)
+        
+        # 均匀采样
+        indices = np.arange(0, len(x_data), step)
+        
+        # 确保包含最后一个点
+        if indices[-1] != len(x_data) - 1:
+            indices = np.append(indices, len(x_data) - 1)
+        
+        return x_arr[indices].tolist(), y_arr[indices].tolist()
+    
+    def add_statistics_text(self, ax, data: List[float], position: str = 'upper right', 
+                           fontsize: int = 9, precision: int = 4):
+        """在图上添加统计信息文本（最小值、最大值、平均值）"""
+        if not data:
+            return
+        
+        data_arr = np.array(data)
+        min_val = np.min(data_arr)
+        max_val = np.max(data_arr)
+        mean_val = np.mean(data_arr)
+        
+        # 格式化文本
+        stats_text = f'Min: {min_val:.{precision}f}\nMax: {max_val:.{precision}f}\nMean: {mean_val:.{precision}f}'
+        
+        # 根据位置设置坐标
+        if position == 'upper right':
+            x_pos = 0.98
+            y_pos = 0.98
+            ha = 'right'
+            va = 'top'
+        elif position == 'upper left':
+            x_pos = 0.02
+            y_pos = 0.98
+            ha = 'left'
+            va = 'top'
+        elif position == 'lower right':
+            x_pos = 0.98
+            y_pos = 0.02
+            ha = 'right'
+            va = 'bottom'
+        elif position == 'lower left':
+            x_pos = 0.02
+            y_pos = 0.02
+            ha = 'left'
+            va = 'bottom'
+        else:
+            x_pos = 0.98
+            y_pos = 0.98
+            ha = 'right'
+            va = 'top'
+        
+        # 添加文本框（带背景）
+        ax.text(x_pos, y_pos, stats_text, transform=ax.transAxes,
+               fontsize=fontsize, verticalalignment=va, horizontalalignment=ha,
+               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
+               family='monospace')
     
     def calculate_episode_rates(self, window_size: int) -> Tuple[List[int], List[float], List[float], List[float]]:
-        """计算episode的成功率、碰撞率、超时率（滑动窗口）"""
+        """计算episode的成功率、碰撞率、超时率（滑动窗口，使用numpy优化）"""
         if not self.episodes:
             return [], [], [], []
         
-        episodes = [ep[0] for ep in self.episodes]
-        successes = [1 if ep[2] == 'Goal' else 0 for ep in self.episodes]
-        collisions = [1 if ep[2] == 'Collision' else 0 for ep in self.episodes]
-        timeouts = [1 if ep[2] == 'Timeout' else 0 for ep in self.episodes]
+        # 使用numpy数组和向量化操作
+        episodes = np.array([ep[0] for ep in self.episodes], dtype=np.int32)
+        successes = np.array([1 if ep[2] == 'Goal' else 0 for ep in self.episodes], dtype=np.float64)
+        collisions = np.array([1 if ep[2] == 'Collision' else 0 for ep in self.episodes], dtype=np.float64)
+        timeouts = np.array([1 if ep[2] == 'Timeout' else 0 for ep in self.episodes], dtype=np.float64)
         
-        success_rates = self.calculate_sliding_window(successes, window_size)
-        collision_rates = self.calculate_sliding_window(collisions, window_size)
-        timeout_rates = self.calculate_sliding_window(timeouts, window_size)
+        # 并行计算三个率（虽然这里计算很快，但保持一致性）
+        success_rates = self.calculate_sliding_window(successes.tolist(), window_size)
+        collision_rates = self.calculate_sliding_window(collisions.tolist(), window_size)
+        timeout_rates = self.calculate_sliding_window(timeouts.tolist(), window_size)
         
-        return episodes, success_rates, collision_rates, timeout_rates
+        return episodes.tolist(), success_rates, collision_rates, timeout_rates
     
     def calculate_reward_detail_curves(self, window_size: int) -> Tuple[List[int], Dict[str, List[float]]]:
         """计算reward detail各项的滑动窗口平均值"""
@@ -311,8 +615,7 @@ class TrainingMetricsAnalyzer:
         reward_curves = {}
         for key in reward_keys:
             values = [ep[3].get(key, 0.0) for ep in self.episodes]
-            smoothed = self.calculate_sliding_window(values, window_size)
-            reward_curves[key] = smoothed
+            reward_curves[key] = self.calculate_sliding_window(values, window_size)
         
         return episodes, reward_curves
     
@@ -330,7 +633,7 @@ class TrainingMetricsAnalyzer:
         valid_episodes = 0
         
         for ep in self.episodes:
-            episode_num, env_id, end_status, reward_detail, steps = ep
+            episode_num, env_id, end_status, reward_detail, steps, timestamp = ep
             
             # 跳过steps为0的episode（可能是旧格式或解析失败）
             if steps <= 0:
@@ -373,8 +676,24 @@ class TrainingMetricsAnalyzer:
         has_episodes = len(self.episodes) > 0
         has_reward_details = has_episodes and any(ep[3] for ep in self.episodes if any(ep[3].values()))
         
+        # 检查是否有梯度数据
+        has_gradients = False
+        if has_training and len(self.training_records) > 0:
+            # 检查是否有梯度数据（gradient字段不为None）
+            has_gradients = any(tr[4] is not None for tr in self.training_records)  # critic_grad_before
+        
+        # 检查是否有熵值和alpha梯度数据
+        has_entropy = False
+        if has_training and len(self.training_records) > 0:
+            # 检查是否有熵值数据（entropy字段不为None）
+            has_entropy = any(tr[8] is not None for tr in self.training_records)  # entropy
+        
         if has_training:
             num_plots += 3  # critic loss, actor loss, avg_sample_times
+        if has_gradients:
+            num_plots += 2  # critic gradients, actor gradients
+        if has_entropy:
+            num_plots += 2  # entropy curve, alpha gradient curve
         if has_episodes:
             num_plots += 1  # episode rates
         if has_reward_details:
@@ -384,10 +703,14 @@ class TrainingMetricsAnalyzer:
             print("错误：没有可绘制的数据")
             return
         
-        # 创建图形
+        # 创建图形（优化：减少DPI以提高渲染速度，但保持清晰度）
+        # 使用更高效的backend设置
         fig, axes = plt.subplots(num_plots, 1, figsize=(FIGURE_SIZE[0], FIGURE_SIZE[1]*num_plots))
         if num_plots == 1:
             axes = [axes]
+        
+        # 设置绘图优化参数
+        MAX_POINTS_PER_LINE = 5000  # 每条线最大点数，超过则降采样
         
         plot_idx = 0
         
@@ -398,9 +721,17 @@ class TrainingMetricsAnalyzer:
             critic_losses_smooth = self.calculate_sliding_window(critic_losses, window_size)
             
             ax = axes[plot_idx]
-            ax.plot(training_steps, critic_losses, 'b-', 
-                   linewidth=PLOT_CONFIG['linewidth_raw'], 
-                   alpha=PLOT_CONFIG['alpha_raw'], label='Raw')
+            # 对原始数据进行降采样以提高绘图性能
+            if len(training_steps) > MAX_POINTS_PER_LINE:
+                steps_raw, losses_raw = self.downsample_for_plot(training_steps, critic_losses, MAX_POINTS_PER_LINE)
+                ax.plot(steps_raw, losses_raw, 'b-', 
+                       linewidth=PLOT_CONFIG['linewidth_raw'], 
+                       alpha=PLOT_CONFIG['alpha_raw'], label='Raw')
+            else:
+                ax.plot(training_steps, critic_losses, 'b-', 
+                       linewidth=PLOT_CONFIG['linewidth_raw'], 
+                       alpha=PLOT_CONFIG['alpha_raw'], label='Raw')
+            # 平滑曲线通常点数较少，直接绘制
             ax.plot(training_steps, critic_losses_smooth, 'b-', 
                    linewidth=PLOT_CONFIG['linewidth_smooth'], 
                    alpha=PLOT_CONFIG['alpha_smooth'], 
@@ -413,6 +744,9 @@ class TrainingMetricsAnalyzer:
             if max(critic_losses) / min([x for x in critic_losses if x > 0]) > 100:
                 ax.set_yscale('log')
                 ax.set_ylabel('Critic Loss (log scale)', fontsize=PLOT_CONFIG['fontsize_label'])
+            # 添加统计信息
+            self.add_statistics_text(ax, critic_losses, position='upper left', 
+                                    fontsize=PLOT_CONFIG['fontsize_legend'], precision=2)
             plot_idx += 1
             
             # 2. Actor Loss曲线（滑动窗口）
@@ -420,9 +754,16 @@ class TrainingMetricsAnalyzer:
             actor_losses_smooth = self.calculate_sliding_window(actor_losses, window_size)
             
             ax = axes[plot_idx]
-            ax.plot(training_steps, actor_losses, 'r-', 
-                   linewidth=PLOT_CONFIG['linewidth_raw'], 
-                   alpha=PLOT_CONFIG['alpha_raw'], label='Raw')
+            # 对原始数据进行降采样以提高绘图性能
+            if len(training_steps) > MAX_POINTS_PER_LINE:
+                steps_raw, losses_raw = self.downsample_for_plot(training_steps, actor_losses, MAX_POINTS_PER_LINE)
+                ax.plot(steps_raw, losses_raw, 'r-', 
+                       linewidth=PLOT_CONFIG['linewidth_raw'], 
+                       alpha=PLOT_CONFIG['alpha_raw'], label='Raw')
+            else:
+                ax.plot(training_steps, actor_losses, 'r-', 
+                       linewidth=PLOT_CONFIG['linewidth_raw'], 
+                       alpha=PLOT_CONFIG['alpha_raw'], label='Raw')
             ax.plot(training_steps, actor_losses_smooth, 'r-', 
                    linewidth=PLOT_CONFIG['linewidth_smooth'], 
                    alpha=PLOT_CONFIG['alpha_smooth'],
@@ -432,6 +773,9 @@ class TrainingMetricsAnalyzer:
             ax.set_title('Actor Loss Curve', fontsize=PLOT_CONFIG['fontsize_title'], fontweight='bold')
             ax.grid(True, alpha=PLOT_CONFIG['grid_alpha'])
             ax.legend(loc='upper right')
+            # 添加统计信息
+            self.add_statistics_text(ax, actor_losses, position='upper left', 
+                                    fontsize=PLOT_CONFIG['fontsize_legend'], precision=2)
             plot_idx += 1
             
             # 3. 样本平均抽样次数曲线（滑动窗口）
@@ -439,9 +783,16 @@ class TrainingMetricsAnalyzer:
             avg_sample_times_smooth = self.calculate_sliding_window(avg_sample_times, window_size)
             
             ax = axes[plot_idx]
-            ax.plot(training_steps, avg_sample_times, 'g-', 
-                   linewidth=PLOT_CONFIG['linewidth_raw'], 
-                   alpha=PLOT_CONFIG['alpha_raw'], label='Raw')
+            # 对原始数据进行降采样以提高绘图性能
+            if len(training_steps) > MAX_POINTS_PER_LINE:
+                steps_raw, times_raw = self.downsample_for_plot(training_steps, avg_sample_times, MAX_POINTS_PER_LINE)
+                ax.plot(steps_raw, times_raw, 'g-', 
+                       linewidth=PLOT_CONFIG['linewidth_raw'], 
+                       alpha=PLOT_CONFIG['alpha_raw'], label='Raw')
+            else:
+                ax.plot(training_steps, avg_sample_times, 'g-', 
+                       linewidth=PLOT_CONFIG['linewidth_raw'], 
+                       alpha=PLOT_CONFIG['alpha_raw'], label='Raw')
             ax.plot(training_steps, avg_sample_times_smooth, 'g-', 
                    linewidth=PLOT_CONFIG['linewidth_smooth'], 
                    alpha=PLOT_CONFIG['alpha_smooth'],
@@ -451,25 +802,232 @@ class TrainingMetricsAnalyzer:
             ax.set_title('Average Sample Times Curve', fontsize=PLOT_CONFIG['fontsize_title'], fontweight='bold')
             ax.grid(True, alpha=PLOT_CONFIG['grid_alpha'])
             ax.legend(loc='upper right')
+            # 添加统计信息
+            self.add_statistics_text(ax, avg_sample_times, position='upper left', 
+                                    fontsize=PLOT_CONFIG['fontsize_legend'], precision=2)
             plot_idx += 1
         
-        # 4. Episode成功率、碰撞率、超时率曲线（滑动窗口）
+        # 梯度曲线（如果有梯度数据）
+        if has_gradients:
+            # 提取梯度数据（过滤掉None值）
+            gradient_data = []
+            gradient_steps = []
+            for tr in self.training_records:
+                if tr[4] is not None:  # critic_grad_before不为None
+                    gradient_steps.append(tr[0])
+                    gradient_data.append((
+                        tr[4],  # critic_grad_before
+                        tr[5] if tr[5] is not None else 0.0,  # critic_grad_after
+                        tr[6] if tr[6] is not None else 0.0,  # actor_grad_before
+                        tr[7] if tr[7] is not None else 0.0   # actor_grad_after
+                    ))
+            
+            if gradient_data:
+                # 4. Critic梯度曲线（裁剪前后）
+                critic_grad_before = [gd[0] for gd in gradient_data]
+                critic_grad_after = [gd[1] for gd in gradient_data]
+                critic_grad_before_smooth = self.calculate_sliding_window(critic_grad_before, window_size)
+                critic_grad_after_smooth = self.calculate_sliding_window(critic_grad_after, window_size)
+                
+                ax = axes[plot_idx]
+                # 对原始数据进行降采样以提高绘图性能
+                if len(gradient_steps) > MAX_POINTS_PER_LINE:
+                    steps_before, grad_before = self.downsample_for_plot(gradient_steps, critic_grad_before, MAX_POINTS_PER_LINE)
+                    steps_after, grad_after = self.downsample_for_plot(gradient_steps, critic_grad_after, MAX_POINTS_PER_LINE)
+                    ax.plot(steps_before, grad_before, 'b--', 
+                           linewidth=PLOT_CONFIG['linewidth_raw'], 
+                           alpha=PLOT_CONFIG['alpha_raw'], label='Critic Grad Before Clip (Raw)')
+                    ax.plot(steps_after, grad_after, 'b-', 
+                           linewidth=PLOT_CONFIG['linewidth_raw'], 
+                           alpha=PLOT_CONFIG['alpha_raw'], label='Critic Grad After Clip (Raw)')
+                else:
+                    ax.plot(gradient_steps, critic_grad_before, 'b--', 
+                           linewidth=PLOT_CONFIG['linewidth_raw'], 
+                           alpha=PLOT_CONFIG['alpha_raw'], label='Critic Grad Before Clip (Raw)')
+                    ax.plot(gradient_steps, critic_grad_after, 'b-', 
+                           linewidth=PLOT_CONFIG['linewidth_raw'], 
+                           alpha=PLOT_CONFIG['alpha_raw'], label='Critic Grad After Clip (Raw)')
+                ax.plot(gradient_steps, critic_grad_before_smooth, 'b--', 
+                       linewidth=PLOT_CONFIG['linewidth_smooth'], 
+                       alpha=PLOT_CONFIG['alpha_smooth'], 
+                       label=f'Critic Grad Before Clip (window={window_size})')
+                ax.plot(gradient_steps, critic_grad_after_smooth, 'b-', 
+                       linewidth=PLOT_CONFIG['linewidth_smooth'], 
+                       alpha=PLOT_CONFIG['alpha_smooth'], 
+                       label=f'Critic Grad After Clip (window={window_size})')
+                ax.set_xlabel('Training Step', fontsize=PLOT_CONFIG['fontsize_label'])
+                ax.set_ylabel('Critic Gradient L2 Norm', fontsize=PLOT_CONFIG['fontsize_label'])
+                ax.set_title('Critic Gradient Norm (Before/After Clipping)', 
+                           fontsize=PLOT_CONFIG['fontsize_title'], fontweight='bold')
+                ax.grid(True, alpha=PLOT_CONFIG['grid_alpha'])
+                ax.legend(loc='upper right', fontsize=PLOT_CONFIG['fontsize_legend'])
+                # 如果梯度值范围很大，使用对数刻度
+                critic_grad_after_positive = [x for x in critic_grad_after if x is not None and x > 0]
+                if critic_grad_before and critic_grad_after_positive and max(critic_grad_before) / max(critic_grad_after_positive + [1]) > 10:
+                    ax.set_yscale('log')
+                    ax.set_ylabel('Critic Gradient L2 Norm (log scale)', fontsize=PLOT_CONFIG['fontsize_label'])
+                # 添加统计信息（使用裁剪前的数据）
+                self.add_statistics_text(ax, critic_grad_before, position='upper left', 
+                                        fontsize=PLOT_CONFIG['fontsize_legend'], precision=4)
+                plot_idx += 1
+                
+                # 5. Actor梯度曲线（裁剪前后）
+                actor_grad_before = [gd[2] for gd in gradient_data]
+                actor_grad_after = [gd[3] for gd in gradient_data]
+                actor_grad_before_smooth = self.calculate_sliding_window(actor_grad_before, window_size)
+                actor_grad_after_smooth = self.calculate_sliding_window(actor_grad_after, window_size)
+                
+                ax = axes[plot_idx]
+                # 对原始数据进行降采样以提高绘图性能
+                if len(gradient_steps) > MAX_POINTS_PER_LINE:
+                    steps_before, grad_before = self.downsample_for_plot(gradient_steps, actor_grad_before, MAX_POINTS_PER_LINE)
+                    steps_after, grad_after = self.downsample_for_plot(gradient_steps, actor_grad_after, MAX_POINTS_PER_LINE)
+                    ax.plot(steps_before, grad_before, 'r--', 
+                           linewidth=PLOT_CONFIG['linewidth_raw'], 
+                           alpha=PLOT_CONFIG['alpha_raw'], label='Actor Grad Before Clip (Raw)')
+                    ax.plot(steps_after, grad_after, 'r-', 
+                           linewidth=PLOT_CONFIG['linewidth_raw'], 
+                           alpha=PLOT_CONFIG['alpha_raw'], label='Actor Grad After Clip (Raw)')
+                else:
+                    ax.plot(gradient_steps, actor_grad_before, 'r--', 
+                           linewidth=PLOT_CONFIG['linewidth_raw'], 
+                           alpha=PLOT_CONFIG['alpha_raw'], label='Actor Grad Before Clip (Raw)')
+                    ax.plot(gradient_steps, actor_grad_after, 'r-', 
+                           linewidth=PLOT_CONFIG['linewidth_raw'], 
+                           alpha=PLOT_CONFIG['alpha_raw'], label='Actor Grad After Clip (Raw)')
+                ax.plot(gradient_steps, actor_grad_before_smooth, 'r--', 
+                       linewidth=PLOT_CONFIG['linewidth_smooth'], 
+                       alpha=PLOT_CONFIG['alpha_smooth'], 
+                       label=f'Actor Grad Before Clip (window={window_size})')
+                ax.plot(gradient_steps, actor_grad_after_smooth, 'r-', 
+                       linewidth=PLOT_CONFIG['linewidth_smooth'], 
+                       alpha=PLOT_CONFIG['alpha_smooth'], 
+                       label=f'Actor Grad After Clip (window={window_size})')
+                ax.set_xlabel('Training Step', fontsize=PLOT_CONFIG['fontsize_label'])
+                ax.set_ylabel('Actor Gradient L2 Norm', fontsize=PLOT_CONFIG['fontsize_label'])
+                ax.set_title('Actor Gradient Norm (Before/After Clipping)', 
+                           fontsize=PLOT_CONFIG['fontsize_title'], fontweight='bold')
+                ax.grid(True, alpha=PLOT_CONFIG['grid_alpha'])
+                ax.legend(loc='upper right', fontsize=PLOT_CONFIG['fontsize_legend'])
+                # 如果梯度值范围很大，使用对数刻度
+                actor_grad_after_positive = [x for x in actor_grad_after if x is not None and x > 0]
+                if actor_grad_before and actor_grad_after_positive and max(actor_grad_before) / max(actor_grad_after_positive + [1]) > 10:
+                    ax.set_yscale('log')
+                    ax.set_ylabel('Actor Gradient L2 Norm (log scale)', fontsize=PLOT_CONFIG['fontsize_label'])
+                # 添加统计信息（使用裁剪前的数据）
+                self.add_statistics_text(ax, actor_grad_before, position='upper left', 
+                                        fontsize=PLOT_CONFIG['fontsize_legend'], precision=4)
+                plot_idx += 1
+        
+        # 熵值曲线和alpha梯度曲线（如果有熵值数据）
+        if has_entropy:
+            # 提取熵值和alpha梯度数据（过滤掉None值）
+            entropy_data = []
+            alpha_grad_data = []
+            entropy_steps = []
+            for tr in self.training_records:
+                if tr[8] is not None:  # entropy不为None
+                    entropy_steps.append(tr[0])
+                    entropy_data.append(tr[8])  # entropy
+                    alpha_grad_data.append(tr[9] if tr[9] is not None else 0.0)  # alpha_grad
+            
+            if entropy_data:
+                # 6. 熵值曲线
+                entropy_smooth = self.calculate_sliding_window(entropy_data, window_size)
+                
+                ax = axes[plot_idx]
+                # 对原始数据进行降采样以提高绘图性能
+                if len(entropy_steps) > MAX_POINTS_PER_LINE:
+                    steps_raw, entropy_raw = self.downsample_for_plot(entropy_steps, entropy_data, MAX_POINTS_PER_LINE)
+                    ax.plot(steps_raw, entropy_raw, 'm-', 
+                           linewidth=PLOT_CONFIG['linewidth_raw'], 
+                           alpha=PLOT_CONFIG['alpha_raw'], label='Raw')
+                else:
+                    ax.plot(entropy_steps, entropy_data, 'm-', 
+                           linewidth=PLOT_CONFIG['linewidth_raw'], 
+                           alpha=PLOT_CONFIG['alpha_raw'], label='Raw')
+                ax.plot(entropy_steps, entropy_smooth, 'm-', 
+                       linewidth=PLOT_CONFIG['linewidth_smooth'], 
+                       alpha=PLOT_CONFIG['alpha_smooth'], 
+                       label=f'Smoothed (window={window_size})')
+                ax.set_xlabel('Training Step', fontsize=PLOT_CONFIG['fontsize_label'])
+                ax.set_ylabel('Entropy', fontsize=PLOT_CONFIG['fontsize_label'])
+                ax.set_title('Entropy Curve', fontsize=PLOT_CONFIG['fontsize_title'], fontweight='bold')
+                ax.grid(True, alpha=PLOT_CONFIG['grid_alpha'])
+                ax.legend(loc='upper right')
+                # 添加统计信息
+                self.add_statistics_text(ax, entropy_data, position='upper left', 
+                                        fontsize=PLOT_CONFIG['fontsize_legend'], precision=4)
+                plot_idx += 1
+                
+                # 7. Alpha梯度曲线
+                alpha_grad_smooth = self.calculate_sliding_window(alpha_grad_data, window_size)
+                
+                ax = axes[plot_idx]
+                # 对原始数据进行降采样以提高绘图性能
+                if len(entropy_steps) > MAX_POINTS_PER_LINE:
+                    steps_raw, alpha_grad_raw = self.downsample_for_plot(entropy_steps, alpha_grad_data, MAX_POINTS_PER_LINE)
+                    ax.plot(steps_raw, alpha_grad_raw, 'c-', 
+                           linewidth=PLOT_CONFIG['linewidth_raw'], 
+                           alpha=PLOT_CONFIG['alpha_raw'], label='Raw')
+                else:
+                    ax.plot(entropy_steps, alpha_grad_data, 'c-', 
+                           linewidth=PLOT_CONFIG['linewidth_raw'], 
+                           alpha=PLOT_CONFIG['alpha_raw'], label='Raw')
+                ax.plot(entropy_steps, alpha_grad_smooth, 'c-', 
+                       linewidth=PLOT_CONFIG['linewidth_smooth'], 
+                       alpha=PLOT_CONFIG['alpha_smooth'], 
+                       label=f'Smoothed (window={window_size})')
+                ax.set_xlabel('Training Step', fontsize=PLOT_CONFIG['fontsize_label'])
+                ax.set_ylabel('Alpha Gradient L2 Norm', fontsize=PLOT_CONFIG['fontsize_label'])
+                ax.set_title('Alpha Gradient Norm Curve', fontsize=PLOT_CONFIG['fontsize_title'], fontweight='bold')
+                ax.grid(True, alpha=PLOT_CONFIG['grid_alpha'])
+                ax.legend(loc='upper right')
+                # 如果梯度值范围很大，使用对数刻度
+                alpha_grad_positive = [x for x in alpha_grad_data if x is not None and x > 0]
+                if alpha_grad_data and alpha_grad_positive and max(alpha_grad_data) / max(alpha_grad_positive + [1]) > 10:
+                    ax.set_yscale('log')
+                    ax.set_ylabel('Alpha Gradient L2 Norm (log scale)', fontsize=PLOT_CONFIG['fontsize_label'])
+                # 添加统计信息
+                self.add_statistics_text(ax, alpha_grad_data, position='upper left', 
+                                        fontsize=PLOT_CONFIG['fontsize_legend'], precision=4)
+                plot_idx += 1
+        
+        # 8. Episode成功率、碰撞率、超时率曲线（滑动窗口）
         if has_episodes:
             episodes, success_rates, collision_rates, timeout_rates = self.calculate_episode_rates(window_size)
             
             ax = axes[plot_idx]
-            ax.plot(episodes, success_rates, 'g-', 
-                   linewidth=PLOT_CONFIG['linewidth_smooth'], 
-                   alpha=PLOT_CONFIG['alpha_smooth'], 
-                   label=f'Success Rate (window={window_size})')
-            ax.plot(episodes, collision_rates, 'r-', 
-                   linewidth=PLOT_CONFIG['linewidth_smooth'], 
-                   alpha=PLOT_CONFIG['alpha_smooth'], 
-                   label=f'Collision Rate (window={window_size})')
-            ax.plot(episodes, timeout_rates, 'orange', 
-                   linewidth=PLOT_CONFIG['linewidth_smooth'], 
-                   alpha=PLOT_CONFIG['alpha_smooth'], 
-                   label=f'Timeout Rate (window={window_size})')
+            # 对数据进行降采样以提高绘图性能（所有三条线使用相同的x轴采样）
+            if len(episodes) > MAX_POINTS_PER_LINE:
+                eps_down, success_down = self.downsample_for_plot(episodes, success_rates, MAX_POINTS_PER_LINE)
+                _, collision_down = self.downsample_for_plot(episodes, collision_rates, MAX_POINTS_PER_LINE)
+                _, timeout_down = self.downsample_for_plot(episodes, timeout_rates, MAX_POINTS_PER_LINE)
+                ax.plot(eps_down, success_down, 'g-', 
+                       linewidth=PLOT_CONFIG['linewidth_smooth'], 
+                       alpha=PLOT_CONFIG['alpha_smooth'], 
+                       label=f'Success Rate (window={window_size})')
+                ax.plot(eps_down, collision_down, 'r-', 
+                       linewidth=PLOT_CONFIG['linewidth_smooth'], 
+                       alpha=PLOT_CONFIG['alpha_smooth'], 
+                       label=f'Collision Rate (window={window_size})')
+                ax.plot(eps_down, timeout_down, 'orange', 
+                       linewidth=PLOT_CONFIG['linewidth_smooth'], 
+                       alpha=PLOT_CONFIG['alpha_smooth'], 
+                       label=f'Timeout Rate (window={window_size})')
+            else:
+                ax.plot(episodes, success_rates, 'g-', 
+                       linewidth=PLOT_CONFIG['linewidth_smooth'], 
+                       alpha=PLOT_CONFIG['alpha_smooth'], 
+                       label=f'Success Rate (window={window_size})')
+                ax.plot(episodes, collision_rates, 'r-', 
+                       linewidth=PLOT_CONFIG['linewidth_smooth'], 
+                       alpha=PLOT_CONFIG['alpha_smooth'], 
+                       label=f'Collision Rate (window={window_size})')
+                ax.plot(episodes, timeout_rates, 'orange', 
+                       linewidth=PLOT_CONFIG['linewidth_smooth'], 
+                       alpha=PLOT_CONFIG['alpha_smooth'], 
+                       label=f'Timeout Rate (window={window_size})')
             ax.set_xlabel('Episode Number', fontsize=PLOT_CONFIG['fontsize_label'])
             ax.set_ylabel('Rate', fontsize=PLOT_CONFIG['fontsize_label'])
             ax.set_title('Episode Rates (Success/Collision/Timeout)', 
@@ -478,9 +1036,12 @@ class TrainingMetricsAnalyzer:
             ax.grid(True, alpha=PLOT_CONFIG['grid_alpha'])
             ax.legend(loc='upper left')
             ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: '{:.0%}'.format(y)))
+            # 添加统计信息（使用成功率数据）
+            self.add_statistics_text(ax, success_rates, position='upper right', 
+                                    fontsize=PLOT_CONFIG['fontsize_legend'], precision=4)
             plot_idx += 1
         
-        # 5. Reward Detail各项曲线（滑动窗口）
+        # 9. Reward Detail各项曲线（滑动窗口）
         if has_reward_details:
             episodes, reward_curves = self.calculate_reward_detail_curves(window_size)
             
@@ -497,11 +1058,20 @@ class TrainingMetricsAnalyzer:
                 if any(abs(v) > 1e-6 for v in values):
                     # 检查是否是常数（所有值都相同）
                     if len(set([round(v, 2) for v in values if abs(v) > 1e-6])) > 1:
-                        ax.plot(episodes, values, 
-                               color=REWARD_COLORS.get(key, 'gray'), 
-                               linewidth=PLOT_CONFIG['linewidth_smooth'], 
-                               alpha=PLOT_CONFIG['alpha_smooth'], 
-                               label=f'{REWARD_LABELS.get(key, key)} (window={window_size})')
+                        # 对数据进行降采样以提高绘图性能
+                        if len(episodes) > MAX_POINTS_PER_LINE:
+                            eps_down, values_down = self.downsample_for_plot(episodes, values, MAX_POINTS_PER_LINE)
+                            ax.plot(eps_down, values_down, 
+                                   color=REWARD_COLORS.get(key, 'gray'), 
+                                   linewidth=PLOT_CONFIG['linewidth_smooth'], 
+                                   alpha=PLOT_CONFIG['alpha_smooth'], 
+                                   label=f'{REWARD_LABELS.get(key, key)} (window={window_size})')
+                        else:
+                            ax.plot(episodes, values, 
+                                   color=REWARD_COLORS.get(key, 'gray'), 
+                                   linewidth=PLOT_CONFIG['linewidth_smooth'], 
+                                   alpha=PLOT_CONFIG['alpha_smooth'], 
+                                   label=f'{REWARD_LABELS.get(key, key)} (window={window_size})')
                         plotted_any = True
             
             if plotted_any:
@@ -511,6 +1081,15 @@ class TrainingMetricsAnalyzer:
                            fontsize=PLOT_CONFIG['fontsize_title'], fontweight='bold')
                 ax.grid(True, alpha=PLOT_CONFIG['grid_alpha'])
                 ax.legend(loc='best', fontsize=PLOT_CONFIG['fontsize_legend'])
+                # 添加统计信息（使用第一个有数据的reward项）
+                for key in reward_curves.keys():
+                    if key in skip_keys:
+                        continue
+                    values = reward_curves[key]
+                    if any(abs(v) > 1e-6 for v in values) and len(set([round(v, 2) for v in values if abs(v) > 1e-6])) > 1:
+                        self.add_statistics_text(ax, values, position='upper right', 
+                                                fontsize=PLOT_CONFIG['fontsize_legend'], precision=4)
+                        break  # 只显示第一个有数据的项的统计信息
             plot_idx += 1
         
         plt.tight_layout()
@@ -543,19 +1122,99 @@ class TrainingMetricsAnalyzer:
                 print(f"Critic Loss - 最小值: {min(critic_losses):.2f}, 最大值: {max(critic_losses):.2f}, 平均值: {np.mean(critic_losses):.2f}")
                 print(f"Actor Loss - 最小值: {min(actor_losses):.2f}, 最大值: {max(actor_losses):.2f}, 平均值: {np.mean(actor_losses):.2f}")
                 print(f"平均抽样次数 - 最小值: {min(avg_sample_times):.2f}, 最大值: {max(avg_sample_times):.2f}, 平均值: {np.mean(avg_sample_times):.2f}")
+                
+                # 梯度统计（如果有梯度数据）
+                gradient_records = [tr for tr in self.training_records if tr[4] is not None]
+                if gradient_records:
+                    critic_grad_before = [tr[4] for tr in gradient_records if tr[4] is not None]
+                    critic_grad_after = [tr[5] for tr in gradient_records if tr[5] is not None]
+                    actor_grad_before = [tr[6] for tr in gradient_records if tr[6] is not None]
+                    actor_grad_after = [tr[7] for tr in gradient_records if tr[7] is not None]
+                    if critic_grad_before:
+                        print(f"\n梯度统计（共{len(gradient_records)}条记录）:")
+                        print(f"Critic梯度（裁剪前） - 最小值: {min(critic_grad_before):.6f}, 最大值: {max(critic_grad_before):.6f}, 平均值: {np.mean(critic_grad_before):.6f}")
+                    if critic_grad_after:
+                        print(f"Critic梯度（裁剪后） - 最小值: {min(critic_grad_after):.6f}, 最大值: {max(critic_grad_after):.6f}, 平均值: {np.mean(critic_grad_after):.6f}")
+                    if actor_grad_before:
+                        print(f"Actor梯度（裁剪前） - 最小值: {min(actor_grad_before):.6f}, 最大值: {max(actor_grad_before):.6f}, 平均值: {np.mean(actor_grad_before):.6f}")
+                    if actor_grad_after:
+                        print(f"Actor梯度（裁剪后） - 最小值: {min(actor_grad_after):.6f}, 最大值: {max(actor_grad_after):.6f}, 平均值: {np.mean(actor_grad_after):.6f}")
+                
+                # 熵值和alpha梯度统计（如果有熵值数据）
+                entropy_records = [tr for tr in self.training_records if tr[8] is not None]
+                if entropy_records:
+                    entropies = [tr[8] for tr in entropy_records]
+                    alpha_grads = [tr[9] for tr in entropy_records if tr[9] is not None]
+                    print(f"\n熵值和Alpha梯度统计（共{len(entropy_records)}条记录）:")
+                    print(f"熵值 - 最小值: {min(entropies):.6f}, 最大值: {max(entropies):.6f}, 平均值: {np.mean(entropies):.6f}")
+                    if alpha_grads:
+                        print(f"Alpha梯度L2范数 - 最小值: {min(alpha_grads):.6f}, 最大值: {max(alpha_grads):.6f}, 平均值: {np.mean(alpha_grads):.6f}")
+                
+                # 训练耗时统计
+                if self.training_durations:
+                    print(f"\n训练耗时统计（共{len(self.training_durations)}条记录）:")
+                    print(f"平均每次训练耗时: {np.mean(self.training_durations):.2f}秒")
+                    print(f"训练耗时 - 最小值: {min(self.training_durations):.2f}秒, 最大值: {max(self.training_durations):.2f}秒")
+                    total_training_time = sum(self.training_durations)
+                    print(f"总训练耗时: {total_training_time:.2f}秒 ({total_training_time/60:.2f}分钟)")
+                    
+                    # 平均每秒抽样样本step数量（总抽样step数量/总训练耗时）
+                    # 注意：日志中的"总抽样数"已经是累加值，所以直接取最后一次的值即可
+                    if self.total_sample_count and total_training_time > 0:
+                        # 总抽样数是累加的，取最后一次的值
+                        total_sample_count_sum = self.total_sample_count[-1] if self.total_sample_count else 0
+                        avg_samples_per_second = total_sample_count_sum / total_training_time
+                        print(f"平均每秒抽样样本step数量: {avg_samples_per_second:.2f} steps/秒")
+                        print(f"总抽样step数量: {total_sample_count_sum}")
+        
+        # 最好模型统计
+        if self.best_model_records:
+            print("\n" + "="*80)
+            print("【最好模型统计】")
+            print("="*80)
+            print(f"总共保存了 {len(self.best_model_records)} 次最好模型")
+            if self.best_model_info:
+                episode_num, success_rate, collision_rate, save_path = self.best_model_info
+                print(f"\n最高成功率记录:")
+                print(f"  Episode编号: {episode_num}")
+                print(f"  成功率: {success_rate:.4f} ({success_rate*100:.2f}%)")
+                print(f"  碰撞率: {collision_rate:.4f} ({collision_rate*100:.2f}%)")
+                print(f"  模型保存路径: {save_path}")
+            else:
+                print("未找到最好模型记录")
         
         if self.episodes:
             print("\n" + "="*80)
             print("【Episode统计】")
             print("="*80)
             total = len(self.episodes)
-            goal_count = sum(1 for ep in self.episodes if ep[2] == 'Goal')
-            collision_count = sum(1 for ep in self.episodes if ep[2] == 'Collision')
-            timeout_count = sum(1 for ep in self.episodes if ep[2] == 'Timeout')
+            # 使用numpy向量化操作优化计数
+            end_statuses = np.array([ep[2] for ep in self.episodes])
+            goal_count = np.sum(end_statuses == 'Goal')
+            collision_count = np.sum(end_statuses == 'Collision')
+            timeout_count = np.sum(end_statuses == 'Timeout')
             print(f"总episode数: {total}")
             print(f"到达终点: {goal_count} ({goal_count/total*100:.1f}%)")
             print(f"发生碰撞: {collision_count} ({collision_count/total*100:.1f}%)")
             print(f"超时结束: {timeout_count} ({timeout_count/total*100:.1f}%)")
+            
+            # 统计每秒产生的平均样本数（总样本数/从第一条episode数据产生时间开始，到日志中最后一条episode数据产生结束的总时间）
+            episode_timestamps = [ep[5] for ep in self.episodes if ep[5] is not None]  # timestamp是第6个元素（索引5）
+            if episode_timestamps and len(episode_timestamps) > 1:
+                first_timestamp = min(episode_timestamps)
+                last_timestamp = max(episode_timestamps)
+                total_time_seconds = (last_timestamp - first_timestamp).total_seconds()
+                
+                if total_time_seconds > 0:
+                    # 计算总样本数（所有episode的steps之和）
+                    total_sample_steps_from_episodes = sum([ep[4] for ep in self.episodes if ep[4] > 0])  # steps是第5个元素（索引4）
+                    avg_samples_per_second = total_sample_steps_from_episodes / total_time_seconds
+                    print(f"\n时间范围统计:")
+                    print(f"第一条episode时间: {first_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"最后一条episode时间: {last_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"总时间跨度: {total_time_seconds:.2f}秒 ({total_time_seconds/60:.2f}分钟)")
+                    print(f"总样本数（所有episode的steps之和）: {total_sample_steps_from_episodes}")
+                    print(f"每秒产生的平均样本数: {avg_samples_per_second:.2f} samples/秒")
             
             # 统计每个step平均的Reward Detail（不包含goal和collision）
             per_step_stats = self.calculate_per_step_reward_stats()
@@ -580,21 +1239,23 @@ class TrainingMetricsAnalyzer:
                 
                 # 统计所有episode的平均值
                 print("所有Episode的平均值:")
+                # 使用numpy向量化操作优化统计计算
                 for key in reward_keys:
-                    # 获取所有值（包括0值）
-                    all_values = [ep[3].get(key, 0.0) for ep in self.episodes]
-                    non_zero_values = [v for v in all_values if abs(v) > 1e-6]
+                    # 获取所有值（包括0值），使用numpy数组
+                    all_values = np.array([ep[3].get(key, 0.0) for ep in self.episodes], dtype=np.float64)
+                    non_zero_mask = np.abs(all_values) > 1e-6
+                    non_zero_values = all_values[non_zero_mask]
                     
-                    if non_zero_values:
+                    if len(non_zero_values) > 0:
                         avg_all = np.mean(all_values)
                         avg_non_zero = np.mean(non_zero_values)
-                        min_val = min(non_zero_values)
-                        max_val = max(non_zero_values)
+                        min_val = np.min(non_zero_values)
+                        max_val = np.max(non_zero_values)
                         count_non_zero = len(non_zero_values)
                         total_count = len(all_values)
                         
-                        # 检查是否是固定值
-                        unique_vals = set([round(v, 2) for v in non_zero_values])
+                        # 检查是否是固定值（使用numpy的unique）
+                        unique_vals = np.unique(np.round(non_zero_values, 2))
                         if len(unique_vals) == 1:
                             print(f"  {REWARD_LABELS.get(key, key)}: {non_zero_values[0]:.2f} (固定值, 出现{count_non_zero}次)")
                         else:
@@ -612,16 +1273,19 @@ class TrainingMetricsAnalyzer:
                     
                     print(f"\n  {end_status} ({len(status_episodes)}个episode):")
                     for key in reward_keys:
-                        values = [ep[3].get(key, 0.0) for ep in status_episodes]
-                        non_zero_values = [v for v in values if abs(v) > 1e-6]
+                        # 使用numpy向量化操作
+                        values = np.array([ep[3].get(key, 0.0) for ep in status_episodes], dtype=np.float64)
+                        non_zero_mask = np.abs(values) > 1e-6
+                        non_zero_values = values[non_zero_mask]
                         
-                        if non_zero_values:
+                        if len(non_zero_values) > 0:
                             avg_val = np.mean(values)
-                            if len(set([round(v, 2) for v in non_zero_values])) == 1:
+                            unique_vals = np.unique(np.round(non_zero_values, 2))
+                            if len(unique_vals) == 1:
                                 print(f"    {REWARD_LABELS.get(key, key)}: {non_zero_values[0]:.2f} (固定值)")
                             else:
                                 print(f"    {REWARD_LABELS.get(key, key)}: 平均值={avg_val:.2f}, "
-                                      f"范围=[{min(non_zero_values):.2f}, {max(non_zero_values):.2f}]")
+                                      f"范围=[{np.min(non_zero_values):.2f}, {np.max(non_zero_values):.2f}]")
     
     def run(self, plot: bool = True, output_dir: Optional[str] = None, window_size: int = 100):
         """运行分析"""
@@ -697,6 +1361,7 @@ def main():
         print(f"  输出文本文件: {output_txt_file}")
         print()
         
+        # 创建分析器
         analyzer = TrainingMetricsAnalyzer(str(log_path))
         analyzer.run(plot=generate_plot, output_dir=str(output_dir), window_size=window_size)
         
