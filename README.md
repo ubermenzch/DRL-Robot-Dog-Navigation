@@ -69,13 +69,13 @@ wget http://fishros.com/install -O fishros && . fishros
 ### 3. 安装编译工具
 如果在鱼香ROS一键安装中已经安装过rosdep了，此步骤可跳过。
 ```shell
+cd ~/DRL-Robot-Navigation-ROS2
 sudo apt install python3-rosdep2
 rosdep update
 rosdep install -i --from-path src --rosdistro foxy -y
 ```
 安装好rosdep后
 ```shell
-cd ~/DRL-Robot-Navigation-ROS2
 sudo apt update
 sudo apt install python3-colcon-common-extensions
 colcon build
