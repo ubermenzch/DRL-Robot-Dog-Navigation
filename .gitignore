@@ -16,6 +16,9 @@ models/**
 !models/**/
 !models/**/.gitkeep
 
+# ===== DRL models: ignore trained model files =====
+src/drl_navigation_ros2/models/
+
 # ===== python common =====
 __pycache__/
 *.py[cod]
