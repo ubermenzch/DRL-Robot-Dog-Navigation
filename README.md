@@ -85,11 +85,11 @@ colcon build
 将以下内容添加到 `~/.bashrc` 文件中：
 
 ```shell
-export DRLNAV_BASE_PATH=~/DRL-Robot-Navigation-ROS2
-export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:~/DRL-Robot-Navigation-ROS2/src/turtlebot3_simulations/turtlebot3_gazebo/models
+export DRLNAV_BASE_PATH=~/DRL-Robot-Dog-Navigation
+export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:~/DRL-Robot-Dog-Navigation/src/turtlebot3_simulations/turtlebot3_gazebo/models
 export TURTLEBOT3_MODEL=waffle
 source /opt/ros/foxy/setup.bash
-source ~/DRL-Robot-Navigation-ROS2/install/setup.bash
+source ~/DRL-Robot-Dog-Navigation/install/setup.bash
 ```
 
 然后执行：
