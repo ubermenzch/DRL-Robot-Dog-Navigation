@@ -67,14 +67,19 @@ wget http://fishros.com/install -O fishros && . fishros
 这将自动完成 ROS2 Foxy 安装、源配置、ROS 环境配置和 rosdep 配置。
 
 ### 3. 安装编译工具
-
+如果在鱼香ROS一键安装中已经安装过rosdep了，此步骤可跳过。
+```shell
+sudo apt install python3-rosdep2
+rosdep update
+rosdep install -i --from-path src --rosdistro foxy -y
+```
+安装好rosdep后
 ```shell
 cd ~/DRL-Robot-Navigation-ROS2
 sudo apt update
 sudo apt install python3-colcon-common-extensions
 colcon build
 ```
-
 ### 4. 配置环境变量
 
 将以下内容添加到 `~/.bashrc` 文件中：
