@@ -133,6 +133,19 @@ class TrainingMetricsAnalyzer:
         self.best_success_rate = 0.0
         self.best_model_info = None  # (episode_num, success_rate, collision_rate, save_path)
         
+        # 训练记录解析状态机：用于逐行匹配训练信息的5行
+        self.current_training_data = {
+            'training_step': None,      # 训练步数
+            'line1_data': None,         # 第1行：总抽样数、总样本数、平均抽样次数
+            'line2_data': None,         # 第2行：Critic损失和梯度
+            'line3_data': None,         # 第3行：Actor损失和梯度
+            'line4_data': None,         # 第4行：熵值统计（可选）
+            'line5_data': None,         # 第5行：训练耗时
+            'lines_collected': set()    # 已收集的行号集合（1-5）
+        }
+        # 记录已完成的训练步数，避免重复解析
+        self.completed_training_steps = set()
+        
         # 预编译正则表达式以提高性能
         self._compile_regex_patterns()
     
@@ -183,6 +196,174 @@ class TrainingMetricsAnalyzer:
             training_step = int(match.group(1))
             return ('training_start', training_step)
         return None
+    
+    def match_training_line1(self, line: str) -> bool:
+        """匹配训练信息第1行：总抽样数、总样本数、样本平均抽样次数"""
+        line = line.strip()
+        sample_match = self.regex_sample_times.search(line)
+        if sample_match:
+            avg_sample_times = float(sample_match.group(1))
+            total_sample_count = None
+            total_sample_steps = None
+            sample_count_match = self.regex_total_sample_count.search(line)
+            if sample_count_match:
+                total_sample_count = int(sample_count_match.group(1))
+            sample_steps_match = self.regex_total_sample_steps.search(line)
+            if sample_steps_match:
+                total_sample_steps = int(sample_steps_match.group(1))
+            self.current_training_data['line1_data'] = {
+                'avg_sample_times': avg_sample_times,
+                'total_sample_count': total_sample_count,
+                'total_sample_steps': total_sample_steps
+            }
+            self.current_training_data['lines_collected'].add(1)
+            return True
+        return False
+    
+    def match_training_line2(self, line: str) -> bool:
+        """匹配训练信息第2行：Critic损失和梯度"""
+        line = line.strip()
+        critic_match = self.regex_critic_loss.search(line)
+        if critic_match:
+            critic_loss = float(critic_match.group(1))
+            critic_grad_before = None
+            critic_grad_after = None
+            critic_grad_match = self.regex_critic_grad.search(line)
+            if critic_grad_match:
+                critic_grad_before = float(critic_grad_match.group(1))
+                critic_grad_after = float(critic_grad_match.group(2))
+            self.current_training_data['line2_data'] = {
+                'critic_loss': critic_loss,
+                'critic_grad_before': critic_grad_before,
+                'critic_grad_after': critic_grad_after
+            }
+            self.current_training_data['lines_collected'].add(2)
+            return True
+        return False
+    
+    def match_training_line3(self, line: str) -> bool:
+        """匹配训练信息第3行：Actor损失和梯度"""
+        line = line.strip()
+        actor_match = self.regex_actor_loss.search(line)
+        if actor_match:
+            actor_loss = float(actor_match.group(1))
+            actor_grad_before = None
+            actor_grad_after = None
+            actor_grad_match = self.regex_actor_grad.search(line)
+            if actor_grad_match:
+                actor_grad_before = float(actor_grad_match.group(1))
+                actor_grad_after = float(actor_grad_match.group(2))
+            self.current_training_data['line3_data'] = {
+                'actor_loss': actor_loss,
+                'actor_grad_before': actor_grad_before,
+                'actor_grad_after': actor_grad_after
+            }
+            self.current_training_data['lines_collected'].add(3)
+            return True
+        return False
+    
+    def match_training_line4(self, line: str) -> bool:
+        """匹配训练信息第4行：熵值统计（可选）"""
+        line = line.strip()
+        if '熵值统计' in line:
+            entropy = None
+            alpha_grad = None
+            entropy_match = self.regex_entropy.search(line)
+            if entropy_match:
+                entropy = float(entropy_match.group(1))
+            alpha_grad_match = self.regex_alpha_grad.search(line)
+            if alpha_grad_match:
+                alpha_grad = float(alpha_grad_match.group(1))
+            self.current_training_data['line4_data'] = {
+                'entropy': entropy,
+                'alpha_grad': alpha_grad
+            }
+            self.current_training_data['lines_collected'].add(4)
+            return True
+        return False
+    
+    def match_training_line5(self, line: str) -> bool:
+        """匹配训练信息第5行：训练耗时"""
+        line = line.strip()
+        duration_match = self.regex_training_duration.search(line)
+        if duration_match:
+            training_duration = float(duration_match.group(1))
+            self.current_training_data['line5_data'] = {
+                'training_duration': training_duration
+            }
+            self.current_training_data['lines_collected'].add(5)
+            return True
+        return False
+    
+    def try_complete_training_record(self) -> bool:
+        """尝试完成当前训练记录（当收集到必要的行时）"""
+        # 至少需要第1、2、3行才能完成一个训练记录
+        if 1 in self.current_training_data['lines_collected'] and \
+           2 in self.current_training_data['lines_collected'] and \
+           3 in self.current_training_data['lines_collected']:
+            
+            # 获取训练步数
+            training_step = self.current_training_data['training_step']
+            if training_step is None:
+                training_step = len(self.training_records) + 1
+            
+            # 组装训练记录
+            line1 = self.current_training_data['line1_data']
+            line2 = self.current_training_data['line2_data']
+            line3 = self.current_training_data['line3_data']
+            line4 = self.current_training_data['line4_data']
+            line5 = self.current_training_data['line5_data']
+            
+            # 检查是否已经完成过这个训练步数（避免重复解析）
+            if training_step in self.completed_training_steps:
+                # 如果已经完成过，重置状态机但不添加记录
+                self.current_training_data = {
+                    'training_step': None,
+                    'line1_data': None,
+                    'line2_data': None,
+                    'line3_data': None,
+                    'line4_data': None,
+                    'line5_data': None,
+                    'lines_collected': set()
+                }
+                return False
+            
+            self.training_records.append((
+                training_step,
+                line2['critic_loss'],
+                line3['actor_loss'],
+                line1['avg_sample_times'],
+                line2['critic_grad_before'],
+                line2['critic_grad_after'],
+                line3['actor_grad_before'],
+                line3['actor_grad_after'],
+                line4['entropy'] if line4 else None,
+                line4['alpha_grad'] if line4 else None
+            ))
+            
+            # 记录已完成的训练步数
+            self.completed_training_steps.add(training_step)
+            
+            # 保存训练耗时、总抽样数、总样本数
+            if line5 and line5['training_duration'] is not None:
+                self.training_durations.append(line5['training_duration'])
+            if line1 and line1['total_sample_count'] is not None:
+                self.total_sample_count.append(line1['total_sample_count'])
+            if line1 and line1['total_sample_steps'] is not None:
+                self.total_sample_steps.append(line1['total_sample_steps'])
+            
+            # 重置状态机
+            self.current_training_data = {
+                'training_step': None,
+                'line1_data': None,
+                'line2_data': None,
+                'line3_data': None,
+                'line4_data': None,
+                'line5_data': None,
+                'lines_collected': set()
+            }
+            return True
+        return False
     
     def parse_training_details(self, lines: List[str], start_idx: int) -> Optional[Tuple]:
         """解析训练详细信息（多行）
@@ -402,8 +583,87 @@ class TrainingMetricsAnalyzer:
         
         return None
     
+    def collect_training_lines_forward(self, lines: List[str], training_start_idx: int, max_lookahead: int = 100) -> int:
+        """从训练完成行开始，向后收集所有训练信息行
+        返回：收集到的最后一个训练信息行的索引（不包括训练完成行本身）
+        """
+        # 重置状态机
+        self.current_training_data = {
+            'training_step': None,
+            'line1_data': None,
+            'line2_data': None,
+            'line3_data': None,
+            'line4_data': None,
+            'line5_data': None,
+            'lines_collected': set()
+        }
+        
+        # 设置训练步数
+        training_start = self.parse_training_record(lines[training_start_idx])
+        if training_start:
+            self.current_training_data['training_step'] = training_start[1]
+        
+        # 从训练完成行的下一行开始，向后搜索最多max_lookahead行
+        last_training_line_idx = training_start_idx
+        end_idx = min(training_start_idx + max_lookahead + 1, len(lines))
+        
+        for j in range(training_start_idx + 1, end_idx):
+            line = lines[j]
+            
+            # 如果遇到新的训练完成行，停止收集
+            if self.parse_training_record(line):
+                break
+            
+            # 检查是否是训练信息行
+            is_training_line = False
+            
+            # 依次尝试匹配训练信息的5行（跳过已经匹配的行）
+            if 1 not in self.current_training_data['lines_collected']:
+                if self.match_training_line1(line):
+                    is_training_line = True
+                    last_training_line_idx = j
+            if 2 not in self.current_training_data['lines_collected']:
+                if self.match_training_line2(line):
+                    is_training_line = True
+                    last_training_line_idx = j
+            if 3 not in self.current_training_data['lines_collected']:
+                if self.match_training_line3(line):
+                    is_training_line = True
+                    last_training_line_idx = j
+            if 4 not in self.current_training_data['lines_collected']:
+                if self.match_training_line4(line):
+                    is_training_line = True
+                    last_training_line_idx = j
+            if 5 not in self.current_training_data['lines_collected']:
+                if self.match_training_line5(line):
+                    is_training_line = True
+                    last_training_line_idx = j
+            
+            # 如果已经收集了所有必要的行（至少1、2、3行和5行），可以提前停止
+            if (1 in self.current_training_data['lines_collected'] and 
+                2 in self.current_training_data['lines_collected'] and 
+                3 in self.current_training_data['lines_collected'] and
+                5 in self.current_training_data['lines_collected']):
+                # 如果连续几行都不是训练信息行，可以提前停止
+                if not is_training_line:
+                    # 检查后续几行是否还有训练信息行
+                    has_more_training_lines = False
+                    for k in range(j + 1, min(j + 3, end_idx)):
+                        check_line = lines[k]
+                        if (self.regex_sample_times.search(check_line) or 
+                            self.regex_critic_loss.search(check_line) or 
+                            self.regex_actor_loss.search(check_line) or
+                            self.regex_training_duration.search(check_line) or
+                            ('熵值统计' in check_line)):
+                            has_more_training_lines = True
+                            break
+                    if not has_more_training_lines:
+                        break
+        
+        return last_training_line_idx
+    
     def parse_log(self):
-        """解析日志文件（优化版本，使用预编译正则表达式和优化的循环）"""
+        """解析日志文件（优化版本：匹配到训练完成行后，向后收集所有训练信息行）"""
         print(f"正在解析日志文件: {self.log_file}")
         
         # 读取文件（对于大文件，可以考虑分块读取，但这里一次性读取更简单）
@@ -413,7 +673,6 @@ class TrainingMetricsAnalyzer:
         print(f"日志文件总行数: {len(lines)}")
         
         # 预分配列表以提高性能（如果可能的话）
-        current_training_step = None
         prev_line = ""
         
         # 使用更高效的循环（减少函数调用开销）
@@ -422,37 +681,70 @@ class TrainingMetricsAnalyzer:
         
         while i < lines_len:
             # 直接访问，减少函数调用
-            line = lines[i].strip()
+            line = lines[i]
             
-            # 直接尝试解析训练详细信息（不依赖训练完成行）
-            # 匹配模式：第1行（总抽样数等）-> 第2行（Critic损失）-> 第3行（Actor损失）-> 第4行（熵值，可选）-> 第5行（训练耗时）
-            if i + 2 < lines_len:
-                training_details = self.parse_training_details(lines, i)
-                if training_details:
-                    _, training_step, avg_sample_times, critic_loss, actor_loss, critic_grad_before, critic_grad_after, actor_grad_before, actor_grad_after, entropy, alpha_grad, training_duration, total_sample_count, total_sample_steps = training_details
-                    self.training_records.append((
-                        training_step, critic_loss, actor_loss, avg_sample_times,
-                        critic_grad_before, critic_grad_after, actor_grad_before, actor_grad_after,
-                        entropy, alpha_grad
-                    ))
-                    # 保存训练耗时、总抽样数、总样本数
-                    if training_duration is not None:
-                        self.training_durations.append(training_duration)
-                    if total_sample_count is not None:
-                        self.total_sample_count.append(total_sample_count)
-                    if total_sample_steps is not None:
-                        self.total_sample_steps.append(total_sample_steps)
-                    # 计算需要跳过的行数
-                    # 我们已经解析了第1-3行（总抽样数、Critic损失、Actor损失）
-                    skip_lines = 3  # 至少跳过3行
-                    # 检查是否有熵值统计（在第4行，即i+3）
-                    if i + 3 < lines_len and '熵值统计' in lines[i + 3].strip():
-                        skip_lines = 4  # 如果有熵值统计，跳过4行（包括熵值统计行）
-                    # 训练耗时可能在熵值统计行之后，但我们不需要跳过它，因为下一轮循环会自然跳过
-                    i += skip_lines
+            # 首先检查是否是训练完成行
+            training_start = self.parse_training_record(line)
+            if training_start:
+                training_step = training_start[1]
+                # 检查这个训练步数是否已经完成过
+                if training_step in self.completed_training_steps:
+                    # 如果已经完成过，跳过这行继续处理
+                    i += 1
+                    continue
+                
+                # 匹配到训练完成行后，向后搜索收集所有训练信息行
+                last_training_line_idx = self.collect_training_lines_forward(lines, i, max_lookahead=100)
+                
+                # 尝试完成训练记录
+                record_completed = self.try_complete_training_record()
+                
+                if record_completed:
+                    # 训练记录已完成，跳转到训练完成行的下一行继续处理
+                    i = i + 1
+                    continue
+                else:
+                    # 训练记录未完成（可能缺少必要的信息），重置状态机并继续
+                    self.current_training_data = {
+                        'training_step': None,
+                        'line1_data': None,
+                        'line2_data': None,
+                        'line3_data': None,
+                        'line4_data': None,
+                        'line5_data': None,
+                        'lines_collected': set()
+                    }
+                    i += 1
                     continue
             
-            # 解析保存最好模型的记录（使用字符串查找优化）
+            # 检查是否是训练信息行（总抽样数、critic损失、actor损失等）
+            # 如果遇到训练信息行但状态机中没有训练步数，说明这些行肯定已经被前面的训练完成行统计过了，直接跳过
+            is_training_info_line = (
+                self.regex_sample_times.search(line) or 
+                self.regex_critic_loss.search(line) or 
+                self.regex_actor_loss.search(line) or
+                self.regex_training_duration.search(line) or
+                ('熵值统计' in line)
+            )
+            
+            if is_training_info_line:
+                # 如果状态机中没有训练步数，说明这些训练信息行肯定已经被前面的训练完成行统计过了
+                # 直接跳过，避免重复解析
+                if self.current_training_data['training_step'] is None:
+                    i += 1
+                    continue
+            
+            # 尝试匹配Episode
+            if 'Reward Detail:' in line or 'Episode:' in line:
+                episode_info = self.parse_episode(line, prev_line)
+                if episode_info and episode_info[0] == 'episode':
+                    _, env_id, episode_num, end_status, reward_detail, steps, timestamp = episode_info
+                    self.episodes.append((episode_num, env_id, end_status, reward_detail, steps, timestamp))
+                    i += 1
+                    prev_line = line
+                    continue
+            
+            # 尝试匹配最好模型保存记录
             if '============================================================' in line and i + 3 < lines_len:
                 best_model_info = self.parse_best_model_record(lines, i)
                 if best_model_info and best_model_info[0] == 'best_model':
@@ -465,15 +757,11 @@ class TrainingMetricsAnalyzer:
                     i += 4  # 跳过已解析的行（包括分隔线和空行）
                     continue
             
-            # 解析Episode（优化：先检查是否包含关键词）
-            if 'Reward Detail:' in line or 'Episode:' in line:
-                episode_info = self.parse_episode(line, prev_line)
-                if episode_info and episode_info[0] == 'episode':
-                    _, env_id, episode_num, end_status, reward_detail, steps, timestamp = episode_info
-                    self.episodes.append((episode_num, env_id, end_status, reward_detail, steps, timestamp))
-            
             prev_line = line
             i += 1
+        
+        # 解析完成后，尝试完成最后一个训练记录（如果有未完成的）
+        self.try_complete_training_record()
         
         # 使用numpy进行排序（对于大数据集更快）
         if self.training_records:
