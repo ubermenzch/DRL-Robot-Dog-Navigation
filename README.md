@@ -113,10 +113,13 @@ sudo apt install ros-foxy-gazebo-*
 根据你的 Python 版本和 CUDA 版本选择合适的 PyTorch 版本。以 CUDA 12.1、Python 3.8 为例：
 
 ```shell
+pip3 install torch
+pip3 install squaternion
+pip3 install scipy
 # 先安装 networkx（兼容性要求）
-pip install "networkx<3.0" --no-deps
+pip3 install "networkx<3.0" --no-deps
 # 安装 PyTorch 及匹配的 CUDA 工具包
-pip install torch==2.2.1+cu121 torchvision==0.17.1+cu121 torchaudio==2.2.1+cu121 \
+pip3 install torch==2.2.1+cu121 torchvision==0.17.1+cu121 torchaudio==2.2.1+cu121 \
     --index-url https://download.pytorch.org/whl/cu121
 ```
 
@@ -129,7 +132,7 @@ pip3 install torch torchvision torchaudio
 ### 7. 安装其他 Python 依赖
 
 ```shell
-pip install squaternion tqdm
+pip3 install squaternion tqdm
 ```
 
 ### 8. 下载 Gazebo 模型库
@@ -422,7 +425,6 @@ nvidia-smi -i <GPU编号> -l 1
 
 - 减少 `num_envs` 参数（每个环境约占用 800MB 显存）
 - 减少 `batch_size` 参数
-- 使用 `use_float64_for_buffer: false` 以降低内存占用
 
 ### 3. Gazebo 无法启动
 

@@ -43,14 +43,17 @@ class SAC(object):
         actor_only=False,  # 是否只创建actor模型（用于数据收集进程，节省显存）
         actor_grad_clip_value=0.0,  # Actor网络梯度裁剪值（>0时启用梯度裁剪，将梯度裁剪到[-actor_grad_clip_value, actor_grad_clip_value]范围；0或负数表示不进行梯度裁剪）
         critic_grad_clip_value=0.0,  # Critic网络梯度裁剪值（>0时启用梯度裁剪，将梯度裁剪到[-critic_grad_clip_value, critic_grad_clip_value]范围；0或负数表示不进行梯度裁剪）
+        bin_num=72,  # 激光扫描分区（bin）的数量
     ):
         super().__init__()
         self.state_dim = state_dim
+        self.bin_num = bin_num  # 激光扫描分区数量
         # base_state_dim用于prepare_state中计算max_bins，如果没有指定则使用state_dim
         self.base_state_dim = base_state_dim if base_state_dim is not None else state_dim
         self.action_dim = action_dim
         self.action_range = (-max_action, max_action)
-        self.device = torch.device(device)
+        # 优先使用CUDA；若不可用则退回CPU，忽略配置中的device字段
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.discount = discount
         self.critic_tau = critic_tau
         self.actor_update_frequency = actor_update_frequency
@@ -167,22 +170,112 @@ class SAC(object):
             )
             print(f"Saved models to: {directory}")
 
+    @staticmethod
+    def infer_network_structure_from_weights(actor_weights_path, action_dim):
+        """从actor权重文件中推断完整的网络结构（输入层、隐藏层、输出层）
+        
+        Args:
+            actor_weights_path: actor权重文件路径
+            action_dim: 动作维度
+            
+        Returns:
+            dict: 包含以下键的字典：
+                - input_dim: 输入层维度（从权重文件读取）
+                - hidden_layers: 隐藏层结构列表，例如 [1024, 512]
+                - output_dim: 输出层维度（应该是2*action_dim）
+        """
+        try:
+            state_dict = torch.load(actor_weights_path, weights_only=True, map_location='cpu')
+            
+            # Actor的trunk是一个MLP，输出维度是2*action_dim（mu和log_std各action_dim维）
+            # 结构是: input_dim -> hidden_layers[0] -> ... -> hidden_layers[-1] -> 2*action_dim
+            # 权重键名格式: trunk.0.weight, trunk.2.weight, ... (Linear层)
+            # 激活函数层没有权重，所以Linear层的索引是0, 2, 4, ...
+            
+            # 提取所有Linear层的权重形状，按层索引排序
+            linear_layers = {}
+            for key in state_dict.keys():
+                if 'trunk' in key and 'weight' in key:
+                    # 提取层索引，例如 "trunk.0.weight" -> 0
+                    layer_idx = int(key.split('.')[1])
+                    weight = state_dict[key]
+                    if len(weight.shape) == 2:  # Linear层的权重是2D的
+                        linear_layers[layer_idx] = weight.shape
+            
+            if len(linear_layers) < 2:
+                raise ValueError(f"无法推断网络结构：只找到{len(linear_layers)}个Linear层，至少需要2层")
+            
+            # 按层索引排序
+            sorted_layers = sorted(linear_layers.items())
+            layer_shapes = [shape for _, shape in sorted_layers]
+            
+            # 读取输入层维度（第一层的输入维度）
+            input_dim = layer_shapes[0][1]  # 第一层的输入维度
+            
+            # 读取输出层维度（最后一层的输出维度）
+            output_dim = layer_shapes[-1][0]  # 最后一层的输出维度
+            
+            # 验证输出层维度
+            expected_output_dim = 2 * action_dim
+            if output_dim != expected_output_dim:
+                raise ValueError(f"网络结构不一致：最后一层输出维度({output_dim})与期望的2*action_dim({expected_output_dim})不匹配")
+            
+            # 提取隐藏层结构
+            # hidden_layers包含所有中间层的输出维度（不包括最后一层）
+            hidden_layers = []
+            for i in range(len(layer_shapes)):
+                layer_out = layer_shapes[i][0]  # 当前层的输出维度
+                if i < len(layer_shapes) - 1:  # 不是最后一层
+                    hidden_layers.append(layer_out)
+                # 验证层之间的连接
+                if i < len(layer_shapes) - 1:
+                    next_layer_in = layer_shapes[i + 1][1]  # 下一层的输入维度
+                    if layer_out != next_layer_in:
+                        raise ValueError(f"网络结构不一致：第{i}层输出维度({layer_out})与第{i+1}层输入维度({next_layer_in})不匹配")
+            
+            return {
+                'input_dim': input_dim,
+                'hidden_layers': hidden_layers,
+                'output_dim': output_dim
+            }
+            
+        except Exception as e:
+            raise ValueError(f"从权重文件推断网络结构失败: {e}")
+    
+    @staticmethod
+    def infer_hidden_layers_from_weights(actor_weights_path, obs_dim, action_dim):
+        """从actor权重文件中推断hidden_layers结构（向后兼容方法）
+        
+        Args:
+            actor_weights_path: actor权重文件路径
+            obs_dim: 输入维度（state_dim）
+            action_dim: 动作维度
+            
+        Returns:
+            hidden_layers: 推断出的隐藏层结构列表，例如 [1024, 512]
+        """
+        structure = SAC.infer_network_structure_from_weights(actor_weights_path, action_dim)
+        # 验证输入维度
+        if structure['input_dim'] != obs_dim:
+            raise ValueError(f"网络结构不一致：权重文件中的输入维度({structure['input_dim']})与期望的obs_dim({obs_dim})不匹配")
+        return structure['hidden_layers']
+
     def load(self, filename, directory):
         """加载模型权重"""
         self.actor.load_state_dict(
-            torch.load("%s/%s_actor.pth" % (directory, filename))
+            torch.load("%s/%s_actor.pth" % (directory, filename), weights_only=True)
         )
         if not self.actor_only:
             # 只有在非actor_only模式下才加载critic权重
             self.critic.load_state_dict(
-                torch.load("%s/%s_critic.pth" % (directory, filename))
+                torch.load("%s/%s_critic.pth" % (directory, filename), weights_only=True)
             )
             self.critic_target.load_state_dict(
-                torch.load("%s/%s_critic_target.pth" % (directory, filename))
+                torch.load("%s/%s_critic_target.pth" % (directory, filename), weights_only=True)
             )
         print(f"Loaded weights from: {directory}")
 
-    def train(self, replay_buffer, iterations, batch_size):
+    def train(self, replay_buffer, iterations, batch_size, stats=None):
         critic_losses = []
         actor_losses = []
         critic_grads = []
@@ -194,7 +287,7 @@ class SAC(object):
         
         for _ in range(iterations):
             critic_loss, actor_loss, critic_grad, actor_grad, entropy, alpha_grad, sample_dt, total_dt = self.update(
-                replay_buffer=replay_buffer, step=self.step, batch_size=batch_size
+                replay_buffer=replay_buffer, step=self.step, batch_size=batch_size, stats=stats
             )
             sample_time_total += sample_dt
             update_time_total += total_dt
@@ -325,7 +418,7 @@ class SAC(object):
             # 注意：clip_grad_norm_内部计算范数的方式可能与手动计算有细微差别（浮点数精度）
             # 因此使用clip_grad_norm_返回的值作为裁剪前的范数，这样更准确
             grad_norm_before = torch.nn.utils.clip_grad_norm_(
-                self.critic.parameters(), 
+                self.critic.parameters(),
                 self.critic_grad_clip_value,
                 error_if_nonfinite=False  # 允许非有限值，避免抛出异常
             ).item()
@@ -378,7 +471,7 @@ class SAC(object):
             # 注意：clip_grad_norm_内部计算范数的方式可能与手动计算有细微差别（浮点数精度）
             # 因此使用clip_grad_norm_返回的值作为裁剪前的范数，这样更准确
             grad_norm_before = torch.nn.utils.clip_grad_norm_(
-                self.actor.parameters(), 
+                self.actor.parameters(),
                 self.actor_grad_clip_value,
                 error_if_nonfinite=False  # 允许非有限值，避免抛出异常
             ).item()
@@ -435,9 +528,13 @@ class SAC(object):
         
         return actor_loss.item(), actor_grad_norm, entropy, alpha_grad_norm
 
-    def update(self, replay_buffer, step, batch_size):
+    def update(self, replay_buffer, step, batch_size, stats=None):
         t0 = time.time()
-        batch_data = replay_buffer.sample_batch(batch_size)
+        # 分层经验池：如果sample_batch支持stats参数，则传入（goal/collision/timeout动态采样需要）
+        try:
+            batch_data = replay_buffer.sample_batch(batch_size, stats=stats)
+        except TypeError:
+            batch_data = replay_buffer.sample_batch(batch_size)
         sample_dt = time.time() - t0
         if batch_data is None:
             print(f"警告: 缓冲区大小({replay_buffer.size()})小于批次大小({batch_size})，跳过训练")
@@ -471,28 +568,53 @@ class SAC(object):
         total_dt = time.time() - t0
         return critic_loss, actor_loss, critic_grad, actor_grad, entropy, alpha_grad, sample_dt, total_dt
 
-    def prepare_state(self, latest_scan, distance, cos, sin, collision, goal, action):
+    def prepare_state(self, latest_scan, distance, cos, sin, collision, goal, action, current_v=0.0, current_w=0.0):
         # update the returned data from ROS into a form used for learning in the current model
-        latest_scan = np.array(latest_scan) #latest_scan为180度方向激光扫描点离智能体的距离
+        latest_scan = np.array(latest_scan)
 
-        # inf_mask = np.isinf(latest_scan) # 得到距离为无限的扫描点的下标
-        # latest_scan[inf_mask] = self.scan_range # 将所有距离为无限的扫描点的距离设置为scan_range（最大有效距离）
+        # 处理无限大值（如果scan_range在类中定义）
+        if hasattr(self, 'scan_range') and np.any(np.isinf(latest_scan)):
+            latest_scan[np.isinf(latest_scan)] = self.scan_range
 
         scan_len = len(latest_scan)
         
-        max_bins = self.base_state_dim - 5 # 最大的分箱数（激光扫描被分成几个区域），使用base_state_dim而非state_dim
-        bin_size = int(np.ceil(scan_len / max_bins)) # 计算每个分箱的扫描点数量
+        # 使用配置的bin_num作为分桶数量
+        if scan_len < self.bin_num:
+            raise ValueError(f"scan_len({scan_len}) must be >= bin_num({self.bin_num})")
 
-        # Initialize the list to store the minimum values of each bin
+        bin_num = self.bin_num
+        # 为确保能够生成恰好bin_num个桶，这里用linspace做等分边界
+        edges = np.linspace(0, scan_len, num=bin_num + 1, dtype=int)
+
+        # 初始化存储每个桶最小值的列表
         min_obs_distance = []
 
-        # Loop through the data and create bins
-        for i in range(0, scan_len, bin_size):
-            # Get the current bin
-            bin = latest_scan[i : i + min(bin_size, scan_len - i)]
-            # Find the minimum value in the current bin and append it to the min_obs_distance list
-            min_obs_distance.append(min(bin))
-        state = min_obs_distance + [distance, cos, sin] + [action[0], action[1]]
+        for b in range(bin_num):
+            start = edges[b]
+            end = edges[b + 1]
+            current_bin = latest_scan[start:end]
+            if current_bin.size == 0:
+                # 理论上scan_len>=bin_num时不会发生；防御性处理
+                current_min = latest_scan[min(start, scan_len - 1)]
+            else:
+                current_min = np.min(current_bin)
+            min_obs_distance.append(current_min)
+        
+        # 按配置的bin_num决定分区数量：min_obs_distance长度应当等于bin_num
+        # 基于当前观测组成规则，单步 state 维度应为：bin_num + 7
+        # 其中 7 = distance,cos,sin(3) + last_action(2) + current_v,current_w(2)
+        expected_base_state_dim = self.bin_num + 7
+        if self.base_state_dim != expected_base_state_dim:
+            raise ValueError(
+                f"base_state_dim({self.base_state_dim}) must equal expected_base_state_dim({expected_base_state_dim})"
+            )
+
+        state = (
+            min_obs_distance
+            + [distance, cos, sin]
+            + [action[0], action[1]]
+            + [float(current_v), float(current_w)]
+        )
         assert len(state) == self.base_state_dim, f"len(state) must be {self.base_state_dim}, but got {len(state)}"
         terminal = 1 if collision or goal else 0
 

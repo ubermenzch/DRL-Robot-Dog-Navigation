@@ -12,6 +12,7 @@ import queue
 import threading
 import time
 import copy
+import math
 from pathlib import Path
 import shutil
 import warnings
@@ -23,6 +24,9 @@ import os
 import yaml
 import json
 from datetime import datetime
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端
+import matplotlib.pyplot as plt
 from collections import deque
 from typing import Optional
 
@@ -30,41 +34,18 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 from SAC.SAC import SAC
 from ros_python import ROS_env
-from replay_buffer import ReplayBuffer
+from replay_buffer import ReplayBuffer, StratifiedReplayBuffer, NumpyReplayBuffer, NumpyStratifiedReplayBuffer
 import utils
 
-def setup_warning_redirect():
-    """将 warnings 输出重定向到日志文件，避免终端刷屏"""
-    logfile = os.environ.get("TRAINING_LOGFILE")
-    if not logfile:
-        return
 
-    def _showwarning(message, category, filename, lineno, file=None, line=None):
-        try:
-            with open(logfile, "a", encoding="utf-8") as f:
-                f.write(warnings.formatwarning(message, category, filename, lineno, line))
-        except Exception:
-            sys.stderr.write(warnings.formatwarning(message, category, filename, lineno, line))
-
-    warnings.showwarning = _showwarning
-    # 针对 std() 的自由度警告只写入日志，不干扰终端
-    warnings.filterwarnings("ignore", message=r"std\(\): degrees of freedom.*")
-
-
-# 将权重等冗长信息只写入日志文件，避免终端刷屏
-def weight_log(msg: str):
-    logfile = os.environ.get("TRAINING_LOGFILE")
-    if logfile:
-        try:
-            with open(logfile, "a", encoding="utf-8") as f:
-                f.write(msg + "\n")
-            return
-        except Exception:
-            pass
-    print(msg)
-
-
-setup_warning_redirect()
+# ==================== Phase定义 ====================
+# 统一的阶段控制，替代原来的phase_ref + collection_start_event + stop_collection_event
+PHASE_TRAIN_COLLECT = 0   # 训练阶段，允许开始/继续收集训练episode
+PHASE_TRAIN_DRAIN = 1     # 训练阶段，本轮"收尾"：不再启动新的训练episode，只让已在跑的episode跑到最小门槛后尽快结束
+PHASE_EVAL_COLLECT = 2    # 评估阶段，收集评估episode（无噪声、不写replay，只统计）
+PHASE_EVAL_DRAIN = 3      # 评估阶段收尾：不再启动新的评估episode，正在进行的episode满足最小门槛后尽快截断并丢弃（不计入统计）
+PHASE_PAUSE = 4           # 完全暂停：既不收集训练episode，也不收集评估episode，所有环境进程只是在while里sleep等待下一次phase切换
+PHASE_STOP = 5            # 停止：环境进程看到后直接break退出循环
 
 
 def load_config(config_path=None):
@@ -106,6 +87,84 @@ def _is_valid_experience(exp):
         return False
     
     return True
+
+
+def config_to_image(config_data, output_path, title="Training Configuration"):
+    """
+    将配置数据转换为图片（使用matplotlib）
+
+    Args:
+        config_data: 配置字典
+        output_path: 输出图片路径
+        title: 图片标题
+    """
+
+    # 将配置格式化为可读文本
+    def format_config_text(config, indent=0):
+        """递归格式化配置为文本"""
+        lines = []
+        prefix = "  " * indent
+
+        if isinstance(config, dict):
+            for key, value in config.items():
+                if isinstance(value, (dict, list)):
+                    lines.append(f"{prefix}{key}:")
+                    lines.extend(format_config_text(value, indent + 1))
+                else:
+                    lines.append(f"{prefix}{key}: {value}")
+        elif isinstance(config, list):
+            for i, item in enumerate(config):
+                if isinstance(item, (dict, list)):
+                    lines.append(f"{prefix}[{i}]:")
+                    lines.extend(format_config_text(item, indent + 1))
+                else:
+                    lines.append(f"{prefix}[{i}]: {item}")
+        else:
+            lines.append(f"{prefix}{config}")
+
+        return lines
+
+    # 生成配置文本
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    header = [
+        "=" * 60,
+        f"  {title}",
+        f"  Generated: {timestamp}",
+        "=" * 60,
+        ""
+    ]
+
+    config_lines = format_config_text(config_data)
+    all_lines = header + config_lines
+
+    # 创建图形
+    fig, ax = plt.subplots(figsize=(12, len(all_lines) * 0.15))  # 动态高度
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, len(all_lines))
+    ax.axis('off')
+
+    # 设置字体
+    font_props = {'family': 'monospace', 'size': 10}
+
+    # 绘制文本
+    for i, line in enumerate(all_lines):
+        ax.text(0.02, len(all_lines) - i - 0.5, line, fontdict=font_props,
+                verticalalignment='center', color='black')
+
+    # 调整布局
+    plt.tight_layout()
+
+    # 保存图片
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
+
+    # 关闭图形以释放内存
+    plt.close(fig)
+
+    # 设置为只读权限
+    os.chmod(output_path, 0o444)
+
+    print(f"配置图片已保存到: {output_path}")
+    print(f"包含 {len(config_lines)} 个配置项")
 
 
 def _is_valid_env_return(latest_scan, distance, cos, sin, collision, goal, last_action, reward):
@@ -156,33 +215,33 @@ def verify_actor_weight_consistency(local_model, latest_model_state, env_id, con
     if not config.get('enable_weight_consistency_check', False):
         return True
     
-    weight_log(f"环境 {env_id} 验证加载后的模型权重:")
+    print(f"环境 {env_id} 验证加载后的模型权重:")
     # actor_only模式下只返回actor权重
     local_state_dict_for_log = local_model.state_dict(actor_only=True)
     
     # 打印模型结构概览
-    weight_log(f"环境 {env_id} 从文件加载的模型结构概览:")
+    print(f"环境 {env_id} 从文件加载的模型结构概览:")
     for key, value in local_state_dict_for_log.items():
         if hasattr(value, 'shape') and value.numel() > 0:
             try:
-                weight_log(f"  环境 {env_id} {key} 形状: {value.shape}, 均值: {value.mean().item():.2f}, 标准差: {value.std().item():.2f}")
+                print(f"  环境 {env_id} {key} 形状: {value.shape}, 均值: {value.mean().item():.2f}, 标准差: {value.std().item():.2f}")
             except Exception:
-                weight_log(f"  环境 {env_id} {key} 形状: {value.shape}, 类型: {type(value)}")
+                print(f"  环境 {env_id} {key} 形状: {value.shape}, 类型: {type(value)}")
         elif isinstance(value, dict):
-            weight_log(f"  环境 {env_id} {key} 子键: {list(value.keys())}")
+            print(f"  环境 {env_id} {key} 子键: {list(value.keys())}")
             for subkey, subvalue in value.items():
                 if hasattr(subvalue, 'shape') and subvalue.numel() > 0:
                     try:
-                        weight_log(f"    环境 {env_id} {key}.{subkey} 形状: {subvalue.shape}, 均值: {subvalue.mean().item():.2f}, 标准差: {subvalue.std().item():.2f}")
+                        print(f"    环境 {env_id} {key}.{subkey} 形状: {subvalue.shape}, 均值: {subvalue.mean().item():.2f}, 标准差: {subvalue.std().item():.2f}")
                     except Exception:
-                        weight_log(f"    环境 {env_id} {key}.{subkey} 形状: {subvalue.shape}, 类型: {type(subvalue)}")
+                        print(f"    环境 {env_id} {key}.{subkey} 形状: {subvalue.shape}, 类型: {type(subvalue)}")
                 else:
-                    weight_log(f"    环境 {env_id} {key}.{subkey} 形状: {subvalue.shape}, 类型: {type(subvalue)}")
+                    print(f"    环境 {env_id} {key}.{subkey} 形状: {subvalue.shape}, 类型: {type(subvalue)}")
         else:
-            weight_log(f"  环境 {env_id} {key} 值: {value}, 类型: {type(value)}")
+            print(f"  环境 {env_id} {key} 值: {value}, 类型: {type(value)}")
     
     # 权重一致性验证（只验证actor权重）
-    weight_log(f"环境 {env_id} 权重一致性验证:")
+    print(f"环境 {env_id} 权重一致性验证:")
     local_state_dict = local_model.state_dict(actor_only=True)  # actor_only模式下只返回actor权重
     weights_match = True
     
@@ -194,130 +253,35 @@ def verify_actor_weight_consistency(local_model, latest_model_state, env_id, con
                     if hasattr(subvalue, 'shape') and subvalue.numel() > 0:
                         local_subvalue = local_state_dict[key][subkey]
                         if torch.allclose(subvalue, local_subvalue, atol=1e-6):
-                            weight_log(f"  ✓ {key}.{subkey} 权重完全匹配")
+                            print(f"  ✓ {key}.{subkey} 权重完全匹配")
                         else:
-                            weight_log(f"  ✗ {key}.{subkey} 权重不匹配!")
-                            weight_log(f"    文件权重均值: {subvalue.mean().item():.2f}, 本地权重均值: {local_subvalue.mean().item():.2f}")
-                            weight_log(f"    文件权重标准差: {subvalue.std().item():.2f}, 本地权重标准差: {local_subvalue.std().item():.2f}")
+                            print(f"  ✗ {key}.{subkey} 权重不匹配!")
+                            print(f"    文件权重均值: {subvalue.mean().item():.2f}, 本地权重均值: {local_subvalue.mean().item():.2f}")
+                            print(f"    文件权重标准差: {subvalue.std().item():.2f}, 本地权重标准差: {local_subvalue.std().item():.2f}")
                             weights_match = False
             else:
-                weight_log(f"  警告: 键 {key} 不在本地模型状态字典中")
+                print(f"  警告: 键 {key} 不在本地模型状态字典中")
         elif hasattr(value, 'shape') and value.numel() > 0:
             # 直接是tensor的情况（不应该出现在actor_only模式下）
             if key in local_state_dict:
                 local_value = local_state_dict[key]
                 if torch.allclose(value, local_value, atol=1e-6):
-                    weight_log(f"  ✓ {key} 权重完全匹配")
+                    print(f"  ✓ {key} 权重完全匹配")
                 else:
-                    weight_log(f"  ✗ {key} 权重不匹配!")
-                    weight_log(f"    文件权重均值: {value.mean().item():.2f}, 本地权重均值: {local_value.mean().item():.2f}")
-                    weight_log(f"    文件权重标准差: {value.std().item():.2f}, 本地权重标准差: {local_value.std().item():.2f}")
+                    print(f"  ✗ {key} 权重不匹配!")
+                    print(f"    文件权重均值: {value.mean().item():.2f}, 本地权重均值: {local_value.mean().item():.2f}")
+                    print(f"    文件权重标准差: {value.std().item():.2f}, 本地权重标准差: {local_value.std().item():.2f}")
                     weights_match = False
     
     # 输出汇总结果
     if weights_match:
-        weight_log(f"环境 {env_id} ✓ 所有权重完全匹配!")
+        print(f"环境 {env_id} ✓ 所有权重完全匹配!")
     else:
-        weight_log(f"环境 {env_id} ✗ 发现权重不匹配!")
+        print(f"环境 {env_id} ✗ 发现权重不匹配!")
     
     return weights_match
 
 
-class SharedReplayBuffer:
-    """多进程共享的重放缓冲区 - 真正的并行版本"""
-    
-    def __init__(self, shared_list, lock, total_added_step, buffer_size,total_episodes_counter):
-        self.shared_list = shared_list
-        self.lock = lock
-        self.total_added_step = total_added_step  # 改名为total_added_step，记录step数量
-        self.buffer_size = buffer_size
-        self.total_episodes_counter = total_episodes_counter  # 新增：Episode计数器
-        self.filtered_count = 0  # 统计被过滤的无效经验数量
-        
-    def add_batch(self, experiences):
-        """批量添加经验 - 使用锁自然阻塞，优化性能"""
-        if not experiences:
-            return
-        
-        with self.lock:
-            valid_count = 0
-            # 批量添加，减少锁持有时间，同时过滤无效经验
-            for exp in experiences:
-                if _is_valid_experience(exp):
-                    self.shared_list.append(exp)
-                    self.total_added_step.value += 1  # 改名为total_added_step
-                    valid_count += 1
-                else:
-                    self.filtered_count += 1
-            
-            # 如果过滤了很多无效经验，打印警告
-            if self.filtered_count > 0 and self.filtered_count % 100 == 0:
-                print(f"警告: SharedReplayBuffer已过滤 {self.filtered_count} 条包含NaN/Inf的无效经验")
-            
-            # 高效清理超出部分：使用切片操作，避免pop(0)的O(n)复杂度
-            # 当缓冲区超过限制时，一次性删除多余的元素
-            if len(self.shared_list) > self.buffer_size:
-                excess_count = len(self.shared_list) - self.buffer_size
-                # 使用切片赋值，比逐个pop(0)快得多
-                self.shared_list[:] = self.shared_list[excess_count:]
-            
-            # 只有在数据成功添加到缓冲区时才增加episode计数（至少有一条有效经验）
-            if valid_count > 0:
-                self.total_episodes_counter.value += 1
-    
-    def drain_batch(self, max_items=None):
-        """从共享缓冲区一次性拉取数据到训练线程本地缓存。
-        - max_items 为正时：最多拉取 max_items 条
-        - max_items 为 None 或 <=0 时：拉取当前全部数据
-        返回列表（可能为空）。"""
-        with self.lock:
-            available = len(self.shared_list)
-            if available == 0:
-                return []
-            if (max_items is None) or (max_items <= 0):
-                take = available
-            else:
-                take = min(max_items, available)
-            # 从末尾截取一段数据返回，然后截断共享列表
-            # Manager().list 支持切片操作
-            data = self.shared_list[-take:]
-            del self.shared_list[-take:]
-            return list(data)
-    
-    def sample_batch(self, batch_size):
-        """采样批次的实现逻辑 - 在采样前获取lock"""
-        with self.lock:
-            if len(self.shared_list) < batch_size:
-                return None
-            
-            # 使用numpy随机采样，更高效
-            indices = np.random.choice(len(self.shared_list), batch_size, replace=False)
-            batch = [self.shared_list[i] for i in indices]
-            
-            # 转换为numpy数组，确保形状一致
-            states = np.array([exp[0] for exp in batch])
-            actions = np.array([exp[1] for exp in batch])
-            rewards = np.array([exp[2] for exp in batch]).reshape(-1, 1)  # 强制reshape为列向量
-            dones = np.array([exp[3] for exp in batch]).reshape(-1, 1)    # 强制reshape为列向量
-            next_states = np.array([exp[4] for exp in batch])
-            
-            return states, actions, rewards, dones, next_states
-    
-    def size(self):
-        """返回缓冲区当前大小"""
-        with self.lock:
-            return len(self.shared_list)
-    
-    def get_total_added_step(self):
-        """返回总添加的step数量"""
-        return self.total_added_step.value
-    
-    def get_total_episodes_added(self):
-        """返回总添加的episode数量"""
-        return self.total_episodes_counter.value
-    
-    
-    
 class LocalReplayBuffer:
     """训练线程本地的高性能重放缓冲区
     
@@ -387,7 +351,7 @@ class LocalReplayBuffer:
             return
         
         # 说明：
-        # 1. NaN/Inf 检查已经在采集进程（env进程）和 SharedReplayBuffer 中完成，
+        # 1. NaN/Inf 检查已经在采集进程（env进程）中完成，
         #    这里再做一次会造成明显的CPU开销，且重复意义不大，故在本地缓冲区去掉重复检查。
         # 2. 这里对整个 batch 做向量化写入，避免逐样本 Python for 循环，显著降低
         #    “拉取到本地 buffer” 阶段的时间开销。
@@ -601,15 +565,11 @@ class GlobalStatistics:
             
             return episode_number
     
-    def get_statistics(self, use_window=True, eligibility_threshold=None, eligibility_ratio=None, report_every=None, max_target_dist=None):
+    def get_statistics(self, use_window=True):
         """获取统计信息
         
         Args:
             use_window: 是否使用滑动窗口统计
-            eligibility_threshold: 最好模型评比资格检查的阈值偏移量（过去report_every个episode中，至少eligibility_ratio比例的target_dist需大于等于max_target_dist-eligibility_threshold才有资格）
-            eligibility_ratio: 最好模型评比资格检查的比例阈值（0-1之间，例如0.8表示80%）
-            report_every: 报告间隔，用于检查最好模型评比资格
-            max_target_dist: 最大目标距离，用于计算资格检查的实际阈值
         """
         with self.lock:
             total_episodes_value = self.total_episodes.value
@@ -621,27 +581,7 @@ class GlobalStatistics:
                     'timeout_rate': 0.0,
                     'avg_reward': 0.0,
                     'window_size': 0,
-                    'eligible_for_best_model': False  # 添加资格标志
                 }
-            
-            # 检查是否有资格参与最好模型评比
-            # 资格条件：过去 report_every 个 episode 中，至少 eligibility_ratio 比例的期望目标距离（ros_env.target_dist）大于等于 (max_target_dist - eligibility_threshold)
-            # 注意：这里比较的是生成episode时的期望目标距离（Target Distance），而非实际生成的终点距离（actual），实际距离有随机性
-            eligible_for_best_model = False
-            if eligibility_threshold is not None and eligibility_ratio is not None and report_every is not None and max_target_dist is not None and len(self.recent_episodes) >= report_every:
-                # 计算实际阈值：max_target_dist - eligibility_threshold
-                actual_threshold = max_target_dist - eligibility_threshold
-                recent_eps = list(self.recent_episodes)[-report_every:]
-                match_count = 0
-                total_count = 0
-                for ep in recent_eps:
-                    td = ep.get('target_dist', None)
-                    total_count += 1
-                    # 检查是否大于等于实际阈值 (max_target_dist - eligibility_threshold)
-                    if td is not None and td >= actual_threshold:
-                        match_count += 1
-                # 至少eligibility_ratio比例的episode的target_dist大于等于实际阈值才有资格
-                eligible_for_best_model = (match_count / total_count) >= eligibility_ratio if total_count > 0 else False
             
             if use_window and len(self.recent_episodes) > 0:
                 # 使用滑动窗口统计
@@ -663,7 +603,6 @@ class GlobalStatistics:
                     'timeout_rate': timeout_rate,
                     'avg_reward': avg_reward,
                     'window_size': window_episodes,
-                    'eligible_for_best_model': eligible_for_best_model  # 添加资格标志
                 }
             else:
                 # 使用全部历史统计
@@ -686,7 +625,6 @@ class GlobalStatistics:
                     'timeout_rate': timeout_rate,
                     'avg_reward': avg_reward,
                     'window_size': total_episodes_value,
-                    'eligible_for_best_model': eligible_for_best_model  # 添加资格标志
                 }
     
     def reset(self):
@@ -756,7 +694,7 @@ class SharedModelManager:
         # 从文件加载模型状态字典到目标设备（GPU或CPU）
         # 添加异常处理，防止文件损坏或权限问题导致进程崩溃
         try:
-            device_model_state = torch.load(self.model_file_path, map_location=target_device)
+            device_model_state = torch.load(self.model_file_path, map_location=target_device, weights_only=True)
             # 验证加载的数据是否为字典类型（state_dict应该是字典）
             if not isinstance(device_model_state, dict):
                 print(f"警告: 从文件 {self.model_file_path} 加载的数据不是字典类型，类型: {type(device_model_state)}")
@@ -838,10 +776,12 @@ class SharedModelManager:
     
 
 
-def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue, total_added_step, global_stats, config, init_complete_counter, total_episodes_counter, training_count_ref, critic_loss_ref, critic_loss_threshold, recent_losses_ref, avg_loss_window_size, phase_ref, eval_target_ref, eval_collected_lock, eval_collected_ref, current_buffer_size_ref, check_best_model_ref):
+def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue, total_added_step, global_stats, config, init_complete_counter, total_episodes_counter, training_count_ref, critic_loss_ref, recent_losses_ref, avg_loss_window_size, phase_ref, eval_target_ref, eval_collected_lock, eval_collected_ref, current_buffer_size_ref, check_best_model_ref, round_done_counter, current_round_ref, env_target_dist_list=None):
     """单个环境的数据收集进程 - 真正的并行版本"""
     try:
         print(f"环境 {env_id} 开始初始化...")
+        
+        is_debug = config.get('is_debug', False)
         
         # 设置正确的ROS域ID，确保与对应的Gazebo环境通信
         # 从配置文件中读取起始ROS_DOMAIN_ID，如果没有则默认为1（向后兼容）
@@ -862,6 +802,7 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             collision_delta=config['collision_delta'],
             neglect_angle=config['neglect_angle'],
             scan_range=config['scan_range'],
+            localization_noise_stddev=config.get('localization_noise_stddev', 0.0),
             world_size=config['world_size'],
             goals_per_map=config.get('goals_per_map', 1),
             obs_min_dist=config['obs_min_dist'],
@@ -879,7 +820,9 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             enable_yawrate_penalty=config.get('enable_yawrate_penalty', True),
             enable_angle_penalty=config.get('enable_angle_penalty', True),
             enable_linear_penalty=config.get('enable_linear_penalty', True),
+            enable_step_penalty=config.get('enable_step_penalty', False),
             enable_target_distance_penalty=config.get('enable_target_distance_penalty', False),
+            enable_progress_reward=config.get('enable_progress_reward', False),
             enable_linear_acceleration_oscillation_penalty=config.get('enable_linear_acceleration_oscillation_penalty', False),
             enable_yawrate_oscillation_penalty=config.get('enable_yawrate_oscillation_penalty', False),
             # 障碍物距离惩罚参数
@@ -892,19 +835,23 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             obs_penalty_middle_ratio=config.get('obs_penalty_middle_ratio', 0.4),
             # 终点距离惩罚参数
             target_distance_penalty_base=config.get('target_distance_penalty_base', -1.0),
+            # 时间步惩罚参数
+            step_penalty_base=config.get('step_penalty_base', 0.0),
             # 震荡惩罚参数
             linear_acceleration_oscillation_penalty_base=config.get('linear_acceleration_oscillation_penalty_base', -1.0),
             yawrate_oscillation_penalty_base=config.get('yawrate_oscillation_penalty_base', -1.0),
+            # 进度奖惩参数
+            progress_reward_base=config.get('progress_reward_base', 1.0),
             # 时间控制
             sim_time=config.get('sim_time', 0.1),
             step_sleep_time=config.get('step_sleep_time', 0.1),
-            eval_sleep_time=config.get('eval_sleep_time', 1.0),
             reset_step_count=config.get('reset_step_count', 3),
-            reward_debug=config.get('reward_debug', False),
             # 连通区域选择偏好
             region_select_bias=config.get('region_select_bias', 1.0),
             # 奖励归一化参数
             reward_scale=config.get('reward_scale', 1.0),  # 奖励缩放因子，用于控制每步整体奖励大小
+            # 调试参数
+            is_debug=config.get('is_debug', False),  # 是否为调试模式
         )
         print(f"环境 {env_id} ROS环境初始化完成")
         
@@ -922,7 +869,10 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
         
         # 计算实际使用的state_dim，确保与历史state拼接一致
         state_history_steps = config.get('state_history_steps', 0)
-        base_state_dim = config.get('base_state_dim', 25)
+        # 单步 state 维度（base_state_dim）不再在 train.yaml 中手动配置，改为由 bin_num + 非激光特征数动态计算
+        bin_num = config.get('bin_num', 72)
+        non_lidar_dim = 7  # distance,cos,sin(3) + last_action(2) + current_v,current_w(2)
+        base_state_dim = int(bin_num) + non_lidar_dim
         state_dim_effective = base_state_dim * (1 + state_history_steps) if state_history_steps > 0 else base_state_dim
 
         # 创建本地SAC模型实例（子进程版本）
@@ -941,6 +891,7 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             load_model=False,  # 数据收集进程不加载模型，使用共享模型状态
             action_noise_std=config.get('action_noise_std', 0.2),
             base_state_dim=base_state_dim,  # 确保prepare_state使用单步状态长度
+            bin_num=config.get('bin_num', 72),  # 激光scan分桶数量
             actor_only=True,  # 只创建actor模型，不创建critic和target_critic，节省显存
             actor_grad_clip_value=config.get('actor_grad_clip_value', 0.0),  # 传递Actor梯度裁剪值（虽然actor_only模式下不会训练，但保持参数一致性）
             critic_grad_clip_value=config.get('critic_grad_clip_value', 0.0),  # 传递Critic梯度裁剪值（虽然actor_only模式下不会训练，但保持参数一致性）
@@ -969,11 +920,11 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
         while wait_attempt < max_wait_attempts:
             latest_model_state = model_manager.get_model_state_dict_for_inference()
             if latest_model_state and len(latest_model_state) > 0:
-                weight_log(f"环境 {env_id} 获取到模型权重，键: {list(latest_model_state.keys())}")
+                print(f"环境 {env_id} 获取到模型权重，键: {list(latest_model_state.keys())}")
                 
                 # 加载模型权重到本地模型
                 local_model.load_state_dict(latest_model_state)
-                weight_log(f"环境 {env_id} 模型权重同步完成")
+                print(f"环境 {env_id} 模型权重同步完成")
                 
                 # 验证actor网络权重一致性
                 verify_actor_weight_consistency(local_model, latest_model_state, env_id, config)
@@ -992,36 +943,71 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             print(f"环境 {env_id} 初始化完成，开始持续数据收集...")
         
         total_steps = 0
-        last_training_count = 0  # 记录上次更新时的训练次数
         discount_factor = config.get('discount_factor', 0.99)  # 折扣因子（gamma），从配置文件 train.yaml 读取，统一用于计算总回报和所有 Reward Detail 分项的折扣回报
 
         # 历史state设置（长度为 state_history_steps + 1，用于存储 [s_{t-k}, ..., s_t]）
         # 即使 state_history_steps 为 0，也保持长度为 1，此时等价于只使用当前 state
         state_history = deque(maxlen=state_history_steps + 1)
         
-        eval_model_synced = False  # 评估阶段只同步一次模型
+        eval_model_synced = False  # 评估阶段只同步一次模型（每次进入评估阶段会重置）
+        last_is_eval = False
 
         global_episode_number = -1  # 安全初始化，防止异常时未定义
+        # 关键约束：每个环境在同一轮（current_round_ref）内最多“提交/计入”一次训练episode。
+        # 注意：被丢弃的episode（NaN/Inf、过滤规则、phase切换边界丢弃等）不会计入 round_done_counter，
+        # 因此不会触发该闸门，仍允许在同一轮内重试，避免单环境因为偶发异常导致整轮卡住。
+        last_committed_round = None
 
         while True:
-            current_phase = phase_ref.value  # 0=train, 1=eval, 2=pause, 3=stop
-            if current_phase == 3:
+            current_phase = phase_ref.value
+            # STOP: 直接退出
+            if current_phase == PHASE_STOP:
                 break
-            if current_phase == 2:
-                time.sleep(0.05)  # 暂停阶段：等待主进程切换
+            # PAUSE 或 EVAL_DRAIN: 等待主进程切换phase，不启动新episode
+            if current_phase == PHASE_PAUSE or current_phase == PHASE_EVAL_DRAIN:
+                time.sleep(0.1)
                 continue
-            is_eval = current_phase == 1
+            
+            # 判断是否为评估语义（评估收集/评估收尾都视为评估）
+            is_eval = (current_phase == PHASE_EVAL_COLLECT or current_phase == PHASE_EVAL_DRAIN)
+
+            # 训练阶段：根据phase决定是否允许开始新episode
+            if not is_eval:
+                # TRAIN_DRAIN: 不允许开始新episode，等待当前episode结束
+                if current_phase == PHASE_TRAIN_DRAIN:
+                    time.sleep(0.1)
+                    continue
+                # TRAIN_COLLECT: 允许开始新episode
+                elif current_phase == PHASE_TRAIN_COLLECT:
+                    local_round = current_round_ref.value
+                    # 每轮每环境最多提交一次：如果本环境已经在该轮提交过一个有效训练episode，则等待进入下一轮
+                    if last_committed_round is not None and local_round == last_committed_round:
+                        time.sleep(0.1)
+                        continue
+                else:
+                    # 未知phase，等待
+                    time.sleep(0.1)
+                    continue
+            else:
+                local_round = -1
+
+            # 阶段切换处理：每次进入评估阶段时，允许同步一次最新模型
+            if is_eval and not last_is_eval:
+                eval_model_synced = False
+            last_is_eval = is_eval
 
             if is_eval:
                 # 评估阶段固定使用最大目标距离，避免沿用训练阶段的递增值
                 ros_env.target_dist = config['max_target_dist']
+                if is_debug and env_id == 0:  # 只在环境0打印，避免刷屏
+                    print(f"[DEBUG] [环境 {env_id}] 进入评估阶段，target_dist={ros_env.target_dist:.2f}, eval_target={eval_target_ref.value}")
 
             # 评估阶段：首次进入时同步模型一次，之后不再更新
             if is_eval and not eval_model_synced:
                 latest_model_state = model_manager.get_model_state_dict_for_inference()
                 if latest_model_state:
                     local_model.load_state_dict(latest_model_state)
-                    weight_log(f"环境 {env_id} 评估阶段模型同步完成")
+                    print(f"环境 {env_id} 评估阶段模型同步完成")
                     # 验证actor网络权重一致性
                     verify_actor_weight_consistency(local_model, latest_model_state, env_id, config)
                 eval_model_synced = True
@@ -1029,46 +1015,16 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             try:
                 # 训练阶段的模型同步策略；评估阶段不再更新模型
                 if not is_eval:
-                    current_training_count = model_manager.get_training_count()
-                    should_update_model = False
-                    
-                    # 使用前X次训练的平均critic损失阈值判断是否同步模型
-                    avg_critic_loss = model_manager.get_average_critic_loss(avg_loss_window_size)
-                    
-                    # 根据平均critic损失阈值判断是否更新模型
-                    # 当 critic_loss_threshold < 0 时，表示忽略阈值，始终允许更新
-                    if critic_loss_threshold is not None and critic_loss_threshold >= 0:
-                        if avg_critic_loss < critic_loss_threshold:
-                            should_update_model = True
-                            print(f"环境 {env_id} 基于前{avg_loss_window_size}次平均损失阈值更新模型 (平均损失: {avg_critic_loss:.2f} < {critic_loss_threshold})")
-                        else:
-                            should_update_model = False
-                            # 只在第一次或每10次检查时打印，避免日志过多
-                            if not hasattr(collect_episode_data, f'no_update_count_{env_id}'):
-                                setattr(collect_episode_data, f'no_update_count_{env_id}', 0)
-                            count = getattr(collect_episode_data, f'no_update_count_{env_id}')
-                            count += 1
-                            setattr(collect_episode_data, f'no_update_count_{env_id}', count)
-                            
-                            if count == 1 or count % 10 == 0:
-                                print(f"环境 {env_id} 暂不更新模型 (前{avg_loss_window_size}次平均损失: {avg_critic_loss:.2f} >= {critic_loss_threshold})")
+                    latest_model_state = model_manager.get_model_state_dict_for_inference()
+                    if latest_model_state:
+                        local_model.load_state_dict(latest_model_state)
+                        # 验证actor网络权重一致性
+                        verify_actor_weight_consistency(local_model, latest_model_state, env_id, config)
                     else:
-                        # 阈值为负，表示不启用损失阈值，始终允许更新
-                        should_update_model = True
-                        # 为避免刷屏，这里不打印每次更新原因
-                    
-                    if should_update_model:
-                        latest_model_state = model_manager.get_model_state_dict_for_inference()
-                        if latest_model_state:
-                            local_model.load_state_dict(latest_model_state)
-                            last_training_count = current_training_count
-                            # 验证actor网络权重一致性
-                            verify_actor_weight_consistency(local_model, latest_model_state, env_id, config)
-                        else:
-                            print(f"环境 {env_id} 警告: 未能获取到模型权重")
+                        print(f"环境 {env_id} 警告: 未能获取到模型权重")
                 
                 # 重置环境
-                latest_scan, distance, cos, sin, collision, goal, last_action, reward = ros_env.reset()
+                latest_scan, distance, cos, sin, collision, goal, last_action, reward, current_v, current_w = ros_env.reset()
                 
                 # 检查reset返回值是否包含NaN/Inf
                 if not _is_valid_env_return(latest_scan, distance, cos, sin, collision, goal, last_action, reward):
@@ -1081,7 +1037,7 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     continue
                 
                 state, terminal = local_model.prepare_state(
-                    latest_scan, distance, cos, sin, collision, goal, last_action
+                    latest_scan, distance, cos, sin, collision, goal, last_action, current_v, current_w
                 )
                 
                 episode_reward = 0
@@ -1091,6 +1047,7 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 episode_discarded_due_to_nan_inf = False  # 标记是否因NaN/Inf而丢弃episode
                 
                 # 折扣后的奖励分项统计（用于 Reward Detail 显示，使用与总回报相同的折扣因子）
+                # 直接读取 ros_python.py 中 get_reward() 记录的“本step分量”，避免用episode累计值做差分
                 discounted_goal_sum = 0.0
                 discounted_collision_sum = 0.0
                 discounted_obs_sum = 0.0
@@ -1098,19 +1055,10 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 discounted_angle_sum = 0.0
                 discounted_linear_sum = 0.0
                 discounted_target_distance_sum = 0.0
+                discounted_step_sum = 0.0
+                discounted_progress_sum = 0.0
                 discounted_linear_acc_osc_sum = 0.0
                 discounted_yawrate_osc_sum = 0.0
-                
-                # 上一 step 的奖励分项累计值（用于计算增量）
-                prev_goal_sum = 0.0
-                prev_collision_sum = 0.0
-                prev_obs_sum = 0.0
-                prev_yawrate_sum = 0.0
-                prev_angle_sum = 0.0
-                prev_linear_sum = 0.0
-                prev_target_distance_sum = 0.0
-                prev_linear_acc_osc_sum = 0.0
-                prev_yawrate_osc_sum = 0.0
                 
                 # 清空并用 s0 填满历史队列（state_history_steps+1 个 s0）
                 state_history.clear()
@@ -1130,8 +1078,26 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     calculated_max_steps = int(distance * config['max_steps_ratio'])
                     max_steps = max(calculated_max_steps, config['max_steps_min'])
                 
-                # 收集一个episode的数据
+                # 收集一个episode的数据；当达到全局停止信号且超过最小门槛时提前结束
+                min_step_threshold = max(1, min(max_steps, int(math.ceil(max_steps * config.get('min_collection_ratio', 0.25)))))
+                forced_stop_flag = False
                 while not terminal and episode_steps < max_steps:
+                    current_phase_in_loop = phase_ref.value
+                    # 训练阶段：如果phase切换到TRAIN_DRAIN或已离开训练阶段
+                    if not is_eval:
+                        if current_phase_in_loop == PHASE_TRAIN_DRAIN or current_phase_in_loop != PHASE_TRAIN_COLLECT:
+                            # 如果满足最小门槛，可以截断（如果是terminal导致的自然结束，也会正常退出循环）
+                            if episode_steps >= min_step_threshold:
+                                forced_stop_flag = True
+                                break
+                            # 如果未满足最小门槛，继续运行直到满足min_threshold或发生terminal
+                            # （terminal时循环会自然退出，此时episode_steps可能 < min_threshold，但后续会判断terminal允许完成）
+                    # 评估阶段：如果phase离开EVAL_COLLECT（例如进入EVAL_DRAIN/PAUSE等），满足最小门槛后尽快截断，
+                    # 且该episode后续不会计入统计（见后面的phase判断）
+                    else:
+                        if current_phase_in_loop != PHASE_EVAL_COLLECT:
+                            forced_stop_flag = True
+                            break
                     # 1. 构造当前输入 x_t（统一从 current_state_with_history 中读取；
                     #    当 state_history_steps 为 0 时，current_state_with_history 仅包含当前 state）
                     model_action = local_model.get_action(current_state_with_history, add_noise=not is_eval)
@@ -1146,7 +1112,7 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     )
                     
                     # 执行动作
-                    latest_scan, distance, cos, sin, collision, goal, last_action, reward = ros_env.step(
+                    latest_scan, distance, cos, sin, collision, goal, last_action, reward, current_v, current_w = ros_env.step(
                         lin_velocity=ros_action[0], ang_velocity=ros_action[1]
                     )
                     
@@ -1168,38 +1134,19 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     episode_reward += gamma_power * reward
                     
                     # 计算各奖励分项的折扣累加值（用于 Reward Detail 显示，使用与总回报相同的 discount_factor）
-                    # 获取当前 step 的累计值
-                    curr_goal_sum = getattr(ros_env, "episode_goal_reward", 0.0)
-                    curr_collision_sum = getattr(ros_env, "episode_collision_penalty", 0.0)
-                    curr_obs_sum = getattr(ros_env, "episode_obs_penalty", 0.0)
-                    curr_yawrate_sum = getattr(ros_env, "episode_yawrate_penalty", 0.0)
-                    curr_angle_sum = getattr(ros_env, "episode_angle_penalty", 0.0)
-                    curr_linear_sum = getattr(ros_env, "episode_linear_penalty", 0.0)
-                    curr_target_distance_sum = getattr(ros_env, "episode_target_distance_penalty", 0.0)
-                    curr_linear_acc_osc_sum = getattr(ros_env, "episode_linear_acceleration_oscillation_penalty", 0.0)
-                    curr_yawrate_osc_sum = getattr(ros_env, "episode_yawrate_oscillation_penalty", 0.0)
-                    
-                    # 计算增量并应用折扣因子
-                    discounted_goal_sum += gamma_power * (curr_goal_sum - prev_goal_sum)
-                    discounted_collision_sum += gamma_power * (curr_collision_sum - prev_collision_sum)
-                    discounted_obs_sum += gamma_power * (curr_obs_sum - prev_obs_sum)
-                    discounted_yawrate_sum += gamma_power * (curr_yawrate_sum - prev_yawrate_sum)
-                    discounted_angle_sum += gamma_power * (curr_angle_sum - prev_angle_sum)
-                    discounted_linear_sum += gamma_power * (curr_linear_sum - prev_linear_sum)
-                    discounted_target_distance_sum += gamma_power * (curr_target_distance_sum - prev_target_distance_sum)
-                    discounted_linear_acc_osc_sum += gamma_power * (curr_linear_acc_osc_sum - prev_linear_acc_osc_sum)
-                    discounted_yawrate_osc_sum += gamma_power * (curr_yawrate_osc_sum - prev_yawrate_osc_sum)
-                    
-                    # 更新上一 step 的累计值
-                    prev_goal_sum = curr_goal_sum
-                    prev_collision_sum = curr_collision_sum
-                    prev_obs_sum = curr_obs_sum
-                    prev_yawrate_sum = curr_yawrate_sum
-                    prev_angle_sum = curr_angle_sum
-                    prev_linear_sum = curr_linear_sum
-                    prev_target_distance_sum = curr_target_distance_sum
-                    prev_linear_acc_osc_sum = curr_linear_acc_osc_sum
-                    prev_yawrate_osc_sum = curr_yawrate_osc_sum
+                    parts = getattr(ros_env, "last_step_reward_parts", None) or {}
+                    parts_scaled = parts.get("scaled", {}) if isinstance(parts, dict) else {}
+                    discounted_goal_sum += gamma_power * float(parts_scaled.get("goal", 0.0) or 0.0)
+                    discounted_collision_sum += gamma_power * float(parts_scaled.get("collision", 0.0) or 0.0)
+                    discounted_obs_sum += gamma_power * float(parts_scaled.get("obs", 0.0) or 0.0)
+                    discounted_yawrate_sum += gamma_power * float(parts_scaled.get("yawrate", 0.0) or 0.0)
+                    discounted_angle_sum += gamma_power * float(parts_scaled.get("angle", 0.0) or 0.0)
+                    discounted_linear_sum += gamma_power * float(parts_scaled.get("linear", 0.0) or 0.0)
+                    discounted_step_sum += gamma_power * float(parts_scaled.get("step_penalty", 0.0) or 0.0)
+                    discounted_progress_sum += gamma_power * float(parts_scaled.get("progress", 0.0) or 0.0)
+                    discounted_target_distance_sum += gamma_power * float(parts_scaled.get("target_distance", 0.0) or 0.0)
+                    discounted_linear_acc_osc_sum += gamma_power * float(parts_scaled.get("linear_acc_osc", 0.0) or 0.0)
+                    discounted_yawrate_osc_sum += gamma_power * float(parts_scaled.get("yawrate_osc", 0.0) or 0.0)
                     
                     gamma_power *= discount_factor  # 更新折扣因子幂次
                     episode_steps += 1
@@ -1207,7 +1154,7 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     
                     # 准备下一个状态（单步 state）
                     next_state, terminal = local_model.prepare_state(
-                        latest_scan, distance, cos, sin, collision, goal, last_action
+                        latest_scan, distance, cos, sin, collision, goal, last_action, current_v, current_w
                     )
                     
                     # 更新历史并构造下一时刻输入 x_{t+1}
@@ -1220,10 +1167,19 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     experiences.append((current_state_with_history, model_action, reward, terminal, next_state_with_history))
                     # 下一个循环直接使用 x_{t+1}
                     current_state_with_history = next_state_with_history
-                
-                # 如果episode因NaN/Inf被丢弃，跳过后续所有处理，不占用episode编号
+                    
+                    # 若phase切换到DRAIN或已离开训练阶段且已超过最小门槛，则提前结束episode
+                    # （这个检查已经在循环开头做了，这里保留作为冗余检查）
+                                # 如果episode因NaN/Inf被丢弃，跳过后续所有处理，不占用episode编号
+
                 if episode_discarded_due_to_nan_inf:
                     continue
+
+                # 强制停止：达到全局停止信号并手动截断
+                if forced_stop_flag and len(experiences) > 0:
+                    # 末条transition置为非终止，避免错误的bootstrap截断
+                    last_exp = experiences[-1]
+                    experiences[-1] = (last_exp[0], last_exp[1], last_exp[2], False, last_exp[4])
                 
                 # 修复风险A：如果是因为timeout退出（步数达到上限且未发生goal/collision），将最后一个transition的done改为False
                 # 注意：
@@ -1236,7 +1192,10 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     experiences[-1] = (last_exp[0], last_exp[1], last_exp[2], False, last_exp[4])
                 
                 # 判断episode结束原因
-                if goal:
+                if forced_stop_flag:
+                    episode_ending = "ForceStop"
+                    timeout = False
+                elif goal:
                     episode_ending = "Goal"
                     timeout = False
                 elif collision:
@@ -1251,6 +1210,30 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 
                 if should_filter:
                     continue
+
+                # 若episode在阶段切换边界被截断完成（或切换后才结束），则直接丢弃：
+                # - 训练阶段：
+                #   * 如果phase是TRAIN_DRAIN且满足完成条件（step>=min_threshold 或 terminal），则允许完成
+                #   * 其他非TRAIN_COLLECT的phase，丢弃
+                # - 评估阶段：避免把"超出目标数量"的episode计入评估统计
+                current_phase_after_episode = phase_ref.value
+                if not is_eval:
+                    # 训练阶段：TRAIN_DRAIN阶段需要特殊处理
+                    if current_phase_after_episode == PHASE_TRAIN_DRAIN:
+                        # 如果满足完成条件（step>=min_threshold 或 terminal），允许完成
+                        if episode_steps >= min_step_threshold or terminal:
+                            # 允许继续，不丢弃
+                            pass
+                        else:
+                            # step < min_threshold 且没有terminal，丢弃
+                            continue
+                    elif current_phase_after_episode != PHASE_TRAIN_COLLECT:
+                        # 其他非TRAIN_COLLECT的phase，丢弃
+                        continue
+                else:
+                    # 评估阶段：只有EVAL_COLLECT阶段的episode才计入统计
+                    if current_phase_after_episode != PHASE_EVAL_COLLECT:
+                        continue
                 
                 # 训练阶段才写入经验队列；评估阶段仅统计
                 if not is_eval:
@@ -1273,35 +1256,60 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     
                     # 所有样本均为有效数值，直接写入经验队列
                     try:
-                        experience_queue.put(experiences)
+                        experience_queue.put({"outcome": episode_ending, "experiences": experiences})
                     except Exception as e:
                         print(f"环境 {env_id} 推送经验到队列失败: {e}")
                 
-                # 使用ros_python.py中已计算的初始终点距离
+                # 以 ros_env.initial_target_distance 为准（reset 后首步 step 的 distance）
                 target_distance = getattr(ros_env, "initial_target_distance", None)
                 if target_distance is None:
-                    # 如果initial_target_distance未设置，回退到计算方式
                     if ros_env.episode_start_position is not None and ros_env.target is not None:
                         target_distance = np.linalg.norm([
                             ros_env.target[0] - ros_env.episode_start_position[0],
                             ros_env.target[1] - ros_env.episode_start_position[1]
                         ])
                     else:
-                        target_distance = ros_env.target_dist  # 如果无法计算，使用配置的目标距离
+                        target_distance = ros_env.target_dist
                 
-                # 更新全局统计并获取episode编号（只有通过过滤的episode才会到这里）
-                # 传递期望的目标距离（ros_env.target_dist），而非实际生成的目标距离
-                global_episode_number = global_stats.add_episode_result(goal, collision, timeout, episode_reward, target_dist=ros_env.target_dist)
+                # episode编号：
+                # - 评估阶段：使用 global_stats 作为“评估窗口”的统计与编号来源（会在每次评估开始时 reset）
+                # - 训练阶段：不再写入 global_stats，避免被评估 reset 影响；训练episode编号改为独立全局计数器 total_episodes_counter
+                if is_eval:
+                    # 评估阶段：计入评估统计并返回评估窗口内的episode编号
+                    global_episode_number = global_stats.add_episode_result(
+                        goal, collision, timeout, episode_reward, target_dist=ros_env.target_dist
+                    )
+                else:
+                    # 训练阶段：全局训练episode计数（严格递增，不受评估reset影响）
+                    with total_episodes_counter.get_lock():
+                        total_episodes_counter.value += 1
+                        global_episode_number = int(total_episodes_counter.value)
+
+                # 写入本环境“最近一次 episode 的 target_dist”，供主进程判断是否“所有采集进程都已达到 max_target_dist”
+                if env_target_dist_list is not None:
+                    try:
+                        env_target_dist_list[env_id] = float(ros_env.target_dist)
+                    except Exception:
+                        pass
                 
-                # 更新全局样本/episode 计数（用于日志）
+                # 更新全局样本计数（用于日志）
                 if not is_eval and experiences:
                     with total_added_step.get_lock():
                         total_added_step.value += len(experiences)
-                    with total_episodes_counter.get_lock():
-                        total_episodes_counter.value += 1
                 if is_eval:
                     with eval_collected_lock:
                         eval_collected_ref.value += 1
+                        current_eval_count = eval_collected_ref.value
+                    if is_debug and env_id == 0:  # 只在环境0打印，避免刷屏
+                        print(f"[DEBUG] [环境 {env_id}] 评估episode完成，eval_collected={current_eval_count}/{eval_target_ref.value}")
+                
+                # 标记当前轮次的收集完成（或被截断）
+                # 训练线程会根据round_done_counter的值来设置phase_ref为TRAIN_DRAIN
+                if not is_eval:
+                    with round_done_counter.get_lock():
+                        round_done_counter.value += 1
+                    # 记录本环境在该轮已提交过一个有效训练episode，防止同轮再次提交
+                    last_committed_round = local_round
                 
                 # 获取当前时间
                 current_time = datetime.now()
@@ -1314,6 +1322,8 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 yaw_sum = discounted_yawrate_sum
                 angle_sum = discounted_angle_sum
                 linear_sum = discounted_linear_sum
+                step_penalty_sum = discounted_step_sum
+                progress_sum = discounted_progress_sum
                 target_distance_sum = discounted_target_distance_sum
                 linear_acc_osc_sum = discounted_linear_acc_osc_sum
                 yawrate_osc_sum = discounted_yawrate_osc_sum
@@ -1323,14 +1333,37 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 enable_yawrate = getattr(ros_env, "enable_yawrate_penalty", False)
                 enable_angle = getattr(ros_env, "enable_angle_penalty", False)
                 enable_linear = getattr(ros_env, "enable_linear_penalty", False)
+                enable_step = getattr(ros_env, "enable_step_penalty", False)
                 enable_target_distance = getattr(ros_env, "enable_target_distance_penalty", False)
                 enable_linear_acc_osc = getattr(ros_env, "enable_linear_acceleration_oscillation_penalty", False)
                 enable_yawrate_osc = getattr(ros_env, "enable_yawrate_oscillation_penalty", False)
+                enable_progress = getattr(ros_env, "enable_progress_reward", False)
 
                 detail_parts = [
                     f"goal={goal_sum:.6f}",
                     f"collision={collision_sum:.6f}",
                 ]
+                # step：将所有“非终止型”的开启分项汇总为 step_total，便于快速对齐 total_reward
+                step_total = 0.0
+                if enable_obs:
+                    step_total += obs_sum
+                if enable_yawrate:
+                    step_total += yaw_sum
+                if enable_angle:
+                    step_total += angle_sum
+                if enable_linear:
+                    step_total += linear_sum
+                if enable_step:
+                    step_total += step_penalty_sum
+                if enable_target_distance:
+                    step_total += target_distance_sum
+                if enable_linear_acc_osc:
+                    step_total += linear_acc_osc_sum
+                if enable_yawrate_osc:
+                    step_total += yawrate_osc_sum
+                if enable_progress:
+                    step_total += progress_sum
+                detail_parts.append(f"step={step_total:.6f}")
                 # 所有开启的奖惩项都要打印（即使值为0也要显示）
                 if enable_obs:
                     detail_parts.append(f"obs={obs_sum:.6f}")
@@ -1340,19 +1373,23 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     detail_parts.append(f"angle={angle_sum:.6f}")
                 if enable_linear:
                     detail_parts.append(f"linear={linear_sum:.6f}")
+                if enable_step:
+                    detail_parts.append(f"step_penalty={step_penalty_sum:.6f}")
                 if enable_target_distance:
                     detail_parts.append(f"target_distance={target_distance_sum:.6f}")
                 if enable_linear_acc_osc:
                     detail_parts.append(f"linear_acc_osc={linear_acc_osc_sum:.6f}")
                 if enable_yawrate_osc:
                     detail_parts.append(f"yawrate_osc={yawrate_osc_sum:.6f}")
+                if enable_progress:
+                    detail_parts.append(f"progress={progress_sum:.6f}")
 
                 # 将结束状态放在最前面，然后是总reward，最后是其他奖励分项
                 detail_parts_with_total = [f"end={episode_ending}", f"total_reward={episode_reward:.6f}"] + detail_parts
                 detail_str = ", ".join(detail_parts_with_total)
 
                 # 输出详细的episode信息（含奖励明细），时间戳放在最前面，便于与训练日志对齐
-                # target_dist 是配置的目标距离上限，target_distance 是实际生成的终点距离
+                # target_dist 是配置的目标距离上限，target_distance 为 ros_env.initial_target_distance（首步 step 的 distance）
                 # 这里的 Queue(episodes) 表示当前经验队列中累计的 episode 数量（近似反映待训练数据量），
                 # 而本地训练缓冲区的样本数量由训练线程在训练日志中单独打印。
                 queue_size_episodes = 0
@@ -1362,264 +1399,397 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 except Exception:
                     queue_size_episodes = -1  # 获取失败时输出 -1 以示区分
                 
+                mode_str = "EVAL" if is_eval else "TRAIN"
                 episode_info = (
                     f"{current_time.strftime('%Y-%m-%d %H:%M:%S')} 环境 {env_id} "
-                    f"Episode: {global_episode_number} "
-                    f"Target Distance: {ros_env.target_dist:.2f} (actual: {target_distance:.2f}) Steps: {episode_steps} "
-                    f"Queue(episodes): {queue_size_episodes}\n"
+                    f"Mode: {mode_str} Round: {local_round} Episode: {global_episode_number} "
+                    f"Target Distance: {ros_env.target_dist:.2f} (actual: {target_distance:.2f}) Steps: {episode_steps}\n"
                     f"  Reward Detail: {detail_str}"
                 )
                 print(episode_info)
                 
-                # 训练阶段按照 report_every 输出；评估阶段统一由主线程在结束后输出
-                # 数据收集进程只负责通知主进程，所有统计、打印、评比都由主进程完成
-                if (not is_eval) and global_episode_number % config.get('report_every', 20) == 0:
-                    # 设置标记，通知主进程进行统计报告打印、资格检查、最好模型评比
-                    check_best_model_ref.value = global_episode_number
-                
             except Exception as e:
                 print(f"环境 {env_id} Episode {global_episode_number} 出错: {e}")
-                time.sleep(1)
+                time.sleep(0.1)
     except Exception as e:
         print(f"环境 {env_id} 初始化失败: {e}")
 
 
-def training_thread(model_manager, env_queues, config, total_added_step, total_episodes_counter, current_buffer_size_ref):
-    """持续循环训练线程 - 真正的并行版本"""
+def training_thread(model_manager, env_queues, config, total_added_step, total_episodes_counter, current_buffer_size_ref, round_done_counter, current_round_ref, phase_ref, eval_target_ref, eval_collected_lock, eval_collected_ref, global_stats, env_target_dist_list, max_steps_for_pause, check_best_model_fn):
+    """按轮次训练：每轮收集完一定比例的episode后统一训练
+    
+    周期性评估触发位置：每轮训练完成后、开启下一轮收集之前。
+    """
     try:
-        print("训练线程启动，持续循环从缓存区中抽样训练")
+        print("训练线程启动，按轮次等待数据再启动训练")
         
+        is_debug = config.get('is_debug', False)
         training_count = 0
         total_samples_drawn = 0  # 总抽样样本数统计
-        # 本地维护actor损失列表，用于计算窗口平均
         recent_actor_losses = []  # 存储最近N次训练的actor损失
-        loss_window_size = config.get('loss_window_size', 10)  # 获取窗口大小配置
+        threshold_envs = max(1, math.ceil(config.get('collection_wait_ratio', 0.8) * config.get('num_envs', 1)))
+        num_envs = config.get('num_envs', 1)
+        # 周期性评估配置
+        eval_every_rounds = int(config.get('eval_every_rounds', 0) or 0)
+        eval_episodes_per_round = int(config.get('eval_episodes_per_round', 0) or 0)
+        eval_start_after_all_max = bool(config.get('eval_start_after_all_target_dist_max', False))
+        periodic_eval_enabled = eval_every_rounds > 0 and eval_episodes_per_round > 0
+        last_eval_training_count = 0
+        max_reached_logged = False
         
-        # 本地缓冲区，用于避免跨进程随机采样的开销
-        # 容量与全局buffer_size一致；精度由配置控制（float32 / float64）
-        use_float64 = config.get('use_float64_for_buffer', False)
-        buffer_dtype = np.float64 if use_float64 else np.float32
-        local_buffer = LocalReplayBuffer(
-            config.get('buffer_size', 50000), 
-            dtype=buffer_dtype,
+        if is_debug:
+            print(f"[DEBUG] 训练线程初始化: threshold_envs={threshold_envs}, num_envs={num_envs}")
+        
+        # 本地缓冲区（固定使用 float32 以降低内存占用并提升速度）
+        if config.get('enable_stratified_replay', False):
+            local_buffer = NumpyStratifiedReplayBuffer(
+                buffer_size=config.get('buffer_size', 50000),
+            dtype=np.float32,
             recent_buffer_ratio=config.get('recent_buffer_ratio', 0.1),
-            recent_batch_ratio=config.get('recent_batch_ratio', 0.3)
+                recent_batch_ratio=config.get('recent_batch_ratio', 0.3),
+                stratified_sampling=config.get('stratified_replay', {}),
+            )
+        else:
+            local_buffer = NumpyReplayBuffer(
+                buffer_size=config.get('buffer_size', 50000),
+                dtype=np.float32,
+                recent_buffer_ratio=config.get('recent_buffer_ratio', 0.1),
+                recent_batch_ratio=config.get('recent_batch_ratio', 0.3),
         )
+        
+        # 初始轮次
+        current_round_ref.value = 0
+        phase_ref.value = PHASE_TRAIN_COLLECT
+        
+        if is_debug:
+            print(f"[DEBUG] 初始轮次: current_round={current_round_ref.value}, phase_ref已设置为TRAIN_COLLECT")
         
         while True:
             try:
-                # 检查是否达到最大训练次数
-                if training_count >= config['max_training_count']:
-                    print(f"达到最大训练次数 {config['max_training_count']}，训练完成！")
+                max_rounds_cfg = config.get('max_rounds', config.get('max_training_count', 0))
+                if max_rounds_cfg and max_rounds_cfg > 0 and training_count >= max_rounds_cfg:
+                    print(f"达到最大轮次数 {max_rounds_cfg}，训练完成！")
                     break
                 
-                # 从各个环境的队列中拉取当前所有可用数据到本地缓冲区，避免使用 Manager().list
+                # 准备新一轮收集
+                with round_done_counter.get_lock():
+                    round_done_counter.value = 0
+                phase_ref.value = PHASE_TRAIN_COLLECT
+                round_index = current_round_ref.value
+                round_steps = 0
+                
+                if is_debug:
+                    print(f"[DEBUG] 开始新一轮收集: round_index={round_index}, round_done_counter已重置为0, phase_ref已设置为TRAIN_COLLECT")
+                
+                # 等待达到阈值并让所有进程提交本轮数据
+                wait_iteration = 0
+                last_debug_time = time.time()
+                while True:
+                    pulled_any = False
+                    queue_sizes = []
+                    for q_idx, q in enumerate(env_queues):
+                        queue_size = 0
+                        while True:
+                            try:
+                                experiences = q.get_nowait()
+                            except queue.Empty:
+                                break
+                            if experiences:
+                                if config.get('enable_stratified_replay', False):
+                                    if isinstance(experiences, dict):
+                                        experiences_outcome = experiences.get("outcome", "Timeout")
+                                        experiences_list = experiences.get("experiences", [])
+                                    else:
+                                        experiences_outcome = "Timeout"
+                                        experiences_list = experiences
+                                    local_buffer.add_episode(experiences_list, outcome=experiences_outcome)
+                                else:
+                                    if isinstance(experiences, dict):
+                                        experiences = experiences.get("experiences", [])
+                                    local_buffer.add_batch(experiences)
+                                round_steps += len(experiences_list if isinstance(experiences, dict) else experiences)
+                                pulled_any = True
+                                queue_size += 1
+                        queue_sizes.append(queue_size)
+                    
+                    current_done = round_done_counter.value
+                    if current_done >= threshold_envs:
+                        if phase_ref.value == PHASE_TRAIN_COLLECT:
+                            phase_ref.value = PHASE_TRAIN_DRAIN
+                            if is_debug:
+                                print(f"[DEBUG] 达到阈值({threshold_envs}), 设置phase_ref为TRAIN_DRAIN, round_done_counter={current_done}")
+                    if current_done >= num_envs:
+                        if is_debug:
+                            print(f"[DEBUG] 所有进程完成({current_done}/{num_envs}), 退出等待循环, round_steps={round_steps}")
+                        break
+                    
+                    # 每0.5秒打印一次调试信息
+                    if is_debug:
+                        current_time = time.time()
+                        if current_time - last_debug_time >= 0.5:
+                            phase_str = ["TRAIN_COLLECT", "TRAIN_DRAIN", "EVAL_COLLECT", "PAUSE", "STOP"][phase_ref.value]
+                            print(f"[DEBUG] 等待中: round_done_counter={current_done}/{num_envs} (阈值={threshold_envs}), "
+                                  f"round_steps={round_steps}, 队列大小={queue_sizes}, "
+                                  f"phase_ref={phase_str}")
+                            last_debug_time = current_time
+                    
+                    wait_iteration += 1
+                    time.sleep(0.1)
+                    
                 pull_start_time = time.time()
-                pulled_any = False
-                for q in env_queues:
+                # 确保队列清空
+                final_queue_sizes = []
+                for q_idx, q in enumerate(env_queues):
+                    queue_size = 0
                     while True:
                         try:
                             experiences = q.get_nowait()
                         except queue.Empty:
                             break
                         if experiences:
-                            local_buffer.add_batch(experiences)
-                            pulled_any = True
-                pull_time = time.time() - pull_start_time if pulled_any else 0.0
+                            if config.get('enable_stratified_replay', False):
+                                if isinstance(experiences, dict):
+                                    experiences_outcome = experiences.get("outcome", "Timeout")
+                                    experiences_list = experiences.get("experiences", [])
+                                else:
+                                    experiences_outcome = "Timeout"
+                                    experiences_list = experiences
+                                local_buffer.add_episode(experiences_list, outcome=experiences_outcome)
+                                round_steps += len(experiences_list)
+                            else:
+                                if isinstance(experiences, dict):
+                                    experiences = experiences.get("experiences", [])
+                                local_buffer.add_batch(experiences)
+                            round_steps += len(experiences)
+                            queue_size += 1
+                    final_queue_sizes.append(queue_size)
+                pull_time = time.time() - pull_start_time if round_steps > 0 else 0.0
                 
-                # 检查本地缓冲区是否有足够数据进行训练
+                if is_debug:
+                    print(f"[DEBUG] 队列清空完成: 最终round_steps={round_steps}, 清空时各队列大小={final_queue_sizes}, 耗时={pull_time:.3f}秒")
+                
+                # 关闭本轮采集，准备训练（设置为PAUSE，防止新episode开始）
+                phase_ref.value = PHASE_PAUSE
+                
+                if is_debug:
+                    print(f"[DEBUG] 关闭本轮采集: phase_ref已设置为PAUSE, 准备训练")
+                
+                # 计算缓冲区大小（总）以及子缓冲区大小（若启用分层采样）
                 buffer_size = local_buffer.size()
-                batch_size = config['batch_size']
-                min_batches_for_training = config.get('min_batches_for_training', 0)  # 从配置文件读取，默认值为0（只要有数据就训练）
-                
-                # 如果 min_batches_for_training 为 0，则只要有数据就训练；否则需要至少 min_batches_for_training * batch_size 个样本
-                if min_batches_for_training == 0:
-                    can_train = buffer_size > 0
-                    min_buffer_size_for_training = 1  # 用于日志显示
-                else:
-                    min_buffer_size_for_training = min_batches_for_training * batch_size
-                    can_train = buffer_size >= min_buffer_size_for_training
-                
-                if can_train:
-                    
-                    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    print(
-                        f"{current_time} 第{training_count+1}次训练开始："
-                        f"当前总episode数: {total_episodes_counter.value}，"
-                        f"当前总step数: {total_added_step.value}，"
-                        f"当前缓冲区大小: {buffer_size}"
-                    )
-                    
-                    # 直接使用主进程的模型进行训练
-                    # sample_batch方法内部会获取lock，训练完成后自动释放
-                    training_iterations = config.get('training_iterations', 200)
-                    samples_this_training = training_iterations * batch_size  # 本次训练抽样的样本数
-                    
-                    start_time = time.time()
-                    avg_critic_loss, critic_losses, avg_actor_loss, actor_losses, avg_critic_grad, avg_actor_grad, avg_entropy, avg_alpha_grad = model_manager.model.train(
-                        replay_buffer=local_buffer,
-                        iterations=training_iterations,
-                        batch_size=batch_size
-                    )
-                    end_time = time.time()
-                    
-                    # 采样与训练耗时拆分统计
-                    sample_time = getattr(model_manager.model, "last_sample_time", None)  # 从本地buffer随机采样的耗时
-                    update_time = getattr(model_manager.model, "last_update_time", None)
-                    compute_time = None
-                    if sample_time is not None and update_time is not None:
-                        compute_time = max(update_time - sample_time, 0.0)
-                    
-                    # 更新总抽样样本数（使用实际成功抽样的样本数）
-                    total_samples_drawn += samples_this_training
-                    
-                    # 计算平均训练次数
-                    total_experiences_added = total_added_step.value
-                    avg_training_times = total_samples_drawn / max(total_experiences_added, 1)
-                    
-                    training_count += 1
-                    end_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-                    # 为了便于阅读，将训练耗时与统计信息分行打印，并细化耗时统计
-                    total_train_time = end_time - start_time
-
-                    # 行1：训练完成基本信息（附带当前本地缓冲区大小，便于和采样耗时一起分析）
-                    print(f"{end_time_str} 第{training_count}次训练完成 | 当前缓冲区大小: {buffer_size}")
-
-                    # 行2：抽样与样本统计
-                    print(
-                        f"  总抽样数: {total_samples_drawn} | 总样本数: {total_experiences_added} "
-                        f"| 样本平均抽样次数: {avg_training_times:.2f}"
-                    )
-                    
-                    # 先将当前损失添加到列表中（这样计算窗口平均时会包括当前这次）
-                    model_manager.add_critic_loss(avg_critic_loss)
-                    
-                    # 行3：Critic损失（本次训练的平均 + 窗口平均 + 全局参数梯度L2范数）
-                    window_avg_critic_loss = model_manager.get_average_critic_loss(loss_window_size)
-                    if window_avg_critic_loss != float('inf'):
-                        if avg_critic_grad is not None:
-                            if isinstance(avg_critic_grad, dict):
-                                grad_info = f" | critic全局参数梯度L2范数(裁剪前:{avg_critic_grad['before']:.6f}, 裁剪后:{avg_critic_grad['after']:.6f})"
-                            else:
-                                # 向后兼容
-                                grad_info = f" | critic全局参数梯度L2范数: {avg_critic_grad:.6f}"
-                        else:
-                            grad_info = ""
-                        print(f"  本次训练的平均critic网络损失: {avg_critic_loss:.6f}{grad_info}")
-                    else:
-                        if avg_critic_grad is not None:
-                            if isinstance(avg_critic_grad, dict):
-                                grad_info = f" | critic全局参数梯度L2范数(裁剪前:{avg_critic_grad['before']:.6f}, 裁剪后:{avg_critic_grad['after']:.6f})"
-                            else:
-                                grad_info = f" | critic全局参数梯度L2范数: {avg_critic_grad:.6f}"
-                        else:
-                            grad_info = ""
-                        print(f"  本次训练的平均critic网络损失: {avg_critic_loss:.6f}{grad_info}")
-                    
-                    # 行4：Actor损失（本次训练的平均 + 窗口平均）
-                    if avg_actor_loss is not None:
-                        # 更新actor损失列表
-                        recent_actor_losses.append(avg_actor_loss)
-                        # 保持列表大小不超过100（避免内存无限增长）
-                        if len(recent_actor_losses) > 100:
-                            recent_actor_losses.pop(0)
-                        
-                        # 计算actor损失的窗口平均（此时已包括当前这次）
-                        if len(recent_actor_losses) > 0:
-                            if len(recent_actor_losses) >= loss_window_size:
-                                window_avg_actor_loss = sum(recent_actor_losses[-loss_window_size:]) / loss_window_size
-                            else:
-                                window_avg_actor_loss = sum(recent_actor_losses) / len(recent_actor_losses)
-                            if avg_actor_grad is not None:
-                                if isinstance(avg_actor_grad, dict):
-                                    grad_info = f" | actor全局参数梯度L2范数(裁剪前:{avg_actor_grad['before']:.6f}, 裁剪后:{avg_actor_grad['after']:.6f})"
-                                else:
-                                    # 向后兼容
-                                    grad_info = f" | actor全局参数梯度L2范数: {avg_actor_grad:.6f}"
-                            else:
-                                grad_info = ""
-                            print(f"  本次训练的平均actor网络损失: {avg_actor_loss:.6f}{grad_info}")
-                        else:
-                            if avg_actor_grad is not None:
-                                if isinstance(avg_actor_grad, dict):
-                                    grad_info = f" | actor全局参数梯度L2范数(裁剪前:{avg_actor_grad['before']:.6f}, 裁剪后:{avg_actor_grad['after']:.6f})"
-                                else:
-                                    grad_info = f" | actor全局参数梯度L2范数: {avg_actor_grad:.6f}"
-                            else:
-                                grad_info = ""
-                            print(f"  本次训练的平均actor网络损失: {avg_actor_loss:.6f}{grad_info}")
-                    
-                    # 行5：熵值和alpha梯度范数统计
-                    entropy_info = ""
-                    if avg_entropy is not None:
-                        entropy_info = f" | 熵值: {avg_entropy:.6f}"
-                    if avg_alpha_grad is not None:
-                        entropy_info += f" | alpha梯度L2范数: {avg_alpha_grad:.6f}"
-                    if entropy_info:
-                        print(f"  熵值统计:{entropy_info}")
-
-                    # 行6：本次训练整体耗时（使用"采样耗时总计 + 前向/反向耗时"的和，而不是墙钟时间）
-                    # 注意：total_sample_time 和 compute_time 仅在 sample_time / update_time 可用时才有意义
-                    if sample_time is not None and update_time is not None:
-                        total_sample_time = pull_time + sample_time
-                        total_train_log_time = total_sample_time + compute_time if compute_time is not None else total_sample_time
-                        print(f"  训练耗时: {total_train_log_time:.2f}秒")
-                        
-                        # 行7+: 采样与前向/反向耗时的细分
-                        print(
-                            f"  采样耗时总计: {total_sample_time:.2f}秒 "
-                            f"(拉取到本地buffer: {pull_time:.2f}秒, 从本地buffer随机采样: {sample_time:.2f}秒)"
+                stratified_enabled = config.get('enable_stratified_replay', False)
+                if stratified_enabled:
+                    goal_buf_size = local_buffer.goal_buffer.size()
+                    coll_buf_size = local_buffer.collision_buffer.size()
+                    timeout_buf_size = local_buffer.timeout_buffer.size()
+                    # 判断是否满足阈值以真正启用分层采样
+                    min_steps_to_enable = int(config.get('stratified_replay', {}).get('min_steps_to_enable', 0))
+                    stratified_active = not (
+                        min_steps_to_enable > 0 and (
+                            goal_buf_size < min_steps_to_enable
+                            or coll_buf_size < min_steps_to_enable
+                            or timeout_buf_size < min_steps_to_enable
                         )
-                        # compute_time 是模型参数更新（前向+反向+优化）的总时间
-                        print(f"  前向/反向(网络更新)耗时: {compute_time:.2f}秒")
-                    else:
-                        # 回退：若无法细分采样/更新耗时，则退回到总墙钟时间
-                        print(f"  训练耗时: {total_train_time:.2f}秒")
-                    
-                    # 增加共享训练次数计数器
-                    if hasattr(model_manager, 'training_count_ref') and model_manager.training_count_ref is not None:
-                        model_manager.training_count_ref.value = training_count
-                    
-                    # 更新critic损失到共享变量（已在上面添加到列表，这里只更新当前值）
-                    model_manager.update_critic_loss(avg_critic_loss)
-                    
-                    # 更新当前本地缓冲区大小（供采集进程打印日志使用）
-                    current_buffer_size_ref.value = buffer_size
-                    
-                    # 训练完成后同步模型权重到共享字典
-                    model_manager.update_dict_from_model()
-                    # print(f"训练完成后更新模型到临时文件: {model_manager.model_file_path}")
-                    
-                    # 定期保存模型（基于训练次数）
-                    if training_count % config.get('save_every', 50) == 0:
-                        # 确保保存目录存在
-                        save_dir = Path(config['model_save_dir'])
-                        save_dir.mkdir(parents=True, exist_ok=True)
-                        model_manager.model.save(filename="SAC", directory=save_dir)
+                    )
                 else:
-                    # 缓冲区数据不足，短暂等待
-                    # 只在第一次或每100次检查时打印一次，避免日志过多
-                    if not hasattr(training_thread, '_wait_count'):
-                        training_thread._wait_count = 0
-                    training_thread._wait_count += 1
-                    if training_thread._wait_count == 1 or training_thread._wait_count % 100 == 0:
-                        if min_batches_for_training == 0:
-                            print(f"训练线程等待数据收集：当前缓冲区大小={buffer_size}，需要至少1个样本")
-                        else:
-                            print(f"训练线程等待数据收集：当前缓冲区大小={buffer_size}，需要至少{min_buffer_size_for_training}（{min_batches_for_training}个batch）")
-                    time.sleep(0.1)
+                    goal_buf_size = coll_buf_size = timeout_buf_size = None
+                    stratified_active = False
+                batch_size = config['batch_size']
                 
-                # 短暂休息，避免过度占用CPU
-                time.sleep(0.01)
+                if round_steps == 0 or buffer_size == 0:
+                    if is_debug:
+                        print(f"[DEBUG] 本轮未收集到有效step: round_steps={round_steps}, buffer_size={buffer_size}, 跳过训练")
+                    print("本轮未收集到有效step，跳过训练，等待下一轮。")
+                    current_round_ref.value = round_index + 1
+                    phase_ref.value = PHASE_TRAIN_COLLECT
+                    if is_debug:
+                        print(f"[DEBUG] 重新开启收集: phase_ref已设置为TRAIN_COLLECT, current_round={current_round_ref.value}")
+                    time.sleep(0.1)
+                    continue
+                
+                training_iterations = max(1, int(round_steps * config.get('train_n_per_step', 1.0)))
+                current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                
+                
+                if is_debug:
+                    print(f"[DEBUG] 开始训练: training_count={training_count+1}, round_steps={round_steps}, "
+                          f"training_iterations={training_iterations}, buffer_size={buffer_size}")
+                
+                message = (
+                    f"{current_time} 第{training_count+1}次训练开始："
+                    f"本轮step数: {round_steps}，训练迭代数: {training_iterations}，"
+                    f"当前总episode数: {total_episodes_counter.value}，"
+                    f"当前总step数: {total_added_step.value}，"
+                )
+                print(message)
+                
+                # 训练
+                start_time = time.time()
+                avg_critic_loss, critic_losses, avg_actor_loss, actor_losses, avg_critic_grad, avg_actor_grad, avg_entropy, avg_alpha_grad = model_manager.model.train(
+                    replay_buffer=local_buffer,
+                    iterations=training_iterations,
+                    batch_size=batch_size,
+                    stats=global_stats.get_statistics(use_window=True),
+                )
+                end_time = time.time()
+                
+                sample_time = getattr(model_manager.model, "last_sample_time", None)
+                update_time = getattr(model_manager.model, "last_update_time", None)
+                compute_time = None
+                if sample_time is not None and update_time is not None:
+                    compute_time = max(update_time - sample_time, 0.0)
+                
+                samples_this_training = training_iterations * batch_size
+                total_samples_drawn += samples_this_training
+                total_experiences_added = total_added_step.value
+                avg_training_times = total_samples_drawn / max(total_experiences_added, 1)
+                
+                training_count += 1
+                end_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                total_train_time = end_time - start_time
+                
+                buffer_info = (
+                    f"当前缓冲区大小: {buffer_size}" if not stratified_enabled else
+                    f"当前缓冲区大小: {buffer_size} (Goal: {goal_buf_size}, Collision: {coll_buf_size}, Timeout: {timeout_buf_size})"
+                )
+                print(
+                    f"{end_time_str} 第{training_count}次训练完成 | {buffer_info} | "
+                    f"分层采样启用: {stratified_enabled}, 实际生效: {stratified_active}"
+                )
+                # 训练完成后再输出分层采样信息
+                print(
+                    f"  本轮step: {round_steps} | 总抽样数: {total_samples_drawn} | 总样本数: {total_experiences_added} "
+                    f"| 样本平均抽样次数: {avg_training_times:.2f}"
+                )
+                
+                model_manager.add_critic_loss(avg_critic_loss)
+                window_avg_critic_loss = model_manager.get_average_critic_loss(config.get('avg_loss_window_size', 10))
+                if avg_critic_grad is not None:
+                    if isinstance(avg_critic_grad, dict):
+                        grad_info = f" | critic全局参数梯度L2范数(裁剪前:{avg_critic_grad['before']:.6f}, 裁剪后:{avg_critic_grad['after']:.6f})"
+                    else:
+                        grad_info = f" | critic全局参数梯度L2范数: {avg_critic_grad:.6f}"
+                else:
+                    grad_info = ""
+                print(f"  本次训练的平均critic网络损失: {avg_critic_loss:.6f}{grad_info}")
+                
+                if avg_actor_loss is not None:
+                    recent_actor_losses.append(avg_actor_loss)
+                    if len(recent_actor_losses) > 100:
+                        recent_actor_losses.pop(0)
+                    if avg_actor_grad is not None:
+                        if isinstance(avg_actor_grad, dict):
+                            actor_grad_info = f" | actor全局参数梯度L2范数(裁剪前:{avg_actor_grad['before']:.6f}, 裁剪后:{avg_actor_grad['after']:.6f})"
+                        else:
+                            actor_grad_info = f" | actor全局参数梯度L2范数: {avg_actor_grad:.6f}"
+                    else:
+                        actor_grad_info = ""
+                    print(f"  本次训练的平均actor网络损失: {avg_actor_loss:.6f}{actor_grad_info}")
+                
+                entropy_info = ""
+                if avg_entropy is not None:
+                    entropy_info = f" | 熵值: {avg_entropy:.6f}"
+                if avg_alpha_grad is not None:
+                    entropy_info += f" | alpha梯度L2范数: {avg_alpha_grad:.6f}"
+                if entropy_info:
+                    print(f"  熵值统计:{entropy_info}")
+                
+                if sample_time is not None and update_time is not None:
+                    total_sample_time = pull_time + sample_time
+                    total_train_log_time = total_sample_time + compute_time if compute_time is not None else total_sample_time
+                    print(f"  训练耗时: {total_train_log_time:.2f}秒")
+                    print(
+                        f"  采样耗时总计: {total_sample_time:.2f}秒 "
+                        f"(拉取到本地buffer: {pull_time:.2f}秒, 从本地buffer随机采样: {sample_time:.2f}秒)"
+                    )
+                    print(f"  前向/反向(网络更新)耗时: {compute_time:.2f}秒")
+                else:
+                    print(f"  训练耗时: {total_train_time:.2f}秒")
+                
+                if hasattr(model_manager, 'training_count_ref') and model_manager.training_count_ref is not None:
+                    model_manager.training_count_ref.value = training_count
+                model_manager.update_critic_loss(avg_critic_loss)
+                current_buffer_size_ref.value = buffer_size
+                
+                model_manager.update_dict_from_model()
+                
+                if training_count % config.get('save_every', 50) == 0:
+                    save_dir = Path(config['model_save_dir'])
+                    save_dir.mkdir(parents=True, exist_ok=True)
+                    model_manager.model.save(filename=f"SAC_train_{training_count}", directory=save_dir)
+                
+                
+                if is_debug:
+                    phase_str = ["TRAIN_COLLECT", "TRAIN_DRAIN", "EVAL_COLLECT", "PAUSE", "STOP"][phase_ref.value]
+                    print(f"[DEBUG] 训练完成，准备下一轮: current_round={current_round_ref.value}, phase_ref={phase_str}")
+                
+                # ==================== 周期性评估（训练线程尾部，开启下一轮前） ====================
+                if periodic_eval_enabled:
+                    max_target_dist = float(config.get('max_target_dist', 0.0))
+                    eps = 1e-6
+                    try:
+                        all_at_max = all(float(td) >= (max_target_dist - eps) for td in list(env_target_dist_list))
+                    except Exception:
+                        all_at_max = False
+                    if all_at_max and not max_reached_logged:
+                        print(f"[周期性评估] 已检测到所有环境 target_dist 达到 max_target_dist={max_target_dist:.2f}，将开始按轮次触发评估。")
+                        max_reached_logged = True
+                    
+                    if (not eval_start_after_all_max) or all_at_max:
+                        if (training_count - last_eval_training_count) >= eval_every_rounds:
+                            print(f"[周期性评估] 触发评估：training_count={training_count}，本轮评估 episode 数={eval_episodes_per_round}（无动作噪声）")
+                        
+                            
+                            # 切换到评估阶段
+                            phase_ref.value = PHASE_EVAL_COLLECT
+                            eval_target_ref.value = eval_episodes_per_round
+                            eval_collected_ref.value = 0
+                            global_stats.reset()
+                            
+                            if is_debug:
+                                print(f"[DEBUG] [周期性评估] 已设置phase_ref=EVAL_COLLECT, eval_target={eval_episodes_per_round}, eval_collected=0")
+                            
+                            # 等待评估完成
+                            wait_count = 0
+                            while True:
+                                with eval_collected_lock:
+                                    current_eval = eval_collected_ref.value
+                                if current_eval >= eval_episodes_per_round:
+                                    # 达到目标后，立即切回训练收集阶段：
+                                    # - 训练线程把 phase_ref 设置为 PHASE_TRAIN_COLLECT
+                                    # - 此时仍在运行评估 episode 的 worker，会在各自循环中检测到current_phase_in_loop != PHASE_EVAL_COLLECT（见约1139行），
+                                    # 从而设置 forced_stop_flag 跳出本次 episode，并在统计阶段被丢弃
+                                    phase_ref.value = PHASE_TRAIN_COLLECT
+                                    if is_debug:
+                                        print(f"[DEBUG] [周期性评估] 达到目标episode数({current_eval}/{eval_episodes_per_round})，切回phase_ref=TRAIN_COLLECT")
+                                    break
+                                wait_count += 1
+                                if is_debug and wait_count % 10 == 0:  # 每5秒打印一次
+                                    print(f"[DEBUG] [周期性评估] 等待中: eval_collected={current_eval}/{eval_episodes_per_round}, phase_ref=EVAL_COLLECT")
+                                time.sleep(0.1)
+                            
+                            print("[周期性评估] 本轮评估完成，输出统计报告")
+                            stats = global_stats.get_statistics(use_window=False)
+                            _print_statistics_report(stats)
+                            # 按评估终点率保存最好模型
+                            check_best_model_fn(stats)
+                            
+                            # 回到训练阶段（当前已切回TRAIN_COLLECT，这里只更新时间戳和轮次）
+                            last_eval_training_count = training_count
+                
+                # 下一轮（如果当前不是评估阶段，则开启新一轮收集）
+                current_round_ref.value = round_index + 1
+                # 若当前不在评估收集阶段（包括评估刚结束或训练路径），则切回训练收集阶段
+                if phase_ref.value != PHASE_EVAL_COLLECT:
+                    phase_ref.value = PHASE_TRAIN_COLLECT
+                
+                time.sleep(0.1)
                 
             except Exception as e:
                 print(f"训练线程出错: {e}")
-                # 如果是Broken pipe错误，说明主进程可能已经退出
                 if "Broken pipe" in str(e) or "Errno 32" in str(e):
                     print("检测到Broken pipe错误，训练线程退出")
                     break
-                time.sleep(5)  # 出错后等待更长时间
+                time.sleep(0.1)
                 
     except Exception as e:
         print(f"训练线程初始化失败: {e}")
@@ -1630,94 +1800,9 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
 class ParallelMultiEnvTrainer:
     """并行多环境训练器"""
     
-    def __init__(self, 
-                 num_envs=4,
-                 batch_size=40,
-                 training_iterations=200,
-                 base_state_dim=25,
-                 state_history_steps=0,
-                 action_dim=2,
-                 max_action=1,
-                 max_steps_ratio=100,
-                 max_steps=3000,
-                 max_steps_min=50,
-                 device=None,
-                 model_save_dir=None,
-                 model_load_dir=None,
-                 load_model=True,
-                 save_every=50,
-                 buffer_size=50000,
-                 report_every=50,
-                 max_velocity=1.0,
-                 neglect_angle=0,
-                 max_yawrate=20.0,
-                 scan_range=5,
-                 max_target_dist=15.0,
-                 init_target_distance=2.0,
-                 target_dist_increase=0.01,
-                 target_reached_delta=0.3,
-                 collision_delta=0.25,
-                 world_size=15,
-                 goals_per_map=4,
-                 obs_min_dist=2,
-                 obs_num=20,
-                 costmap_resolution=0.3,
-                 obstacle_size=0.3,
-                 obs_distribution_mode='uniform',
-                 max_acceleration=5.0,
-                 max_deceleration=-5.0,
-                 region_select_bias=1.0,
-                 enable_weight_consistency_check=False,
-                 use_float64_for_buffer=False,
-                 is_code_debug=False,
-                 max_training_count=1000,
-                 stats_window_size=100,
-                 gpu_id=0,
-                 critic_loss_threshold=100.0,
-                 actor_update_frequency=1,
-                 critic_target_update_frequency=4,
-                 hidden_layers=[1024, 512],
-                 avg_loss_window_size=5,
-                 total_eval_episodes=0,
-                 # 奖励函数参数
-                 goal_reward=1000.0,
-                 base_collision_penalty=-1000.0,
-                 angle_base_penalty=0.0,
-                 base_linear_penalty=-1.0,
-                 yawrate_penalty_base=0.0,
-                 # 障碍物距离惩罚参数
-                 obs_penalty_threshold=1.0,
-                 obs_penalty_base=-10.0,
-                 obs_penalty_power=2.0,
-                 min_obs_penalty_threshold=0.5,
-                 obs_penalty_high_weight=1.0,
-                 obs_penalty_low_weight=0.4,
-                 obs_penalty_middle_ratio=0.4,
-                 # 时间控制参数
-                 step_sleep_time=0.1,
-                 sim_time=0.1,
-                 eval_sleep_time=1.0,
-                 reset_step_count=3,
-                 # 动作噪声参数
-                 action_noise_std=0.2,
-                 # 调试
-                 reward_debug=False,
-                 enable_obs_penalty=True,
-                 enable_yawrate_penalty=True,
-                 enable_angle_penalty=True,
-                 enable_linear_penalty=True,
-                 enable_target_distance_penalty=False,
-                 enable_linear_acceleration_oscillation_penalty=False,
-                 enable_yawrate_oscillation_penalty=False,
-                 target_distance_penalty_base=-1.0,
-                 linear_acceleration_oscillation_penalty_base=-1.0,
-                 yawrate_oscillation_penalty_base=-1.0,
-                 config_path=None,
-                 best_model_eligibility_threshold=5.0,
-                 best_model_eligibility_ratio=0.8,
-                 discount_factor=0.99,
-                 reward_scale=1.0):  # 奖励缩放因子，用于控制每步整体奖励大小
-        
+    def __init__(self, config=None, config_path=None):
+        cfg = config or {}
+
         def _to_bool(val, default=True):
             if isinstance(val, bool):
                 return val
@@ -1728,87 +1813,137 @@ class ParallelMultiEnvTrainer:
                 if low in ("false", "0", "no", "n", "off"):
                     return False
             return default
-        
-        self.num_envs = num_envs
-        self.batch_size = batch_size
-        self.training_iterations = training_iterations
-        self.max_steps_ratio = max_steps_ratio
-        self.max_steps = max_steps
-        self.max_steps_min = max_steps_min
-        self.save_every = save_every
-        self.buffer_size = buffer_size
-        self.report_every = report_every
-        self.max_velocity = max_velocity
-        self.neglect_angle = neglect_angle
-        self.max_yawrate = max_yawrate
-        self.scan_range = scan_range
-        self.max_target_dist = max_target_dist
-        self.init_target_distance = init_target_distance
-        self.target_dist_increase = target_dist_increase
-        self.target_reached_delta = target_reached_delta
-        self.collision_delta = collision_delta
-        self.world_size = world_size
-        self.goals_per_map = goals_per_map
-        self.obs_min_dist = obs_min_dist
-        self.obs_num = obs_num
-        self.costmap_resolution = costmap_resolution
-        self.obstacle_size = obstacle_size
-        self.obs_distribution_mode = obs_distribution_mode
-        self.max_acceleration = max_acceleration
-        self.max_deceleration = max_deceleration
-        self.region_select_bias = region_select_bias
-        self.enable_weight_consistency_check = enable_weight_consistency_check
-        self.use_float64_for_buffer = use_float64_for_buffer
-        self.is_code_debug = is_code_debug
-        self.max_training_count = max_training_count
-        self.critic_loss_threshold = critic_loss_threshold
-        self.actor_update_frequency = actor_update_frequency
-        self.critic_target_update_frequency = critic_target_update_frequency
-        self.hidden_layers = hidden_layers
-        self.avg_loss_window_size = avg_loss_window_size
-        self.reward_debug = reward_debug
-        self.base_state_dim = base_state_dim
-        self.state_history_steps = state_history_steps
-        # 奖励函数参数
-        self.goal_reward = goal_reward
-        self.base_collision_penalty = base_collision_penalty
-        self.angle_base_penalty = angle_base_penalty
-        self.base_linear_penalty = base_linear_penalty
-        self.yawrate_penalty_base = yawrate_penalty_base
-        # 奖励/惩罚开关（规范为布尔）
-        self.enable_obs_penalty = _to_bool(enable_obs_penalty, True)
-        self.enable_yawrate_penalty = _to_bool(enable_yawrate_penalty, True)
-        self.enable_angle_penalty = _to_bool(enable_angle_penalty, True)
-        self.enable_linear_penalty = _to_bool(enable_linear_penalty, True)
-        self.enable_target_distance_penalty = _to_bool(enable_target_distance_penalty, False)
-        self.enable_linear_acceleration_oscillation_penalty = _to_bool(enable_linear_acceleration_oscillation_penalty, False)
-        self.enable_yawrate_oscillation_penalty = _to_bool(enable_yawrate_oscillation_penalty, False)
-        # 障碍物距离惩罚参数
-        self.obs_penalty_threshold = obs_penalty_threshold
-        self.obs_penalty_base = obs_penalty_base
-        self.obs_penalty_power = obs_penalty_power
-        self.min_obs_penalty_threshold = min_obs_penalty_threshold
-        self.obs_penalty_high_weight = obs_penalty_high_weight
-        self.obs_penalty_low_weight = obs_penalty_low_weight
-        self.obs_penalty_middle_ratio = obs_penalty_middle_ratio
-        # 终点距离惩罚参数
-        self.target_distance_penalty_base = target_distance_penalty_base
-        # 震荡惩罚参数
-        self.linear_acceleration_oscillation_penalty_base = linear_acceleration_oscillation_penalty_base
-        self.yawrate_oscillation_penalty_base = yawrate_oscillation_penalty_base
+
+        # ==================== 从配置字典读取参数（统一入口） ====================
+        # 训练参数
+        self.num_envs = cfg.get('num_envs', 4)
+        self.batch_size = cfg.get('batch_size', 40)
+        self.training_iterations = cfg.get('training_iterations', 200)
+        self.train_n_per_step = cfg.get('train_n_per_step', 1.0)
+        self.collection_wait_ratio = cfg.get('collection_wait_ratio', 0.8)
+        self.min_collection_ratio = cfg.get('min_collection_ratio', 0.25)
+        self.save_every = cfg.get('save_every', 50)
+        self.buffer_size = cfg.get('buffer_size', 50000)
+        self.max_training_count = cfg.get('max_training_count', 1000)
+        self.max_rounds = cfg.get('max_rounds', self.max_training_count)
+        self.max_steps_ratio = cfg.get('max_steps_ratio', 100)
+        self.max_steps = cfg.get('max_steps', 3000)
+        self.max_steps_min = cfg.get('max_steps_min', 50)
+
+        # 机器人与环境参数
+        self.max_velocity = cfg.get('max_velocity', 1.0)
+        self.max_acceleration = cfg.get('max_acceleration', 5.0)
+        self.max_deceleration = cfg.get('max_deceleration', -5.0)
+        self.neglect_angle = cfg.get('neglect_angle', 0)
+        self.max_yawrate = cfg.get('max_yawrate', 20.0)
+        self.scan_range = cfg.get('scan_range', 5)
+        self.max_target_dist = cfg.get('max_target_dist', 15.0)
+        self.init_target_distance = cfg.get('init_target_distance', 2.0)
+        self.target_dist_increase = cfg.get('target_dist_increase', 0.01)
+        self.target_reached_delta = cfg.get('target_reached_delta', 0.3)
+        self.collision_delta = cfg.get('collision_delta', 0.25)
+        self.world_size = cfg.get('world_size', 15)
+        self.goals_per_map = cfg.get('goals_per_map', 4)
+        self.obs_min_dist = cfg.get('obs_min_dist', 2)
+        self.obs_num = cfg.get('obs_num', 20)
+        self.costmap_resolution = cfg.get('costmap_resolution', 0.3)
+        self.obstacle_size = cfg.get('obstacle_size', 0.3)
+        self.obs_distribution_mode = cfg.get('obs_distribution_mode', 'uniform')
+
+        # 连通区域/一致性检查
+        self.region_select_bias = cfg.get('region_select_bias', 1.0)
+        self.enable_weight_consistency_check = _to_bool(cfg.get('enable_weight_consistency_check', False), False)
+
+        # 模型与网络参数
+        # 根据bin_num自动计算：base_state_dim = bin_num + 非激光特征(7)
+        self.bin_num = cfg.get('bin_num', 72)
+        non_lidar_dim = 7
+        self.base_state_dim = int(self.bin_num) + non_lidar_dim
+        self.state_history_steps = cfg.get('state_history_steps', 0)
+        self.hidden_layers = cfg.get('hidden_layers', [1024, 512])
+        self.avg_loss_window_size = cfg.get('avg_loss_window_size', 5)
+
+        self.stats_window_size = cfg.get('stats_window_size', 100)
+        gpu_id = cfg.get('gpu_id', 0)
+        max_action = cfg.get('max_action', 1.0)
+        action_dim = cfg.get('action_dim', 2)
+
+        # 训练算法参数
+        discount_factor = cfg.get('discount_factor', 0.99)
+        actor_update_frequency = cfg.get('actor_update_frequency', 1)
+        critic_target_update_frequency = cfg.get('critic_target_update_frequency', 4)
+
+        # 奖励缩放
+        self.reward_scale = cfg.get('reward_scale', 1.0)
+
         # 时间控制参数
-        self.sim_time = sim_time
-        self.step_sleep_time = step_sleep_time
-        self.eval_sleep_time = eval_sleep_time
-        self.reset_step_count = reset_step_count
-        # 动作噪声参数
-        self.action_noise_std = action_noise_std
-        # 奖励归一化参数
-        self.reward_scale = reward_scale
-        # 最好模型评比资格检查参数
-        self.best_model_eligibility_threshold = best_model_eligibility_threshold
-        self.best_model_eligibility_ratio = best_model_eligibility_ratio
-        
+        self.sim_time = cfg.get('sim_time', 0.1)
+        self.step_sleep_time = cfg.get('step_sleep_time', 0.1)
+        self.reset_step_count = cfg.get('reset_step_count', 3)
+
+        # 动作噪声
+        self.action_noise_std = cfg.get('action_noise_std', 0.2)
+
+        # 奖励函数参数（兼容旧字段名）
+        self.goal_reward = cfg.get('goal_reward', 1000.0)
+        self.base_collision_penalty = cfg.get('collision_penalty_base', cfg.get('base_collision_penalty', -1000.0))
+        self.angle_base_penalty = cfg.get('angle_penalty_base', cfg.get('angle_base_penalty', 0.0))
+        self.base_linear_penalty = cfg.get('linear_penalty_base', cfg.get('base_linear_penalty', -1.0))
+        self.yawrate_penalty_base = cfg.get('yawrate_penalty_base', 0.0)
+
+        self.enable_obs_penalty = _to_bool(cfg.get('enable_obs_penalty', True), True)
+        self.enable_yawrate_penalty = _to_bool(cfg.get('enable_yawrate_penalty', True), True)
+        self.enable_angle_penalty = _to_bool(cfg.get('enable_angle_penalty', True), True)
+        self.enable_linear_penalty = _to_bool(cfg.get('enable_linear_penalty', True), True)
+        self.enable_step_penalty = _to_bool(cfg.get('enable_step_penalty', False), False)
+        self.enable_target_distance_penalty = _to_bool(cfg.get('enable_target_distance_penalty', False), False)
+        self.enable_progress_reward = _to_bool(cfg.get('enable_progress_reward', False), False)
+        self.enable_linear_acceleration_oscillation_penalty = _to_bool(cfg.get('enable_linear_acceleration_oscillation_penalty', False), False)
+        self.enable_yawrate_oscillation_penalty = _to_bool(cfg.get('enable_yawrate_oscillation_penalty', False), False)
+
+        self.progress_reward_base = cfg.get('progress_reward_base', 1.0)
+        self.target_distance_penalty_base = cfg.get('target_distance_penalty_base', -1.0)
+        self.step_penalty_base = cfg.get('step_penalty_base', 0.0)
+        self.linear_acceleration_oscillation_penalty_base = cfg.get('linear_acceleration_oscillation_penalty_base', -1.0)
+        self.yawrate_oscillation_penalty_base = cfg.get('yawrate_oscillation_penalty_base', -1.0)
+
+        # 障碍物距离惩罚参数
+        self.obs_penalty_threshold = cfg.get('obs_penalty_threshold', 1.0)
+        self.obs_penalty_base = cfg.get('obs_penalty_base', -10.0)
+        self.obs_penalty_power = cfg.get('obs_penalty_power', 2.0)
+        self.min_obs_penalty_threshold = cfg.get('min_obs_penalty_threshold', 0.5)
+        self.obs_penalty_high_weight = cfg.get('obs_penalty_high_weight', 1.0)
+        self.obs_penalty_low_weight = cfg.get('obs_penalty_low_weight', 0.4)
+        self.obs_penalty_middle_ratio = cfg.get('obs_penalty_middle_ratio', 0.4)
+
+        # 路径参数（兼容 load_path/model_load_dir 等）
+        model_save_dir = cfg.get('model_save_dir', None)
+        model_load_dir = cfg.get('load_path', cfg.get('model_load_dir', None))
+        load_model_str = cfg.get('load_model', cfg.get('load_existing_model', True))
+        load_model = load_model_str if isinstance(load_model_str, bool) else str(load_model_str).lower() == 'true'
+
+        # stats_window_size 老字段兼容
+        self.max_training_count = cfg.get('max_training_count', self.max_training_count)
+
+        # 设备配置
+        cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if False:
+            pass
+        elif torch.cuda.is_available():
+            if cuda_visible_devices:
+                self.device = torch.device("cuda")
+                print(f"使用GPU: cuda (物理GPU: {cuda_visible_devices})")
+            else:
+                self.device = torch.device(f"cuda:{gpu_id}")
+                print(f"使用GPU: cuda:{gpu_id}")
+        else:
+            self.device = torch.device("cpu")
+            print("CUDA不可用，使用CPU")
+
+        # 配置文件路径
+        self.config_path = config_path
+
         # 设备配置
         # 注意：如果通过环境变量 CUDA_VISIBLE_DEVICES 设置了 GPU，PyTorch 视角下 GPU 索引从 0 开始
         cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
@@ -1825,47 +1960,39 @@ class ParallelMultiEnvTrainer:
         else:
             self.device = torch.device("cpu")
             print("CUDA不可用，使用CPU")
-        
-        # ==================== 日志与模型保存目录配置 ====================
-        # 优先使用外部脚本(start_multi_env_training.sh)传入的 LOG_DIR 和 TRAINING_TIMESTAMP，
-        # 确保模型与配置都保存在对应的日志子目录中，例如：
-        #   /log/multi_env_training/train_20260103_102344/model
-        #   /log/multi_env_training/train_20260103_102344/best_model
-        log_dir_env = os.environ.get('LOG_DIR', None)
-        timestamp_env = os.environ.get('TRAINING_TIMESTAMP', None)
-        timestamp = timestamp_env if timestamp_env else datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.timestamp = timestamp
 
-        if log_dir_env:
-            # 日志目录由启动脚本创建，这里只在其下创建子目录
-            self.log_dir = Path(log_dir_env)
-            self.model_save_dir = self.log_dir / "model"
-            self.best_model_save_dir = self.log_dir / "best_model"
-        else:
-            # 兼容旧逻辑：仍然按照模型基目录 + 时间戳创建保存目录
-            base_save_dir = Path(model_save_dir) if model_save_dir else Path("src/drl_navigation_ros2/models/SAC")
-            self.log_dir = None
-            self.model_save_dir = base_save_dir / timestamp
-            self.best_model_save_dir = self.model_save_dir / "best"
-
-        self.model_load_dir = Path(model_load_dir) if model_load_dir else Path("src/drl_navigation_ros2/models/SAC")
-        self.load_model = load_model
-        self.config_path = config_path
-        
-        # 加载配置文件以读取 start_ros_domain_id
+        # 先从配置文件中读取完整配置（如果存在），供日志目录等使用
         if self.config_path and Path(self.config_path).exists():
             try:
-                with open(self.config_path, 'r') as f:
+                with open(self.config_path, 'r', encoding='utf-8') as f:
                     self._loaded_config = yaml.safe_load(f) or {}
             except Exception as e:
                 print(f"警告: 读取配置文件失败: {e}")
                 self._loaded_config = {}
         else:
             self._loaded_config = {}
+
+        # ==================== 日志与模型保存目录配置 ====================
+        # 统一使用 TRAINING_TIMESTAMP（若未设置则 fallback 为当前时间）
+        # 日志目录由 train.yaml 的 multi_env_log_model_dir + 时间戳子目录组合得到：
+        #   <multi_env_log_model_dir>/train_<timestamp>/model
+        #   <multi_env_log_model_dir>/train_<timestamp>/best_model
+        self.timestamp = os.environ.get("TRAINING_TIMESTAMP", datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+        base_log_dir = Path(self._loaded_config.get("multi_env_log_model_dir", "log/multi_env_training"))
+        self.log_dir = base_log_dir / f"train_{self.timestamp}"
+        # 实时模型保存目录
+        self.model_save_dir = self.log_dir / "model"
+        # 最好模型单独保存到 best_model 子目录，便于区分
+        self.best_model_save_dir = self.log_dir / "best_model"
+
+        self.model_load_dir = Path(model_load_dir) if model_load_dir else Path("src/drl_navigation_ros2/models/SAC")
+        self.load_model = load_model
         
         # 创建目录
         self._setup_directories()
         # 保存本次训练使用的配置快照：
+        #   - 转换为图片格式保存为只读文件，确保完全不可修改
         #   - 若存在日志目录，则保存在日志目录根下，文件名带时间戳
         #   - 否则，保存在模型保存目录下，文件名同样带时间戳
         if self.config_path and Path(self.config_path).exists():
@@ -1875,20 +2002,18 @@ class ParallelMultiEnvTrainer:
                 else:
                     config_save_dir = self.model_save_dir
                 config_save_dir.mkdir(parents=True, exist_ok=True)
-                config_filename = f"config_{self.timestamp}.yaml"
-                shutil.copy(self.config_path, config_save_dir / config_filename)
+                config_filename = f"config_{self.timestamp}.png"
+                target_config_path = config_save_dir / config_filename
+                # 将YAML配置转换为图片格式保存
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    config_data = yaml.safe_load(f) or {}
+                config_to_image(config_data, target_config_path, "DRL Robot Dog Navigation - Training Config")
             except Exception as e:
-                print(f"警告: 复制配置到保存目录失败: {e}")
+                print(f"警告: 保存配置快照到保存目录失败: {e}")
         
-        # 计算实际使用的state_dim，确保与历史state拼接保持一致
-        state_dim_effective = self.base_state_dim * (1 + self.state_history_steps) if self.state_history_steps > 0 else self.base_state_dim
-        print(f"使用state_dim={state_dim_effective} (base_state_dim={self.base_state_dim}, state_history_steps={self.state_history_steps})")
-
         print(f"初始化SAC模型...")
-        if self.load_model:
-            print(f"加载已有模型: {self.model_load_dir}")
-        else:
-            print(f"创建新的随机初始化模型")
+        print(f"使用state_dim={(self.base_state_dim * (1 + self.state_history_steps) if self.state_history_steps > 0 else self.base_state_dim)} (base_state_dim={self.base_state_dim}, state_history_steps={self.state_history_steps})")
+        
         # 初始化模型
         actor_grad_clip_value = self._loaded_config.get('actor_grad_clip_value', 0.0)
         critic_grad_clip_value = self._loaded_config.get('critic_grad_clip_value', 0.0)
@@ -1897,7 +2022,7 @@ class ParallelMultiEnvTrainer:
         critic_lr = self._loaded_config.get('critic_lr', 1e-4)
         alpha_lr = self._loaded_config.get('alpha_lr', 1e-4)
         self.model = SAC(
-            state_dim=state_dim_effective,
+            state_dim=self.base_state_dim * (1 + self.state_history_steps) if self.state_history_steps > 0 else self.base_state_dim,
             action_dim=action_dim,
             max_action=max_action,
             device=self.device,
@@ -1907,13 +2032,14 @@ class ParallelMultiEnvTrainer:
             alpha_lr=alpha_lr,  # 传递温度参数学习率
             actor_update_frequency=actor_update_frequency,
             critic_target_update_frequency=critic_target_update_frequency,
-            hidden_layers=hidden_layers,
+            hidden_layers=self.hidden_layers,  # 使用实例变量，确保使用更新后的值
             save_every=0,  # 不自动保存
             load_model=self.load_model,
             save_directory=self.model_save_dir,
             load_directory=self.model_load_dir,
             action_noise_std=self.action_noise_std,
-            base_state_dim=base_state_dim,  # 传递base_state_dim给SAC模型
+            base_state_dim=self.base_state_dim,  # 传递base_state_dim给SAC模型
+            bin_num=self._loaded_config.get('bin_num', 72),  # 激光scan分桶数量
             actor_grad_clip_value=actor_grad_clip_value,  # 传递Actor梯度裁剪值
             critic_grad_clip_value=critic_grad_clip_value,  # 传递Critic梯度裁剪值
         )
@@ -1922,10 +2048,15 @@ class ParallelMultiEnvTrainer:
         # 初始化Manager（必须在SharedModelManager之前）
         self.manager = mp.Manager()
         
-        # 创建固定的临时文件目录
+        # 创建固定的临时文件目录（在当前目录下的tmp文件夹中）
         import tempfile
-        self.shared_temp_dir = tempfile.mkdtemp(prefix="sac_model_sync_")
-        weight_log(f"创建共享临时目录: {self.shared_temp_dir}")
+        # 获取当前工作目录，创建tmp文件夹（如果不存在）
+        current_dir = Path.cwd()
+        tmp_base_dir = current_dir / "tmp"
+        tmp_base_dir.mkdir(exist_ok=True)
+        # 在tmp目录中创建临时子目录
+        self.shared_temp_dir = tempfile.mkdtemp(prefix="sac_model_sync_", dir=str(tmp_base_dir))
+        print(f"创建共享临时目录: {self.shared_temp_dir}")
         
         # 创建共享的模型相关对象
         shared_model_dict = self.manager.dict()  # 共享模型权重字典
@@ -1933,14 +2064,17 @@ class ParallelMultiEnvTrainer:
         training_count_ref = self.manager.Value('i', 0)  # 共享训练次数计数器
         critic_loss_ref = self.manager.Value('d', float('inf'))  # 共享critic损失
         recent_losses_ref = self.manager.list()  # 共享最近损失列表
+        # 新的同步控制：按轮次收集 episode 后再训练（使用统一的phase_ref）
+        self.round_done_counter = mp.Value('i', 0)  # 当前轮完成/被截断的进程计数
+        self.current_round_ref = mp.Value('i', 0)  # 当前轮次编号
         
         # 初始化共享模型管理器
         self.model_manager = SharedModelManager(self.model, shared_model_dict, model_lock, training_count_ref, critic_loss_ref, recent_losses_ref, is_main_process=True, shared_temp_dir=self.shared_temp_dir)
         
         # 立即将主进程的模型权重同步到临时文件
-        weight_log("将主进程模型权重同步到临时文件...")
+        print("将主进程模型权重同步到临时文件...")
         self.model_manager.update_dict_from_model()
-        weight_log("模型权重同步完成")
+        print("模型权重同步完成")
         
         # 将临时目录路径保存到共享字典，供数据收集进程使用
         self.model_manager.shared_model_dict['shared_temp_dir'] = self.model_manager.temp_dir
@@ -1953,44 +2087,57 @@ class ParallelMultiEnvTrainer:
             layers.append(("输出层", output_dim))
             return layers
 
-        weight_log("主进程模型结构概览:")
+        print("主进程模型结构概览:")
         # actor 结构: trunk 输出为 action_dim 的均值和对数方差，故输出维度为 2 * action_dim
-        actor_layers = _describe_mlp(state_dim_effective, hidden_layers, 2 * action_dim)
-        weight_log(f"  主进程 actor 层级神经元: " + " -> ".join([f"{name}:{size}" for name, size in actor_layers]))
+        # 注意：这里直接使用主进程创建模型时的输入维度，避免依赖尚未初始化的 self.config
+        _state_dim_effective = int(self.base_state_dim * (1 + self.state_history_steps) if self.state_history_steps > 0 else self.base_state_dim)
+        actor_layers = _describe_mlp(_state_dim_effective, self.hidden_layers, 2 * action_dim)
+        print(f"  主进程 actor 层级神经元: " + " -> ".join([f"{name}:{size}" for name, size in actor_layers]))
         # critic 结构: Q1/Q2 两个 MLP，输入为 state_dim+action_dim，输出为标量 Q 值
-        critic_layers = _describe_mlp(state_dim_effective + action_dim, hidden_layers, 1)
-        weight_log(f"  主进程 critic(Q1/Q2) 层级神经元: " + " -> ".join([f"{name}:{size}" for name, size in critic_layers]))
+        critic_layers = _describe_mlp(_state_dim_effective + action_dim, self.hidden_layers, 1)
+        print(f"  主进程 critic(Q1/Q2) 层级神经元: " + " -> ".join([f"{name}:{size}" for name, size in critic_layers]))
         for key, value in self.model.state_dict().items():
             if isinstance(value, dict):
-                weight_log(f"  主进程 {key} 子键: {list(value.keys())}")
+                print(f"  主进程 {key} 子键: {list(value.keys())}")
             elif hasattr(value, 'shape'):
-                weight_log(f"  主进程 {key} 形状: {value.shape}")
+                print(f"  主进程 {key} 形状: {value.shape}")
             else:
-                weight_log(f"  主进程 {key} 类型: {type(value)}")
+                print(f"  主进程 {key} 类型: {type(value)}")
 
-        weight_log(f"主进程模型文件路径: {self.model_manager.model_file_path}")
-        weight_log(f"主进程临时目录: {self.model_manager.temp_dir}")
+        print(f"主进程模型文件路径: {self.model_manager.model_file_path}")
+        print(f"主进程临时目录: {self.model_manager.temp_dir}")
         
         # 初始化共享缓冲区相关结构
         # 使用每个环境一个队列传输经验，由训练线程集中维护本地大缓冲区
-        self.env_queues = [mp.Queue() for _ in range(num_envs)]
+        self.env_queues = [mp.Queue() for _ in range(self.num_envs)]
         # 计数器使用 multiprocessing.Value，在 spawn 模式下通过参数传入子进程
         # 而不是使用 Manager().Value（后者返回的 ValueProxy 不支持 get_lock）
         self.total_added_step = mp.Value('i', 0)        # 全局step数量（样本数）
         self.total_episodes_counter = mp.Value('i', 0)  # 全局episode计数器
         self.current_buffer_size = mp.Value('i', 0)     # 当前本地缓冲区大小（用于日志）
 
-        # 训练/评估阶段共享标识
-        self.phase_ref = self.manager.Value('i', 0)  # 0=train,1=eval,2=pause,3=stop
-        self.eval_target_ref = self.manager.Value('i', total_eval_episodes)
+        # 训练/评估阶段共享标识（5态phase统一控制）
+        self.phase_ref = self.manager.Value('i', PHASE_TRAIN_COLLECT)  # 初始为训练收集阶段
+        # eval_target_ref 仅用于“当前一轮评估”的目标episode数，由训练线程在触发周期性评估时写入
+        self.eval_target_ref = self.manager.Value('i', 0)
         self.eval_collected_ref = self.manager.Value('i', 0)
         self.eval_collected_lock = self.manager.Lock()
+
+        # 共享：每个环境“最近一次 episode 的 target_dist”（用于判定是否所有采集进程都达到 max_target_dist）
+        # 注意：target_dist 以采集进程侧 ROS_env.target_dist 为准（期望目标距离上限），不是 actual 终点距离。
+        try:
+            init_td = float(self._loaded_config.get('init_target_distance', self.init_target_distance))
+        except Exception:
+            init_td = float(self.init_target_distance)
+        self.env_target_dist_list = self.manager.list([init_td for _ in range(self.num_envs)])
         
         
         # 初始化全局统计
-        self.global_stats = GlobalStatistics(window_size=stats_window_size)
+        self.global_stats = GlobalStatistics(window_size=self.stats_window_size)
         
         # 初始化最好模型跟踪变量
+        # 注意：最好模型保存从“评估阶段”开始启用；训练阶段只打印统计不保存
+        self.best_model_enabled = False
         self.best_goal_rate = -1.0  # 最好的成功率（初始化为-1，表示还没有记录）
         self.best_collision_rate = float('inf')  # 最好的碰撞率（初始化为无穷大，表示还没有记录）
         self.check_best_model_ref = self.manager.Value('i', 0)  # 共享变量：标记是否需要检查最好模型（episode编号）
@@ -2000,111 +2147,120 @@ class ParallelMultiEnvTrainer:
         # 初始化计数器（不再需要同步事件）
         self.init_complete_counter = mp.Value('i', 0)  # 跟踪初始化完成的环境数量
         
-        # 配置字典
+        # 配置字典（供采集子进程初始化 ROS_env 等读取）
         self.config = {
-            'num_envs': num_envs,
-            'state_dim': state_dim_effective,
-            'base_state_dim': base_state_dim,  # 添加base_state_dim到配置
-            'state_history_steps': state_history_steps,  # 添加state_history_steps到配置
+            'num_envs': self.num_envs,
+            'state_dim': int(self.base_state_dim * (1 + self.state_history_steps) if self.state_history_steps > 0 else self.base_state_dim),
+            'base_state_dim': self.base_state_dim,
+            'state_history_steps': self.state_history_steps,
             'action_dim': action_dim,
             'max_action': max_action,
-            'max_steps_ratio': max_steps_ratio,
+            'max_steps_ratio': self.max_steps_ratio,
             'max_steps': self.max_steps,
-            'max_steps_min': max_steps_min,
-            'batch_size': batch_size,
-            'training_iterations': training_iterations,
-            'save_every': save_every,
-            'buffer_size': buffer_size,
+            'max_steps_min': self.max_steps_min,
+            'batch_size': self.batch_size,
+            'training_iterations': self.training_iterations,
+            'train_n_per_step': self.train_n_per_step,
+            'collection_wait_ratio': self.collection_wait_ratio,
+            'min_collection_ratio': self.min_collection_ratio,
+            'max_rounds': self.max_rounds,
+            'save_every': self.save_every,
+            'buffer_size': self.buffer_size,
+            'enable_stratified_replay': self._loaded_config.get('enable_stratified_replay', False),
+            'stratified_replay': self._loaded_config.get('stratified_replay', {}),
             'min_batches_for_training': self._loaded_config.get('min_batches_for_training', 0),  # 训练开始前需要收集的最少batch数量（0表示只要有数据就训练）
-            'report_every': report_every,
             'model_save_dir': self.model_save_dir,
-            'max_velocity': max_velocity,
-            'neglect_angle': neglect_angle,
-            'max_yawrate': max_yawrate,
-            'scan_range': scan_range,
-            'max_target_dist': max_target_dist,
-            'init_target_distance': init_target_distance,
-            'target_dist_increase': target_dist_increase,
-            'target_reached_delta': target_reached_delta,
-            'collision_delta': collision_delta,
-            'world_size': world_size,
-            'goals_per_map': goals_per_map,
-            'obs_min_dist': obs_min_dist,
-            'obs_num': obs_num,
-            'costmap_resolution': costmap_resolution,
-            'obstacle_size': obstacle_size,
-            'obs_distribution_mode': obs_distribution_mode,
-            'max_acceleration': max_acceleration,
-            'max_deceleration': max_deceleration,
-            'is_code_debug': is_code_debug,
-            'enable_weight_consistency_check': enable_weight_consistency_check,
-            'use_float64_for_buffer': use_float64_for_buffer,
-            'max_training_count': max_training_count,
-            'critic_loss_threshold': critic_loss_threshold,
-            'actor_update_frequency': actor_update_frequency,
-            'critic_target_update_frequency': critic_target_update_frequency,
-            'hidden_layers': hidden_layers,
-            'avg_loss_window_size': avg_loss_window_size,
-            'gpu_id': gpu_id,  # 添加GPU ID到配置中
-            'reward_debug': self.reward_debug,
-            'total_eval_episodes': total_eval_episodes,
+            'max_velocity': self.max_velocity,
+            'neglect_angle': self.neglect_angle,
+            'max_yawrate': self.max_yawrate,
+            'scan_range': self.scan_range,
+            'max_target_dist': self.max_target_dist,
+            'init_target_distance': self.init_target_distance,
+            'target_dist_increase': self.target_dist_increase,
+            'target_reached_delta': self.target_reached_delta,
+            'collision_delta': self.collision_delta,
+            'world_size': self.world_size,
+            'goals_per_map': self.goals_per_map,
+            'obs_min_dist': self.obs_min_dist,
+            'obs_num': self.obs_num,
+            'costmap_resolution': self.costmap_resolution,
+            'obstacle_size': self.obstacle_size,
+            'obs_distribution_mode': self.obs_distribution_mode,
+            'max_acceleration': self.max_acceleration,
+            'max_deceleration': self.max_deceleration,
+            'enable_weight_consistency_check': self.enable_weight_consistency_check,
+            'max_training_count': self.max_training_count,
+            'actor_update_frequency': cfg.get('actor_update_frequency', 1),
+            'critic_target_update_frequency': cfg.get('critic_target_update_frequency', 4),
+            'hidden_layers': self.hidden_layers,
+            'avg_loss_window_size': self.avg_loss_window_size,
+            'gpu_id': cfg.get('gpu_id', 0),
+            # 周期性评估参数（从 train.yaml 读取）
+            'eval_start_after_all_target_dist_max': self._loaded_config.get('eval_start_after_all_target_dist_max', False),
+            'eval_every_rounds': int(self._loaded_config.get('eval_every_rounds', 0) or 0),
+            'eval_episodes_per_round': int(self._loaded_config.get('eval_episodes_per_round', 0) or 0),
             # 奖励函数参数
-            'goal_reward': goal_reward,
-            'base_collision_penalty': base_collision_penalty,
-            'angle_base_penalty': angle_base_penalty,
-            'base_linear_penalty': base_linear_penalty,
+            'goal_reward': self.goal_reward,
+            'base_collision_penalty': self.base_collision_penalty,
+            'angle_base_penalty': self.angle_base_penalty,
+            'base_linear_penalty': self.base_linear_penalty,
             'yawrate_penalty_base': self.yawrate_penalty_base,
             'enable_obs_penalty': self.enable_obs_penalty,
             'enable_yawrate_penalty': self.enable_yawrate_penalty,
             'enable_angle_penalty': self.enable_angle_penalty,
             'enable_linear_penalty': self.enable_linear_penalty,
+            'enable_step_penalty': self.enable_step_penalty,
             'enable_target_distance_penalty': self.enable_target_distance_penalty,
+            # 进度奖惩参数（必须写入config，供采集子进程初始化ROS_env时读取）
+            'enable_progress_reward': self.enable_progress_reward,
+            'progress_reward_base': self.progress_reward_base,
             'enable_linear_acceleration_oscillation_penalty': self.enable_linear_acceleration_oscillation_penalty,
             'enable_yawrate_oscillation_penalty': self.enable_yawrate_oscillation_penalty,
             # 障碍物距离惩罚参数
-            'obs_penalty_threshold': obs_penalty_threshold,
-            'obs_penalty_base': obs_penalty_base,
-            'obs_penalty_power': obs_penalty_power,
-            'min_obs_penalty_threshold': min_obs_penalty_threshold,
-            'obs_penalty_high_weight': obs_penalty_high_weight,
-            'obs_penalty_low_weight': obs_penalty_low_weight,
-            'obs_penalty_middle_ratio': obs_penalty_middle_ratio,
+            'obs_penalty_threshold': self.obs_penalty_threshold,
+            'obs_penalty_base': self.obs_penalty_base,
+            'obs_penalty_power': self.obs_penalty_power,
+            'min_obs_penalty_threshold': self.min_obs_penalty_threshold,
+            'obs_penalty_high_weight': self.obs_penalty_high_weight,
+            'obs_penalty_low_weight': self.obs_penalty_low_weight,
+            'obs_penalty_middle_ratio': self.obs_penalty_middle_ratio,
             # 终点距离惩罚参数
             'target_distance_penalty_base': self.target_distance_penalty_base,
+            # 时间步惩罚参数
+            'step_penalty_base': self.step_penalty_base,
             # 震荡惩罚参数
             'linear_acceleration_oscillation_penalty_base': self.linear_acceleration_oscillation_penalty_base,
             'yawrate_oscillation_penalty_base': self.yawrate_oscillation_penalty_base,
             # 时间控制参数
             'sim_time': self.sim_time,
-            'step_sleep_time': step_sleep_time,
-            'eval_sleep_time': eval_sleep_time,
-            'reset_step_count': reset_step_count,
+            'step_sleep_time': self.step_sleep_time,
+            'reset_step_count': self.reset_step_count,
             # 动作噪声参数
-            'action_noise_std': action_noise_std,
+            'action_noise_std': self.action_noise_std,
             # 连通区域选择参数（从 train.yaml 读取）
             'region_select_bias': self.region_select_bias,
             # 奖励归一化参数
             'reward_scale': self.reward_scale,
-            # 最好模型评比资格检查参数
-            'best_model_eligibility_threshold': self.best_model_eligibility_threshold,
-            'best_model_eligibility_ratio': self.best_model_eligibility_ratio,
             # ROS域ID参数（从配置文件读取）
             'start_ros_domain_id': self._loaded_config.get('start_ros_domain_id', 1),
+            # 调试模式参数（从配置文件读取）
+            'is_debug': self._loaded_config.get('is_debug', False),
         }
         
-        # 初始化信息在 shell 脚本中已经完整打印过，这里只打一行简要提示，避免重复参数配置
-        weight_log("真正的并行多环境训练器初始化完成")
-        weight_log("")
+                # 打印训练配置汇总（包含 YAML 原始项和运行时派生字段）
+        print("\n训练配置汇总（含派生参数）:")
+        for k, v in self.config.items():
+            print(f"  - {k}: {v}")
+        print("\n真正的并行多环境训练器初始化完成\n")
     
     def _setup_directories(self):
         """设置目录"""
         try:
+            # 创建实时模型保存目录
             self.model_save_dir.mkdir(parents=True, exist_ok=True)
             print(f"模型保存目录已准备: {self.model_save_dir}")
-            # 创建最好模型保存目录（不再强制为 model 子目录，而是使用预先配置的路径）
-            if not hasattr(self, 'best_model_save_dir') or self.best_model_save_dir is None:
-                # 兜底：若未显式设置，则仍旧在模型目录下创建 best 子目录
-                self.best_model_save_dir = self.model_save_dir / "best"
+            # 创建最好模型保存目录
+            self.best_model_save_dir = self.log_dir / "best_model"
             self.best_model_save_dir.mkdir(parents=True, exist_ok=True)
             print(f"最好模型保存目录已准备: {self.best_model_save_dir}")
         except PermissionError:
@@ -2114,54 +2270,43 @@ class ParallelMultiEnvTrainer:
             print(f"错误: 无法创建模型保存目录 {self.model_save_dir}")
             raise
     
-    def _check_and_save_best_model(self, stats):
-        """检查当前统计信息是否更好，如果是则保存最好模型
-        
-        Args:
-            stats: 统计信息字典，包含 goal_rate, collision_rate, eligible_for_best_model 等
+    def _check_and_save_best_model_by_eval_goal_rate(self, eval_stats):
+        """评估阶段：按终点率(goal_rate)保存最好模型（不做训练阶段资格检查）
+
+        规则：
+        - goal_rate 更高则更新最好模型
+        - goal_rate 相等时，collision_rate 更低则更新（避免并列）
         """
         with self.check_best_model_lock:
-            # 首先检查是否有资格参与最好模型评比
-            eligible_for_best_model = stats.get('eligible_for_best_model', False)
-            if not eligible_for_best_model:
-                # 没有资格，不进行评比（每100个episode打印一次警告，避免刷屏）
-                current_episode = stats.get('total_episodes', 0)
-                eligibility_threshold = self.config.get('best_model_eligibility_threshold', 5.0)
-                eligibility_ratio = self.config.get('best_model_eligibility_ratio', 0.8)
-                max_target_dist = self.config.get('max_target_dist', 15.0)
-                actual_threshold = max_target_dist - eligibility_threshold
-                if current_episode - self.last_eligibility_warning_episode >= 100:
-                    print(f"[最好模型检查] Episode {current_episode}: 当前统计不具备参与最好模型评比的资格（资格要求：过去report_every个episode中至少{eligibility_ratio*100:.0f}%的target_dist >= {actual_threshold:.2f} (max_target_dist={max_target_dist:.2f} - threshold={eligibility_threshold:.2f})）")
-                    self.last_eligibility_warning_episode = current_episode
-                return
-            
-            current_goal_rate = stats.get('goal_rate', 0.0)
-            current_collision_rate = stats.get('collision_rate', float('inf'))
-            
-            # 判断是否更好：成功率更高，或成功率相等但碰撞率更低
+            # 一旦出现评估阶段，就启用最好模型保存
+            self.best_model_enabled = True
+
+            current_goal_rate = float(eval_stats.get('goal_rate', 0.0) or 0.0)
+            current_collision_rate = float(eval_stats.get('collision_rate', float('inf')))
+
             is_better = False
             if current_goal_rate > self.best_goal_rate:
                 is_better = True
             elif current_goal_rate == self.best_goal_rate and current_collision_rate < self.best_collision_rate:
                 is_better = True
-            
-            if is_better:
-                # 更新最好统计信息
-                self.best_goal_rate = current_goal_rate
-                self.best_collision_rate = current_collision_rate
-                
-                # 保存最好模型
-                try:
-                    # 确保保存目录存在
-                    self.best_model_save_dir.mkdir(parents=True, exist_ok=True)
-                    self.model.save(filename="SAC", directory=self.best_model_save_dir)
-                    print(f"\n{'='*60}")
-                    print(f"保存最好模型到: {self.best_model_save_dir}")
-                    print(f"当前最好统计: 成功率={self.best_goal_rate:.4f} ({self.best_goal_rate*100:.2f}%), "
-                          f"碰撞率={self.best_collision_rate:.4f} ({self.best_collision_rate*100:.2f}%)")
-                    print(f"{'='*60}\n")
-                except Exception as e:
-                    print(f"警告: 保存最好模型失败: {e}")
+
+            if not is_better:
+                return
+
+            self.best_goal_rate = current_goal_rate
+            self.best_collision_rate = current_collision_rate
+
+            try:
+                # 确保最好模型目录存在
+                self.best_model_save_dir.mkdir(parents=True, exist_ok=True)
+                self.model.save(filename="SAC_best", directory=self.best_model_save_dir)
+                print(f"\n{'='*60}")
+                print(f"[评估最好模型] 保存最好模型到: {self.best_model_save_dir}")
+                print(f"[评估最好模型] 当前最好统计: 终点率={self.best_goal_rate:.4f} ({self.best_goal_rate*100:.2f}%), "
+                      f"碰撞率={self.best_collision_rate:.4f} ({self.best_collision_rate*100:.2f}%)")
+                print(f"{'='*60}\n")
+            except Exception as e:
+                print(f"警告: [评估最好模型] 保存最好模型失败: {e}")
         
     
     def run_training(self):
@@ -2186,7 +2331,6 @@ class ParallelMultiEnvTrainer:
                     self.total_episodes_counter,
                     self.model_manager.training_count_ref,
                     self.model_manager.critic_loss_ref,
-                    self.critic_loss_threshold,
                     self.model_manager.recent_losses_ref,
                     self.avg_loss_window_size,
                     self.phase_ref,
@@ -2195,6 +2339,9 @@ class ParallelMultiEnvTrainer:
                     self.eval_collected_ref,
                     self.current_buffer_size,
                     self.check_best_model_ref,
+                    self.round_done_counter,
+                    self.current_round_ref,
+                    self.env_target_dist_list,
                 )
             )
             p.start()
@@ -2203,74 +2350,42 @@ class ParallelMultiEnvTrainer:
         # 启动训练线程
         training_thread_obj = threading.Thread(
             target=training_thread,
-            args=(self.model_manager, self.env_queues, self.config, self.total_added_step, self.total_episodes_counter, self.current_buffer_size)
+            args=(
+                self.model_manager,
+                self.env_queues,
+                self.config,
+                self.total_added_step,
+                self.total_episodes_counter,
+                self.current_buffer_size,
+                self.round_done_counter,
+                self.current_round_ref,
+                self.phase_ref,
+                self.eval_target_ref,
+                self.eval_collected_lock,
+                self.eval_collected_ref,
+                self.global_stats,
+                self.env_target_dist_list,
+                self.max_steps,
+                self._check_and_save_best_model_by_eval_goal_rate,
+            )
         )
         training_thread_obj.daemon = True
         training_thread_obj.start()
         
         try:
-            last_checked_episode = 0  # 记录上次检查的episode编号，避免重复检查
-            while True:
-                # 检查训练线程是否还在运行
-                if not training_thread_obj.is_alive():
-                    break
-                
-                # 检查是否需要打印统计报告和评比最好模型
-                # 数据收集进程在每 report_every 个 episode 时设置标记，通知主进程
-                current_check_episode = self.check_best_model_ref.value
-                if current_check_episode > last_checked_episode:
-                    # 获取当前统计信息，传递资格检查参数
-                    stats = self.global_stats.get_statistics(
-                        eligibility_threshold=self.config.get('best_model_eligibility_threshold', 5.0),
-                        eligibility_ratio=self.config.get('best_model_eligibility_ratio', 0.8),
-                        report_every=self.config.get('report_every', 20),
-                        max_target_dist=self.config.get('max_target_dist', 15.0)
-                    )
-                    # 打印统计报告（主进程统一负责）
-                    _print_statistics_report(stats)
-                    # 检查并保存最好模型（内部会检查资格）
-                    self._check_and_save_best_model(stats)
-                    last_checked_episode = current_check_episode
-                
-                time.sleep(1)
-                
+            # 等待训练线程结束（周期性评估已在训练线程内部完成）
+            while training_thread_obj.is_alive():
+                time.sleep(0.1)
         except KeyboardInterrupt:
             print("\n收到中断信号，正在停止训练...")
-        
         finally:
-            # 如果需要评估阶段
-            total_eval_episodes = self.config.get('total_eval_episodes', 0)
+            # 不做“训练结束后一次性评估”的特殊处理；
+            # 若最后一轮训练结束时恰好触发周期性评估，则训练线程已完成评估并输出报告。
             if training_thread_obj.is_alive():
                 training_thread_obj.join(timeout=5)
 
-            if total_eval_episodes > 0:
-                print(f"训练完成，进入评估阶段，总计需要 {total_eval_episodes} 个episode")
-                # 先暂停收集进程，等待训练尾巴收敛
-                self.phase_ref.value = 2  # pause
-                pause_seconds = max(int(self.max_steps / 10), 1)
-                time.sleep(pause_seconds)
-
-                # 切换到评估阶段
-                self.phase_ref.value = 1
-                self.eval_collected_ref.value = 0
-                self.global_stats.reset()
-
-                # 等待评估完成
-                while True:
-                    with self.eval_collected_lock:
-                        current_eval = self.eval_collected_ref.value
-                    if current_eval >= total_eval_episodes:
-                        break
-                    time.sleep(0.5)
-
-                print("评估阶段完成，准备输出统计报告")
-                stats = self.global_stats.get_statistics(use_window=False)
-                _print_statistics_report(stats)
-            else:
-                print("训练完成，未配置评估阶段。")
-
             # 通知子进程退出
-            self.phase_ref.value = 3
+            self.phase_ref.value = PHASE_STOP
             # 清理进程
             for p in collect_processes:
                 if p.is_alive():
@@ -2282,7 +2397,7 @@ class ParallelMultiEnvTrainer:
             # 保存最终模型
             # 确保保存目录存在
             self.model_save_dir.mkdir(parents=True, exist_ok=True)
-            self.model.save(filename="SAC", directory=self.model_save_dir)
+            self.model.save(filename="SAC_final", directory=self.model_save_dir)
             print(f"最终模型已保存到 {self.model_save_dir}")
             
             # 清理临时文件
@@ -2322,10 +2437,8 @@ def parse_args():
     parser.add_argument('--max_steps_min', type=int, default=None, help='每Episode最小步数（覆盖配置文件）')
     parser.add_argument('--save_every', type=int, default=None, help='每多少次训练保存一次模型（覆盖配置文件）')
     parser.add_argument('--buffer_size', type=int, default=None, help='重放缓冲区大小（覆盖配置文件）')
-    parser.add_argument('--report_every', type=int, default=None, help='每多少个episode输出一次统计报告（覆盖配置文件）')
     parser.add_argument('--stats_window_size', type=int, default=None, help='统计窗口大小（覆盖配置文件）')
     parser.add_argument('--gpu_id', type=int, default=None, help='使用的GPU编号（覆盖配置文件）')
-    parser.add_argument('--total_eval_episodes', type=int, default=None, help='评估阶段采集的episode数量（覆盖配置文件）')
     
     # 环境参数（命令行参数可以覆盖配置文件）
     parser.add_argument('--max_velocity', type=float, default=None, help='最大速度（覆盖配置文件）')
@@ -2341,9 +2454,6 @@ def parse_args():
     parser.add_argument('--obs_min_dist', type=float, default=None, help='障碍物圆心最小距离（覆盖配置文件）')
     parser.add_argument('--obs_num', type=int, default=None, help='障碍物数量（覆盖配置文件）')
     
-    # 调试参数（命令行参数可以覆盖配置文件）
-    parser.add_argument('--is_code_debug', type=str, default=None, help='是否为调试代码（覆盖配置文件）')
-    
     # 模型参数（命令行参数可以覆盖配置文件）
     parser.add_argument('--model_save_dir', type=str, default=None, help='模型保存目录（覆盖配置文件）')
     parser.add_argument('--model_load_dir', type=str, default=None, help='模型加载目录（覆盖配置文件）')
@@ -2351,12 +2461,10 @@ def parse_args():
     
     # 并行训练参数（命令行参数可以覆盖配置文件）
     parser.add_argument('--max_training_count', type=int, default=None, help='最大训练次数（覆盖配置文件）')
-    parser.add_argument('--critic_loss_threshold', type=float, default=None, help='critic损失阈值（覆盖配置文件）')
     parser.add_argument('--actor_update_frequency', type=int, default=None, help='Actor网络更新频率（覆盖配置文件）')
     parser.add_argument('--critic_target_update_frequency', type=int, default=None, help='Critic目标网络更新频率（覆盖配置文件）')
     parser.add_argument('--hidden_layers', type=str, default=None, help='神经网络隐藏层结构（覆盖配置文件，JSON格式，例如：[1024,512]）')
     parser.add_argument('--avg_loss_window_size', type=int, default=None, help='平均损失计算窗口大小（覆盖配置文件，向后兼容参数名）')
-    parser.add_argument('--loss_window_size', type=int, default=None, help='训练损失窗口大小（覆盖配置文件）')
     
     # 算法参数（命令行参数可以覆盖配置文件）
     parser.add_argument('--action_dim', type=int, default=None, help='动作维度（覆盖配置文件）')
@@ -2375,7 +2483,6 @@ def parse_args():
     
     # 时间控制参数（命令行参数可以覆盖配置文件）
     parser.add_argument('--step_sleep_time', type=float, default=None, help='step方法中的sleep时间（覆盖配置文件）')
-    parser.add_argument('--eval_sleep_time', type=float, default=None, help='eval方法中的sleep时间（覆盖配置文件）')
     parser.add_argument('--reset_step_count', type=int, default=None, help='reset方法中调用step的次数（覆盖配置文件）')
     
     # 动作噪声参数（命令行参数可以覆盖配置文件）
@@ -2390,14 +2497,22 @@ def main():
     mp.set_start_method('spawn', force=True)
     
     args = parse_args()
-    
-    # ==================== 加载配置文件 ====================
-    config_path_env = os.environ.get('MULTI_ENV_TRAIN_CONFIG_PATH', args.config)
-    config = load_config(config_path_env)
+
+    # ==================== 加载配置文件（仅从 train.yaml 读取参数） ====================
+    config_path = args.config
+    config = load_config(config_path)
     
     # 获取实际使用的配置文件路径用于打印
-    actual_config_path = config_path_env if config_path_env else (Path(__file__).parent.parent.parent / "config" / "train.yaml")
+    actual_config_path = config_path if config_path else (Path(__file__).parent.parent.parent / "config" / "train.yaml")
     print(f"使用配置文件: {actual_config_path}")
+    
+    # ==================== 设置TURTLEBOT3_MODEL ====================
+    # 从配置文件读取turtlebot3_model，用于指定世界模型文件
+    # 注意：此参数由启动脚本（start_multi_env_training.sh）设置到环境变量，launch文件会读取环境变量
+    # 这里读取并打印用于验证，确保配置正确
+    turtlebot3_model = config.get('turtlebot3_model', 'waffle')
+    print(f"TURTLEBOT3_MODEL: {turtlebot3_model} (用于加载世界文件: turtlebot3_drl/{turtlebot3_model}.model)")
+    print(f"机器人模型固定为: /root/DRL-Robot-Dog-Navigation/src/turtlebot3_simulations/turtlebot3_gazebo/models/turtlebot3_waffle/model.sdf")
 
     def parse_bool(val, default=True):
         if isinstance(val, bool):
@@ -2412,114 +2527,90 @@ def main():
                 return False
         return default
     
-    # ==================== 从配置文件读取参数（命令行参数优先） ====================
+    # ==================== 从配置文件读取参数（不再从命令行读取） ====================
     # 训练参数
-    num_envs = args.num_envs if args.num_envs is not None else config.get('num_envs', 4)
-    batch_size = args.batch_size if hasattr(args, 'batch_size') and args.batch_size is not None else config.get('batch_size', 40)
-    training_iterations = args.training_iterations if hasattr(args, 'training_iterations') and args.training_iterations is not None else config.get('training_iterations', 200)
-    max_steps_ratio = args.max_steps_ratio if hasattr(args, 'max_steps_ratio') and args.max_steps_ratio is not None else config.get('max_steps_ratio', 0)
-    max_steps = args.max_steps if hasattr(args, 'max_steps') and args.max_steps is not None else config.get('max_steps', 300)
-    max_steps_min = args.max_steps_min if hasattr(args, 'max_steps_min') and args.max_steps_min is not None else config.get('max_steps_min', 50)
-    save_every = args.save_every if hasattr(args, 'save_every') and args.save_every is not None else config.get('save_every', 50)
-    buffer_size = args.buffer_size if hasattr(args, 'buffer_size') and args.buffer_size is not None else config.get('buffer_size', 50000)
-    base_report_every = args.report_every if hasattr(args, 'report_every') and args.report_every is not None else config.get('report_every', 20)
-    # report_every 由配置决定
-    report_every = base_report_every
-    # stats_window_size 始终与 report_every 保持一致，忽略配置文件中的 stats_window_size
-    stats_window_size = report_every
-    # 如果配置文件中显式设置了 stats_window_size，发出警告
-    if config.get('stats_window_size') is not None and config.get('stats_window_size') != report_every:
-        print(f"警告: 配置文件中的 stats_window_size ({config.get('stats_window_size')}) 将被忽略，将使用 report_every ({report_every}) 的值")
-    max_training_count = args.max_training_count if hasattr(args, 'max_training_count') and args.max_training_count is not None else config.get('max_training_count', 1000)
-    total_eval_episodes = args.total_eval_episodes if hasattr(args, 'total_eval_episodes') and args.total_eval_episodes is not None else config.get('total_eval_episodes', 0)
+    num_envs = config.get('num_envs', 4)
+    batch_size = config.get('batch_size', 40)
+    training_iterations = config.get('training_iterations', 200)
+    train_n_per_step = config.get('train_n_per_step', 1.0)
+    collection_wait_ratio = config.get('collection_wait_ratio', 0.8)
+    min_collection_ratio = config.get('min_collection_ratio', 0.25)
+    max_steps_ratio = config.get('max_steps_ratio', 0)
+    max_steps = config.get('max_steps', 300)
+    max_steps_min = config.get('max_steps_min', 50)
+    save_every = config.get('save_every', 50)
+    buffer_size = config.get('buffer_size', 50000)
+    stats_window_size = config.get('stats_window_size', 20)
+    max_training_count = config.get('max_training_count', 1000)
+    max_rounds = config.get('max_rounds', max_training_count)
     
     # 机器人和环境参数
-    max_velocity = args.max_velocity if hasattr(args, 'max_velocity') and args.max_velocity is not None else config.get('max_velocity', 1.0)
+    max_velocity = config.get('max_velocity', 1.0)
     max_acceleration = config.get('max_acceleration', 5.0)
     max_deceleration = config.get('max_deceleration', -5.0)
-    neglect_angle = args.neglect_angle if hasattr(args, 'neglect_angle') and args.neglect_angle is not None else config.get('neglect_angle', 0)
-    max_yawrate = args.max_yawrate if hasattr(args, 'max_yawrate') and args.max_yawrate is not None else config.get('max_yawrate', 20.0)
-    scan_range = args.scan_range if hasattr(args, 'scan_range') and args.scan_range is not None else config.get('scan_range', 5)
-    max_target_dist = args.max_target_dist if hasattr(args, 'max_target_dist') and args.max_target_dist is not None else config.get('max_target_dist', 15.0)
-    init_target_distance = args.init_target_distance if hasattr(args, 'init_target_distance') and args.init_target_distance is not None else config.get('init_target_distance', 2.0)
-    target_dist_increase = args.target_dist_increase if hasattr(args, 'target_dist_increase') and args.target_dist_increase is not None else config.get('target_dist_increase', 0.01)
-    target_reached_delta = args.target_reached_delta if hasattr(args, 'target_reached_delta') and args.target_reached_delta is not None else config.get('target_reached_delta', 0.3)
-    collision_delta = args.collision_delta if hasattr(args, 'collision_delta') and args.collision_delta is not None else config.get('collision_delta', 0.25)
-    world_size = args.world_size if hasattr(args, 'world_size') and args.world_size is not None else config.get('world_size', 15)
+    neglect_angle = config.get('neglect_angle', 0)
+    max_yawrate = config.get('max_yawrate', 20.0)
+    scan_range = config.get('scan_range', 5)
+    localization_noise_stddev = config.get('localization_noise_stddev', 0.0)
+    max_target_dist = config.get('max_target_dist', 15.0)
+    init_target_distance = config.get('init_target_distance', 2.0)
+    target_dist_increase = config.get('target_dist_increase', 0.01)
+    target_reached_delta = config.get('target_reached_delta', 0.3)
+    collision_delta = config.get('collision_delta', 0.25)
+    world_size = config.get('world_size', 15)
     goals_per_map = config.get('goals_per_map', 4)
-    obs_min_dist = args.obs_min_dist if hasattr(args, 'obs_min_dist') and args.obs_min_dist is not None else config.get('obs_min_dist', 2)
-    obs_num = args.obs_num if hasattr(args, 'obs_num') and args.obs_num is not None else config.get('obs_num', 20)
+    obs_min_dist = config.get('obs_min_dist', 2)
+    obs_num = config.get('obs_num', 20)
     costmap_resolution = config.get('costmap_resolution', 0.3)
     obstacle_size = config.get('obstacle_size', 0.3)
     obs_distribution_mode = config.get('obs_distribution_mode', 'uniform')
     
-    # 模型参数
+    # 模型参数（仅来自配置文件）
     base_state_dim = config.get('base_state_dim', 25)
     state_history_steps = config.get('state_history_steps', 0)
+    action_dim = config.get('action_dim', 2)
+    max_action = config.get('max_action', 1.0)
+    gpu_id = config.get('gpu_id', 0)
     
-    # 动态计算state_dim（始终从base_state_dim计算，不再从配置文件读取state_dim）
-    if state_history_steps > 0:
-        state_dim = base_state_dim * (1 + state_history_steps)
-        print(f"启用历史state模式: base_state_dim={base_state_dim}, state_history_steps={state_history_steps}, 最终state_dim={state_dim}")
-    else:
-        state_dim = base_state_dim
-        print(f"未启用历史state模式: state_dim={state_dim}")
+    # 网络结构参数（仅来自配置文件）
+    hidden_layers = config.get('hidden_layers', [1024, 512])
     
-    action_dim = args.action_dim if hasattr(args, 'action_dim') and args.action_dim is not None else config.get('action_dim', 2)
-    max_action = args.max_action if hasattr(args, 'max_action') and args.max_action is not None else config.get('max_action', 1.0)
-    gpu_id = args.gpu_id if hasattr(args, 'gpu_id') and args.gpu_id is not None else config.get('gpu_id', 0)
-    
-    # 网络结构参数
-    if hasattr(args, 'hidden_layers') and args.hidden_layers is not None and args.hidden_layers.strip() != '':
-        try:
-            hidden_layers = json.loads(args.hidden_layers)
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"警告: 无法解析 --hidden_layers 参数 '{args.hidden_layers}'，使用配置文件中的值。错误: {e}")
-            hidden_layers = config.get('hidden_layers', [1024, 512])
-    else:
-        hidden_layers = config.get('hidden_layers', [1024, 512])
-    
-    # 训练算法参数
+    # 训练算法参数（仅来自配置文件）
     discount_factor = config.get('discount_factor', 0.99)  # 折扣因子（gamma），从配置文件 train.yaml 读取，统一用于计算总回报和所有 Reward Detail 分项的折扣回报
-    critic_loss_threshold = args.critic_loss_threshold if hasattr(args, 'critic_loss_threshold') and args.critic_loss_threshold is not None else config.get('critic_loss_threshold', 100.0)
-    actor_update_frequency = args.actor_update_frequency if hasattr(args, 'actor_update_frequency') and args.actor_update_frequency is not None else config.get('actor_update_frequency', 1)
-    critic_target_update_frequency = args.critic_target_update_frequency if hasattr(args, 'critic_target_update_frequency') and args.critic_target_update_frequency is not None else config.get('critic_target_update_frequency', 4)
-    # 支持向后兼容：优先使用loss_window_size，如果没有则使用avg_loss_window_size
-    loss_window_size = config.get('loss_window_size', None) or config.get('avg_loss_window_size', 10)
-    # 命令行参数可以覆盖配置文件
-    if hasattr(args, 'loss_window_size') and args.loss_window_size is not None:
-        loss_window_size = args.loss_window_size
-    elif hasattr(args, 'avg_loss_window_size') and args.avg_loss_window_size is not None:
-        loss_window_size = args.avg_loss_window_size
-    # 为了向后兼容，同时设置avg_loss_window_size
-    avg_loss_window_size = loss_window_size
+    actor_update_frequency = config.get('actor_update_frequency', 1)
+    critic_target_update_frequency = config.get('critic_target_update_frequency', 4)
+    # 平均损失窗口大小（向后兼容参数名 avg_loss_window_size）
+    avg_loss_window_size = config.get('avg_loss_window_size', 10)
     
-    # 路径参数（只允许通过命令行参数指定模型保存目录，不再从配置文件读取）
-    model_save_dir = args.model_save_dir if hasattr(args, 'model_save_dir') and args.model_save_dir is not None else None
+    # 路径参数（仅来自配置文件）
+    model_save_dir = config.get('model_save_dir', None)
     # 优先使用 load_path，如果没有则使用 model_load_dir（向后兼容）
-    model_load_dir = args.model_load_dir if hasattr(args, 'model_load_dir') and args.model_load_dir is not None else config.get('load_path', config.get('model_load_dir', None))
+    model_load_dir = config.get('load_path', config.get('model_load_dir', None))
     # 优先使用 load_model，如果没有则使用 load_existing_model（向后兼容）
-    load_model_str = args.load_model if hasattr(args, 'load_model') and args.load_model is not None else config.get('load_model', config.get('load_existing_model', True))
-    load_model = load_model_str if isinstance(load_model_str, bool) else load_model_str.lower() == 'true'
+    load_model_str = config.get('load_model', config.get('load_existing_model', True))
+    load_model = load_model_str if isinstance(load_model_str, bool) else str(load_model_str).lower() == 'true'
     
-    # 奖励函数参数（从 train.yaml 读取，兼容旧字段名）
-    goal_reward = args.goal_reward if hasattr(args, 'goal_reward') and args.goal_reward is not None else config.get('goal_reward', 1000.0)
-    base_collision_penalty = args.base_collision_penalty if hasattr(args, 'base_collision_penalty') and args.base_collision_penalty is not None else config.get('collision_penalty_base', config.get('base_collision_penalty', -1000.0))
-    angle_base_penalty = args.angle_base_penalty if hasattr(args, 'angle_base_penalty') and args.angle_base_penalty is not None else config.get('angle_penalty_base', config.get('angle_base_penalty', 0.0))
-    base_linear_penalty = args.base_linear_penalty if hasattr(args, 'base_linear_penalty') and args.base_linear_penalty is not None else config.get('linear_penalty_base', config.get('base_linear_penalty', -1.0))
+    # 奖励函数参数（仅来自 train.yaml，兼容旧字段名）
+    goal_reward = config.get('goal_reward', 1000.0)
+    base_collision_penalty = config.get('collision_penalty_base', config.get('base_collision_penalty', -1000.0))
+    angle_base_penalty = config.get('angle_penalty_base', config.get('angle_base_penalty', 0.0))
+    base_linear_penalty = config.get('linear_penalty_base', config.get('base_linear_penalty', -1.0))
     yawrate_penalty_base = config.get('yawrate_penalty_base', 0.0)
     enable_obs_penalty = parse_bool(config.get('enable_obs_penalty', True), True)
     enable_yawrate_penalty = parse_bool(config.get('enable_yawrate_penalty', True), True)
     enable_angle_penalty = parse_bool(config.get('enable_angle_penalty', True), True)
     enable_linear_penalty = parse_bool(config.get('enable_linear_penalty', True), True)
+    enable_step_penalty = parse_bool(config.get('enable_step_penalty', False), False)
     enable_target_distance_penalty = parse_bool(config.get('enable_target_distance_penalty', False), False)
+    enable_progress_reward = parse_bool(config.get('enable_progress_reward', False), False)
     enable_linear_acceleration_oscillation_penalty = parse_bool(config.get('enable_linear_acceleration_oscillation_penalty', False), False)
     enable_yawrate_oscillation_penalty = parse_bool(config.get('enable_yawrate_oscillation_penalty', False), False)
+    progress_reward_base = config.get('progress_reward_base', 1.0)
     
     # 障碍物距离惩罚参数
-    obs_penalty_threshold = args.obs_penalty_threshold if hasattr(args, 'obs_penalty_threshold') and args.obs_penalty_threshold is not None else config.get('obs_penalty_threshold', 1.0)
-    obs_penalty_base = args.obs_penalty_base if hasattr(args, 'obs_penalty_base') and args.obs_penalty_base is not None else config.get('obs_penalty_base', -10.0)
-    obs_penalty_power = args.obs_penalty_power if hasattr(args, 'obs_penalty_power') and args.obs_penalty_power is not None else config.get('obs_penalty_power', 2.0)
+    obs_penalty_threshold = config.get('obs_penalty_threshold', 1.0)
+    obs_penalty_base = config.get('obs_penalty_base', -10.0)
+    obs_penalty_power = config.get('obs_penalty_power', 2.0)
     min_obs_penalty_threshold = config.get('min_obs_penalty_threshold', 0.5)
     obs_penalty_high_weight = config.get('obs_penalty_high_weight', 1.0)
     obs_penalty_low_weight = config.get('obs_penalty_low_weight', 0.4)
@@ -2527,6 +2618,8 @@ def main():
     
     # 终点距离惩罚参数
     target_distance_penalty_base = config.get('target_distance_penalty_base', -1.0)
+    # 时间步惩罚参数
+    step_penalty_base = config.get('step_penalty_base', 0.0)
     
     # 震荡惩罚参数
     linear_acceleration_oscillation_penalty_base = config.get('linear_acceleration_oscillation_penalty_base', -1.0)
@@ -2537,126 +2630,28 @@ def main():
     
     # 时间控制参数
     sim_time = config.get('sim_time', 0.1)
-    step_sleep_time = args.step_sleep_time if hasattr(args, 'step_sleep_time') and args.step_sleep_time is not None else config.get('step_sleep_time', 0.1)
-    eval_sleep_time = args.eval_sleep_time if hasattr(args, 'eval_sleep_time') and args.eval_sleep_time is not None else config.get('eval_sleep_time', 1.0)
-    reset_step_count = args.reset_step_count if hasattr(args, 'reset_step_count') and args.reset_step_count is not None else config.get('reset_step_count', 3)
+    step_sleep_time = config.get('step_sleep_time', 0.1)
+    reset_step_count = config.get('reset_step_count', 3)
     
     # 动作噪声参数
-    action_noise_std = args.action_noise_std if hasattr(args, 'action_noise_std') and args.action_noise_std is not None else config.get('action_noise_std', 0.2)
-    
-    # 调试参数
-    is_code_debug_str = args.is_code_debug if hasattr(args, 'is_code_debug') else config.get('is_code_debug', False)
-    is_code_debug = is_code_debug_str if isinstance(is_code_debug_str, bool) else is_code_debug_str.lower() == 'true'
-    reward_debug = config.get('reward_debug', False)
+    action_noise_std = config.get('action_noise_std', 0.2)
     
     # 连通区域选择参数（仅来自配置文件）
     region_select_bias = config.get('region_select_bias', 1.0)
     
     # 最好模型评比资格检查参数（仅来自配置文件）
-    best_model_eligibility_threshold = config.get('best_model_eligibility_threshold', 5.0)
-    best_model_eligibility_ratio = config.get('best_model_eligibility_ratio', 0.8)
     
     # 多环境训练参数（仅来自配置文件）
     enable_weight_consistency_check = parse_bool(config.get('enable_weight_consistency_check', False), False)
     
     # 缓冲区参数（仅来自配置文件）
-    use_float64_for_buffer = parse_bool(config.get('use_float64_for_buffer', False), False)
     
-    # ==================== 日志目录与模型保存目录同步 ====================
-    # 若外部脚本提供了 LOG_DIR，则将实时模型保存目录固定为：
-    #   LOG_DIR/model
-    # 这样可以保证：
-    #   /log/multi_env_training/train_YYYYmmdd_HHMMSS/model        —— 实时模型
-    #   /log/multi_env_training/train_YYYYmmdd_HHMMSS/best_model   —— 最好模型
-    log_dir_env_main = os.environ.get('LOG_DIR', None)
-    if log_dir_env_main:
-        model_save_dir = str(Path(log_dir_env_main) / "model")
-        # 同时更新config中的model_save_dir，供训练线程等直接使用
-        config['model_save_dir'] = model_save_dir
-    
-    # 创建训练器
-    trainer = ParallelMultiEnvTrainer(
-        num_envs=num_envs,
-        batch_size=batch_size,
-        training_iterations=training_iterations,
-        max_steps_ratio=max_steps_ratio,
-        max_steps=max_steps,
-        max_steps_min=max_steps_min,
-        save_every=save_every,
-        buffer_size=buffer_size,
-        report_every=report_every,
-        max_velocity=max_velocity,
-        neglect_angle=neglect_angle,
-        max_yawrate=max_yawrate,
-        scan_range=scan_range,
-        max_target_dist=max_target_dist,
-        init_target_distance=init_target_distance,
-        target_dist_increase=target_dist_increase,
-        target_reached_delta=target_reached_delta,
-        collision_delta=collision_delta,
-        world_size=world_size,
-        goals_per_map=goals_per_map,
-        obs_min_dist=obs_min_dist,
-        obs_num=obs_num,
-        costmap_resolution=costmap_resolution,
-        obstacle_size=obstacle_size,
-        obs_distribution_mode=obs_distribution_mode,
-        max_acceleration=max_acceleration,
-        max_deceleration=max_deceleration,
-        region_select_bias=region_select_bias,
-        enable_weight_consistency_check=enable_weight_consistency_check,
-        use_float64_for_buffer=use_float64_for_buffer,
-        is_code_debug=is_code_debug,
-        base_state_dim=base_state_dim,  # 添加base_state_dim参数
-        state_history_steps=state_history_steps,  # 添加state_history_steps参数
-        action_dim=action_dim,
-        max_action=max_action,
-        model_save_dir=model_save_dir,
-        model_load_dir=model_load_dir,
-        load_model=load_model,
-        max_training_count=max_training_count,
-        stats_window_size=stats_window_size,
-        gpu_id=gpu_id,
-        critic_loss_threshold=critic_loss_threshold,
-        actor_update_frequency=actor_update_frequency,
-        critic_target_update_frequency=critic_target_update_frequency,
-        hidden_layers=hidden_layers,
-        avg_loss_window_size=avg_loss_window_size,
-        goal_reward=goal_reward,
-        base_collision_penalty=base_collision_penalty,
-        angle_base_penalty=angle_base_penalty,
-        base_linear_penalty=base_linear_penalty,
-        yawrate_penalty_base=yawrate_penalty_base,
-        enable_obs_penalty=enable_obs_penalty,
-        enable_yawrate_penalty=enable_yawrate_penalty,
-        enable_angle_penalty=enable_angle_penalty,
-        enable_linear_penalty=enable_linear_penalty,
-        enable_target_distance_penalty=enable_target_distance_penalty,
-        enable_linear_acceleration_oscillation_penalty=enable_linear_acceleration_oscillation_penalty,
-        enable_yawrate_oscillation_penalty=enable_yawrate_oscillation_penalty,
-        obs_penalty_threshold=obs_penalty_threshold,
-        obs_penalty_base=obs_penalty_base,
-        obs_penalty_power=obs_penalty_power,
-        min_obs_penalty_threshold=min_obs_penalty_threshold,
-        obs_penalty_high_weight=obs_penalty_high_weight,
-        obs_penalty_low_weight=obs_penalty_low_weight,
-        obs_penalty_middle_ratio=obs_penalty_middle_ratio,
-        target_distance_penalty_base=target_distance_penalty_base,
-        linear_acceleration_oscillation_penalty_base=linear_acceleration_oscillation_penalty_base,
-        yawrate_oscillation_penalty_base=yawrate_oscillation_penalty_base,
-        sim_time=sim_time,
-        step_sleep_time=step_sleep_time,
-        eval_sleep_time=eval_sleep_time,
-        reset_step_count=reset_step_count,
-        action_noise_std=action_noise_std,
-        reward_debug=reward_debug,
-        total_eval_episodes=total_eval_episodes,
-        config_path=actual_config_path,
-        best_model_eligibility_threshold=best_model_eligibility_threshold,
-        best_model_eligibility_ratio=best_model_eligibility_ratio,
-        discount_factor=discount_factor,
-        reward_scale=reward_scale,  # 奖励缩放因子
-    )
+    # 日志目录由 ParallelMultiEnvTrainer 内部统一处理：
+    # - 使用环境变量 TRAINING_TIMESTAMP（由 start_multi_env_training.sh 在创建日志目录时导出）
+    # - 若未设置则 fallback 为当前时间
+    # - 目录结构：<multi_env_log_model_dir>/train_<timestamp>/{model,best_model,...}
+    # 创建训练器：仅传递配置字典，所有派生/计算参数在 ParallelMultiEnvTrainer 内部完成
+    trainer = ParallelMultiEnvTrainer(config=config, config_path=actual_config_path)
     
     # 开始训练
     trainer.run_training()

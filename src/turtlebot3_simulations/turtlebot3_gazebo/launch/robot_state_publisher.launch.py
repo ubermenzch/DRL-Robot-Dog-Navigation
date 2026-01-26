@@ -26,12 +26,27 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    TURTLEBOT3_MODEL = os.environ["TURTLEBOT3_MODEL"]
+    # ==================== 机器人模型说明 ====================
+    # 机器人模型固定为 waffle（TURTLEBOT3_MODEL 用于世界文件，不用于机器人模型）
+    # - Gazebo中实际使用的机器人SDF模型固定为：
+    #   /root/DRL-Robot-Dog-Navigation/src/turtlebot3_simulations/turtlebot3_gazebo/models/turtlebot3_waffle/model.sdf
+    #   此模型在世界文件中通过 <uri>model://turtlebot3_waffle</uri> 引用
+    # - robot_state_publisher 使用URDF文件来发布TF变换（用于ROS2节点通信）
+    #   如果环境变量 TURTLEBOT3_ROBOT_MODEL 存在则使用它，否则默认使用 waffle
+    TURTLEBOT3_ROBOT_MODEL = os.environ.get("TURTLEBOT3_ROBOT_MODEL", "waffle")
+    TURTLEBOT3_MODEL = os.environ.get("TURTLEBOT3_MODEL", "未设置")
 
     use_sim_time = LaunchConfiguration("use_sim_time", default="false")
-    urdf_file_name = "turtlebot3_" + TURTLEBOT3_MODEL + ".urdf"
+    urdf_file_name = "turtlebot3_" + TURTLEBOT3_ROBOT_MODEL + ".urdf"
 
-    print("urdf_file_name : {}".format(urdf_file_name))
+    # 调试信息：打印环境变量值，确保使用正确的机器人模型
+    print("=" * 60)
+    print("robot_state_publisher 环境变量检查:")
+    print("  TURTLEBOT3_MODEL (世界文件): {}".format(TURTLEBOT3_MODEL))
+    print("  TURTLEBOT3_ROBOT_MODEL (机器人模型): {}".format(TURTLEBOT3_ROBOT_MODEL))
+    print("  urdf_file_name: {}".format(urdf_file_name))
+    print("=" * 60)
+    print("机器人SDF模型固定为: /root/DRL-Robot-Dog-Navigation/src/turtlebot3_simulations/turtlebot3_gazebo/models/turtlebot3_waffle/model.sdf")
 
     urdf = os.path.join(
         get_package_share_directory("turtlebot3_description"), "urdf", urdf_file_name

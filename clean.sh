@@ -213,6 +213,27 @@ rm -f "$TMP_DIR"/start_gazebo_env_*.sh \
 # 清理评估脚本目录
 [ -d "$TMP_DIR/eval_scripts" ] && rm -rf "$TMP_DIR/eval_scripts" 2>/dev/null || true
 
+# 清理tmp目录下的所有临时文件和目录（包括模型同步临时目录等）
+if [ -d "$TMP_DIR" ]; then
+    echo "  清理tmp目录下的临时文件..."
+    # 清理 sac_model_sync_* 临时目录（模型同步临时目录）
+    shopt -s nullglob
+    for dir in "$TMP_DIR"/sac_model_sync_*; do
+        if [ -d "$dir" ]; then
+            echo "    删除临时目录: $dir"
+            rm -rf "$dir" 2>/dev/null || true
+        fi
+    done
+    shopt -u nullglob
+    
+    # 清理其他所有临时文件和目录（进程已停止，可以安全清理）
+    # 注意：上面已经单独处理了PID文件和特定脚本文件，这里清理可能遗留的其他临时内容
+    # 清理所有临时目录（除了 eval_scripts，已在上面单独处理）
+    find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d ! -name "eval_scripts" -exec rm -rf {} + 2>/dev/null || true
+    # 清理所有临时文件（上面已经清理了特定的脚本、日志和PID文件，这里清理其他遗留文件）
+    find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type f -delete 2>/dev/null || true
+fi
+
 # 清理ROS2共享内存段
 if [ -d "/dev/shm" ]; then
     echo "  清理ROS2共享内存段..."

@@ -1,4 +1,5 @@
 import time
+from datetime import datetime
 import rclpy
 from ros_nodes import (
     ScanSubscriber,
@@ -41,21 +42,24 @@ class ROS_env:
         obstacle_size=0.3,       # 障碍物在 costmap 中的等效边长（米，默认为正方形）
         # 机器人参数
         max_velocity=1.0,  # 线速度最大值（用于惩罚归一化）
+        localization_noise_stddev=0.0,  # 定位噪声标准差（米）
         # 奖励函数参数
         goal_reward=1000.0,  # 到达目标的奖励
         collision_penalty_base=-1000.0,  # 碰撞惩罚系数
         angle_penalty_base=0.0,  # 角度偏差基础惩罚
         linear_penalty_base=-1.0,  # 线速度基础惩罚
         yawrate_penalty_base=0.0,  # 角速度惩罚系数（负值惩罚，0为关闭效果）
+        enable_progress_reward=False,  # 是否启用进度奖惩
+        progress_reward_base=1.0,  # 进度奖惩基础系数
         # 奖励/惩罚开关
         enable_obs_penalty=True,  # 是否启用障碍物距离惩罚
         enable_yawrate_penalty=True,  # 是否启用角速度惩罚
         enable_angle_penalty=True,  # 是否启用角度偏移惩罚
         enable_linear_penalty=True,  # 是否启用线速度惩罚
+        enable_step_penalty=False,  # 是否启用时间步常数惩罚
         enable_target_distance_penalty=False,  # 是否启用终点距离惩罚
         enable_linear_acceleration_oscillation_penalty=False,  # 是否启用线速度加速度震荡惩罚
         enable_yawrate_oscillation_penalty=False,  # 是否启用角速度震荡惩罚
-        reward_debug=False,  # 是否打印奖励/惩罚明细
         # 障碍物距离惩罚参数
         obs_penalty_threshold=1.0,  # 障碍物距离惩罚阈值（米），低于此值开始惩罚；设为-1时根据速度自动计算（|v| * sim_time）
         min_obs_penalty_threshold=0.5,  # 动态计算阈值时的最小阈值下限，避免阈值过小
@@ -66,6 +70,8 @@ class ROS_env:
         obs_penalty_middle_ratio=0.4,  # 中间高权重区域比例（0-1）
         # 终点距离惩罚参数
         target_distance_penalty_base=-1.0,  # 终点距离惩罚基础系数（负值表示惩罚）
+        # 时间步惩罚参数
+        step_penalty_base=0.0,  # 每个step的固定惩罚（负值为惩罚，0为关闭效果）
         # 震荡惩罚参数
         linear_acceleration_oscillation_penalty_base=-1.0,  # 线速度加速度震荡惩罚基础系数（负值表示惩罚）
         yawrate_oscillation_penalty_base=-1.0,  # 角速度震荡惩罚基础系数（负值表示惩罚）
@@ -76,10 +82,11 @@ class ROS_env:
         # 时间控制参数
         sim_time=0.1,  # 仿真步长，用于基于速度的动态阈值等
         step_sleep_time=0.1,  # step方法中的sleep时间（秒）
-        eval_sleep_time=1.0,  # eval方法中的sleep时间（秒）
         reset_step_count=3,  # reset方法中调用step的次数
         # 地图复用参数
-        goals_per_map=1  # 每张地图的目标点数量（即一张地图可以用来产生多少个episode）
+        goals_per_map=1,  # 每张地图的目标点数量（即一张地图可以用来产生多少个episode）
+        # 调试参数
+        is_debug=False  # 是否为调试模式
     ):
         # 记录初始化阶段步骤，便于定位卡点
         def _log(msg):
@@ -90,17 +97,20 @@ class ROS_env:
         # _log("初始化 rclpy ...")
         rclpy.init(args=args)
         # _log("rclpy 初始化完成，开始创建ROS接口...")
+        # 预先保存 scan_range，以便下方 SensorSubscriber 使用
+        self.scan_range = scan_range
         self.env_id = env_id
         self.cmd_vel_publisher = CmdVelPublisher(env_id)
-        self.scan_subscriber = ScanSubscriber(env_id)
-        self.odom_subscriber = OdomSubscriber(env_id)
         self.robot_state_publisher = SetModelStateClient(env_id)
         self.world_reset = ResetWorldClient(env_id)
         self.physics_client = PhysicsClient(env_id)
         self.publish_target = MarkerPublisher(env_id)
         self.goal_model_client = GoalModelClient(env_id)
-        self.element_positions = []
-        self.sensor_subscriber = SensorSubscriber(env_id)
+        self.sensor_subscriber = SensorSubscriber(
+            env_id,
+            scan_range=self.scan_range,
+            localization_noise_stddev=localization_noise_stddev,
+        )
         self.target_dist = init_target_distance
         self.target_dist_increase = target_dist_increase
         self.max_target_dist = max_target_dist
@@ -124,9 +134,8 @@ class ROS_env:
         self.grid_width = int(np.ceil(self.world_size / self.costmap_resolution))
         self.grid_height = int(np.ceil(self.world_size / self.costmap_resolution))
         self.costmap = None  # 后续按需初始化
-        # 障碍物仅先在内存中记录（位置+朝向），确认 costmap 成功后再一次性写入 Gazebo
-        self.obstacle_positions = []  # 单独记录障碍物圆心，用于构建 costmap
-        self.obstacle_angles = []     # 与 obstacle_positions 对应的朝向
+        # 障碍物位姿缓存：每个元素为 [x, y, yaw]，用于 costmap 和写回 Gazebo
+        self.obstacle_poses = []  # [[x, y, yaw], ...]
         self.max_velocity = max_velocity
         self.target = None
         self.episode_start_position = None  # 记录每个episode开始时的机器人位置
@@ -137,15 +146,17 @@ class ROS_env:
         self.angle_penalty_base = angle_penalty_base
         self.linear_penalty_base = linear_penalty_base
         self.yawrate_penalty_base = yawrate_penalty_base
+        self.enable_progress_reward = enable_progress_reward
+        self.progress_reward_base = progress_reward_base
         # 奖励/惩罚开关
         self.enable_obs_penalty = enable_obs_penalty
         self.enable_yawrate_penalty = enable_yawrate_penalty
         self.enable_angle_penalty = enable_angle_penalty
         self.enable_linear_penalty = enable_linear_penalty
+        self.enable_step_penalty = enable_step_penalty
         self.enable_target_distance_penalty = enable_target_distance_penalty
         self.enable_linear_acceleration_oscillation_penalty = enable_linear_acceleration_oscillation_penalty
         self.enable_yawrate_oscillation_penalty = enable_yawrate_oscillation_penalty
-        self.reward_debug = reward_debug
         # 障碍物距离惩罚参数
         self.obs_penalty_threshold = obs_penalty_threshold
         self.obs_penalty_base = obs_penalty_base
@@ -157,6 +168,8 @@ class ROS_env:
         self.obs_penalty_middle_ratio = np.clip(obs_penalty_middle_ratio, 0.0, 1.0)
         # 终点距离惩罚参数
         self.target_distance_penalty_base = target_distance_penalty_base
+        # 时间步惩罚参数
+        self.step_penalty_base = step_penalty_base
         # 震荡惩罚参数
         self.linear_acceleration_oscillation_penalty_base = linear_acceleration_oscillation_penalty_base
         self.yawrate_oscillation_penalty_base = yawrate_oscillation_penalty_base
@@ -166,42 +179,41 @@ class ROS_env:
         self.prev_linear_velocity = None
         self.prev_angular_velocity = None
         self.prev_linear_acceleration = None
+        # 记录上一step与终点的距离（用于进度奖惩计算）
+        self.prev_distance_to_goal = None
         # 连通区域选择概率（内部按 [0,1] 裁剪）
         self.region_select_bias = region_select_bias
         # 时间控制参数
         self.sim_time = sim_time
         self.step_sleep_time = step_sleep_time
-        self.eval_sleep_time = eval_sleep_time
         self.reset_step_count = reset_step_count
         # 地图复用参数
         self.goals_per_map = goals_per_map
         self.goals_count_for_current_map = 0  # 当前地图已使用的目标点数量
+        self.generated_map_count = 0  # 已生成的地图数量（仅在真正重新生成地图时递增）
+        # 调试参数
+        self.is_debug = is_debug
         # 奖励分解统计（按 episode 累积）
         # _log("ROS接口与参数初始化完成，准备reset...")
         self.reset_episode_reward_breakdown()
         # for i in range(60):
         #     self.step(empty_step=True)
-        print(f"环境 {self.env_id} ROS环境变量赋值完成，开始reset地图...")
-        self.reset()
+        print(f"环境 {self.env_id} ROS环境初始化完成")
+        # self.reset()
         # _log("环境初始化完成")
 
     def reset_episode_reward_breakdown(self):
         """重置当前 episode 的奖励分解统计"""
-        self.episode_obs_penalty = 0.0
-        self.episode_yawrate_penalty = 0.0
-        self.episode_angle_penalty = 0.0
-        self.episode_linear_penalty = 0.0
-        self.episode_target_distance_penalty = 0.0
-        self.episode_linear_acceleration_oscillation_penalty = 0.0
-        self.episode_yawrate_oscillation_penalty = 0.0
-        self.episode_goal_reward = 0.0
-        self.episode_collision_penalty = 0.0
-        # 标记本 episode 是否已经发生过碰撞（用于保证碰撞惩罚每个 episode 只记一次）
-        self._has_collision_this_episode = False
+        # 记录“本step”的奖励分量（供训练侧直接读取，避免用episode累计值做差分）
+        # 结构：
+        #   self.last_step_reward_parts = {"raw": {...}, "scaled": {...}}
+        # raw：缩放前；scaled：乘以 reward_scale 后
+        self.last_step_reward_parts = {"raw": {}, "scaled": {}}
         # 重置上一step的记录（用于震荡惩罚计算）
         self.prev_linear_velocity = None
         self.prev_angular_velocity = None
         self.prev_linear_acceleration = None
+
 
     def step(self, lin_velocity=0.0, ang_velocity=0.0, empty_step=False):
         """执行一步仿真；empty_step=True 时仅发送零速度指令，不采样传感器或计算奖励。"""
@@ -210,9 +222,9 @@ class ROS_env:
             time.sleep(self.step_sleep_time)
             return None, None, None, None, False, False, [0.0, 0.0], 0.0
 
-        self.step_count+=1
         self.cmd_vel_publisher.publish_cmd_vel(lin_velocity, ang_velocity)
         # 物理模拟的unpause/pause现在在episode级别控制，不在每个step中控制
+        self.step_count+=1
         time.sleep(self.step_sleep_time)
         rclpy.spin_once(self.sensor_subscriber)
 
@@ -220,32 +232,70 @@ class ROS_env:
             latest_scan,
             latest_position,
             latest_orientation,
+            current_linear_velocity,
+            current_angular_velocity,
+            _position_raw,  # 忽略未添加噪声的position（训练时使用添加噪声的）
         ) = self.sensor_subscriber.get_latest_sensor()
+        # 等待直到收到有效的雷达数据（或超时）
         if latest_scan is None:
-            # 创建默认激光数据（360个点，距离10米）
-            print(f"[ROS_env {self.env_id}] No laser scan data received, using default values.")
-            latest_scan = [self.collision_delta+0.5] * 180
+            max_wait_sec = 2.0
+            wait_start = time.time()
+            while latest_scan is None and (time.time() - wait_start) < max_wait_sec:
+                rclpy.spin_once(self.sensor_subscriber, timeout_sec=0.1)
+                (
+                    latest_scan,
+                    latest_position,
+                    latest_orientation,
+                    current_linear_velocity,
+                    current_angular_velocity,
+                    _position_raw,  # 忽略未添加噪声的position（训练时使用添加噪声的）
+                ) = self.sensor_subscriber.get_latest_sensor()
+            if latest_scan is None:
+                raise RuntimeError(
+                    f"[ROS_env {self.env_id}] No laser scan data received after {max_wait_sec}s. "
+                    f"Please check /scan topic and Gazebo sensor plugins."
+                )
         latest_scan = np.array(latest_scan) 
         # print("latest_scan_len:",len(latest_scan))
         # 裁剪掉忽略的视野
         neglect_scan = int(np.ceil((self.neglect_angle/180)*len(latest_scan)))
         latest_scan = latest_scan[neglect_scan:len(latest_scan)-neglect_scan]
-        latest_scan[latest_scan > self.scan_range] = self.scan_range # 把所有距离超过scan_range的值修改为scan_range
         #print(f" Laser scan data: {latest_scan}")
         distance, cos, sin, _ = self.get_dist_sincos(
             latest_position, latest_orientation
         )
+        # 若初始化prev_distance_to_goal为None，则用当前距离初始化
+        if self.prev_distance_to_goal is None:
+            self.prev_distance_to_goal = distance
         collision = self.check_collision(latest_scan)
         goal = self.check_target(distance, collision)
         action = [lin_velocity, ang_velocity]
         reward = self.get_reward(goal, collision, action, latest_scan,distance,cos,sin)
 
-        return latest_scan, distance, cos, sin, collision, goal, action, reward
+        # 在 step 中统一更新上一距离，用于下一步的进度奖惩计算
+        if np.isfinite(distance):
+            # 若之前未初始化，则直接用当前距离作为起点；否则也更新为当前距离
+            self.prev_distance_to_goal = distance
+
+        return (
+            latest_scan,
+            distance,
+            cos,
+            sin,
+            collision,
+            goal,
+            action,
+            reward,
+            float(current_linear_velocity),
+            float(current_angular_velocity),
+        )
 
     def _find_best_robot_target_combination(self, region_mask):
         """在给定的连通区域内一次性尝试所有可能的机器人-目标位置组合，找到满足距离约束的组合
         
-        策略：收集所有满足距离约束的组合，找到距离最远的那些组合，然后从中随机选择一个
+        优化策略：
+        1. 使用采样策略避免在超大区域中遍历所有组合
+        2. 直接计算世界坐标距离进行判断
         
         Args:
             region_mask: 连通区域的mask（bool数组）
@@ -255,26 +305,59 @@ class ROS_env:
         """
         indices = np.argwhere(region_mask)
         if indices.size == 0:
+            if self.is_debug:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                print(f"{timestamp} [DEBUG] [环境 {self.env_id}] _find_best_robot_target_combination: 区域内没有有效索引")
             return None, None
         
         min_dist = self.target_reached_delta + 0.1
         max_dist = self.target_dist
         
+        if self.is_debug:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f"{timestamp} [DEBUG] [环境 {self.env_id}] _find_best_robot_target_combination: 开始搜索，区域内有效格点数={len(indices)}, "
+                  f"距离约束=[{min_dist:.2f}, {max_dist:.2f}]m")
+        
         # 收集所有满足距离约束的组合
         valid_combinations = []
         
-        # 遍历所有可能的机器人位置
-        for ridx in range(len(indices)):
+        # 如果区域太大，使用采样策略而不是完全遍历
+        max_samples = 20  # 最大采样组合数，避免在超大区域中搜索过久
+        total_combinations = len(indices) * len(indices)
+        use_sampling = len(indices) > max_samples
+        
+        if use_sampling:
+            # 采样策略：随机选择机器人位置，对每个机器人位置尝试所有可能的目标位置
+            # 采样数量随indices增大而增大，确保在大区域中也能充分采样
+            num_robot_samples = min(len(indices), max_samples)
+            robot_indices = np.random.choice(len(indices), size=num_robot_samples, replace=False)
+            if self.is_debug:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                print(f"{timestamp} [DEBUG] [环境 {self.env_id}] _find_best_robot_target_combination: "
+                      f"区域过大（{total_combinations}个组合），使用采样策略，随机选择{num_robot_samples}个机器人位置")
+        else:
+            robot_indices = range(len(indices))
+        
+        # 遍历选定的机器人位置
+        for ridx in robot_indices:
             ry, rx = indices[ridx]
+            
+            if self.is_debug and not use_sampling:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                print(f"{timestamp} [DEBUG] [环境 {self.env_id}] _find_best_robot_target_combination: "
+                      f"处理机器人位置 [{ridx+1}/{len(indices)}] - 网格=({rx}, {ry})")
+            
             robot_x, robot_y = self._grid_to_world_center(rx, ry)
             
             # 对于当前机器人位置，遍历所有可能的目标位置
             for tidx in range(len(indices)):
                 ty, tx = indices[tidx]
+                
+                # 计算世界坐标距离
                 target_x_center, target_y_center = self._grid_to_world_center(tx, ty)
                 dist = np.linalg.norm([target_x_center - robot_x, target_y_center - robot_y])
                 
-                # 检查距离约束
+                # 距离检查
                 if min_dist <= dist <= max_dist:
                     valid_combinations.append({
                         'robot_pos': (robot_x, robot_y),
@@ -283,6 +366,9 @@ class ROS_env:
                     })
         
         if len(valid_combinations) == 0:
+            if self.is_debug:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                print(f"{timestamp} [DEBUG] [环境 {self.env_id}] _find_best_robot_target_combination: 未找到满足距离约束的组合")
             return None, None
         
         # 找到最大距离
@@ -291,12 +377,30 @@ class ROS_env:
         # 筛选出距离等于最大距离的所有组合（最远的组合）
         farthest_combinations = [combo for combo in valid_combinations if combo['dist'] == max_distance]
         
+        if self.is_debug:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f"{timestamp} [DEBUG] [环境 {self.env_id}] _find_best_robot_target_combination: "
+                  f"找到{len(valid_combinations)}个有效组合，最大距离={max_distance:.2f}m, "
+                  f"最远组合数={len(farthest_combinations)}")
+        
         # 从最远的组合中随机选择一个
         selected = farthest_combinations[np.random.randint(len(farthest_combinations))]
+        
+        if self.is_debug:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f"{timestamp} [DEBUG] [环境 {self.env_id}] _find_best_robot_target_combination: "
+                  f"选中组合 - 机器人位置=({selected['robot_pos'][0]:.2f}, {selected['robot_pos'][1]:.2f}), "
+                  f"目标网格=({selected['target_grid'][0]}, {selected['target_grid'][1]}), "
+                  f"距离={selected['dist']:.2f}m")
         
         # 在选定的格子的范围内随机生成终点位置
         tx, ty = selected['target_grid']
         target_x, target_y = self._grid_to_world_random(tx, ty)
+        
+        if self.is_debug:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f"{timestamp} [DEBUG] [环境 {self.env_id}] _find_best_robot_target_combination: "
+                  f"最终目标位置=({target_x:.2f}, {target_y:.2f})")
         
         return selected['robot_pos'], (target_x, target_y)
 
@@ -308,8 +412,6 @@ class ROS_env:
         2. 以region_select_bias概率选择最大连通区域，否则随机选择其他连通区域
         3. 在选定的连通区域内一次性尝试所有可能的机器人-目标位置组合，找到满足距离约束的最佳组合
         """
-        # 基于当前障碍物重新构建costmap
-        self._build_costmap_from_obstacles()
         
         # 重新选择连通区域（以region_select_bias概率选择最大连通区域）
         region_mask = self._find_largest_free_region()
@@ -318,10 +420,17 @@ class ROS_env:
             return False
         
         # 一次性尝试所有可能的机器人-目标位置组合
+        if self.is_debug:
+            print(f"[DEBUG] [环境 {self.env_id}] reset_with_current_map: 开始查找最佳机器人-目标位置组合")
         robot_pos, target_pos = self._find_best_robot_target_combination(region_mask)
         
         if robot_pos is None or target_pos is None:
+            if self.is_debug:
+                print(f"[DEBUG] [环境 {self.env_id}] reset_with_current_map: 未找到有效的机器人-目标位置组合，返回False")
             return False
+        
+        if self.is_debug:
+            print(f"[DEBUG] [环境 {self.env_id}] reset_with_current_map: 成功找到机器人位置={robot_pos}, 目标位置={target_pos}")
         
         # 设置机器人位置
         rx, ry = robot_pos
@@ -332,15 +441,74 @@ class ROS_env:
         self.episode_start_position = [rx, ry]
         self.target = [tx, ty]
         
-        # 更新元素位置：障碍物 + 机器人 + 目标（障碍物位置不变）
-        self.element_positions = list(self.obstacle_positions) + [
-            self.episode_start_position,
-            self.target,
-        ]
-        
         return True
 
     def reset(self):
+        self.world_reset.reset_world()
+        # time.sleep(self.step_sleep_time*25)
+        # 使用 repeated empty_step + IMU / 里程计数据，确保机器人完全静止且姿态与地面水平
+        settle_start_time = time.time()
+        max_settle_time = 5.0  # 防止极端情况下死循环
+        robot_settled = False
+        while not robot_settled:
+            # 发送零速度指令，让机器人逐渐停稳
+            self.step(lin_velocity=0.0, ang_velocity=0.0, empty_step=True)
+
+            # 更新一次传感器数据（包含 LaserScan / Odom / IMU）
+            rclpy.spin_once(self.sensor_subscriber, timeout_sec=0.1)
+            (
+                latest_scan,
+                latest_position,
+                latest_orientation,
+                current_linear_velocity,
+                current_angular_velocity,
+                _position_raw,
+            ) = self.sensor_subscriber.get_latest_sensor()
+
+            # 从 IMU 读取线加速度、角速度和姿态
+            imu_lin_acc = getattr(self.sensor_subscriber, "latest_imu_linear_acc", None)
+            imu_ang_vel = getattr(self.sensor_subscriber, "latest_imu_angular_vel", None)
+            imu_orientation = getattr(self.sensor_subscriber, "latest_imu_orientation", None)
+
+            # 传感器数据尚未准备好，继续等待
+            if (
+                latest_scan is None
+                or latest_position is None
+                or latest_orientation is None
+                or imu_lin_acc is None
+                or imu_ang_vel is None
+                or imu_orientation is None
+            ):
+                if time.time() - settle_start_time > max_settle_time:
+                    # 传感器长时间无数据，直接跳出，避免卡死
+                    break
+                continue
+
+            # 由 IMU 姿态计算 roll / pitch，用于判断相机视角是否与地面近似水平
+            imu_quat = Quaternion(
+                imu_orientation.w,
+                imu_orientation.x,
+                imu_orientation.y,
+                imu_orientation.z,
+            )
+            roll, pitch, _ = imu_quat.to_euler(degrees=False)
+
+            # 线速度、角速度阈值（由里程计给出）
+            lin_vel_ok = abs(current_linear_velocity) < 1e-3
+            ang_vel_ok = abs(current_angular_velocity) < 1e-3
+
+            # 线加速度阈值：这里只考虑水平分量，近似认为无额外水平加速度即为静止
+            lin_acc_xy = math.hypot(float(imu_lin_acc.x), float(imu_lin_acc.y))
+            lin_acc_ok = lin_acc_xy < 1e-2
+
+            # 姿态接近水平：roll / pitch 足够小
+            attitude_ok = abs(roll) < 0.02 and abs(pitch) < 0.02
+
+            robot_settled =  lin_vel_ok and ang_vel_ok and lin_acc_ok and attitude_ok
+
+            if time.time() - settle_start_time > max_settle_time:
+                # 超时兜底，避免在极端情况下无限等待
+                break
         # print(f"环境 {env_id} 开始reset地图")
         # 根据goals_per_map参数决定是否重新生成地图
         should_regenerate_map = False
@@ -357,88 +525,138 @@ class ROS_env:
                 # 达到数量，需要重新生成地图
                 should_regenerate_map = True
         
+        # reset 开头统一 reset_world()（见函数开头）
+        # 若要生成新地图：仅生成新障碍物位置 -> 更新 costmap
         if should_regenerate_map:
-            # 重新生成地图（包括障碍物、机器人和目标）
-            self.world_reset.reset_world()
-            position_set = self.set_positions()
-            while not position_set:
-                position_set = self.set_positions()
+            map_ready = self.generate_and_set_obstacles()
+            while not map_ready:
+                map_ready = self.generate_and_set_obstacles()
+
+            # 统计已生成地图数量（仅在重新生成地图时递增）
+            self.generated_map_count += 1
             # 重新生成地图后，这是新地图的第1个目标点
             self.goals_count_for_current_map = 1
         else:
-            # 当前地图还未达到goals_per_map个终点，必须继续使用当前地图
-            # 重新选择连通区域（以region_select_bias概率选择最大连通区域），
-            # 并在选定的连通区域内重新采样机器人和目标位置
-            reset_success = self.reset_with_current_map()
-            if not reset_success:
-                # 如果重置失败，说明当前地图确实无法继续使用
-                # 但为了满足goals_per_map的要求，我们强制重新生成地图并重置计数器
-                # 这种情况应该很少发生，如果频繁发生，说明地图生成逻辑有问题
-                print(f"[WARNING] reset_with_current_map failed for map with {self.goals_count_for_current_map}/{self.goals_per_map} goals. "
-                      f"Forcing map regeneration (this violates goals_per_map requirement for current map).")
-                self.world_reset.reset_world()
-                position_set = self.set_positions()
-                while not position_set:
-                    position_set = self.set_positions()
-                # 重新生成地图后，这是新地图的第1个目标点
+            # 不重新生成地图：reset_world() 会把 Gazebo 中的障碍物恢复到初始位姿
+            # 这里用缓存的 obstacle_poses 重新设置一次障碍物，
+            # 等效于“地图不变”，只是把 Gazebo 世界恢复到当前地图状态
+            self.apply_obstacle_poses_to_gazebo()
+
+        # 若不生成新地图：不做任何操作（沿用当前 costmap / 障碍物）
+        # 然后统一根据当前 costmap 生成机器人和终点
+        spawn_ok = self._spawn_robot_and_target_from_current_costmap()
+        if not spawn_ok:
+            # 极端情况：当前 costmap 无法找到合格的机器人-终点组合（或 costmap 丢失）
+            # 强制重新生成地图（这可能打破 goals_per_map 的“同图多目标”设定，但应非常少见）
+            print(
+                f"[WARNING] spawn_robot_and_target_from_current_costmap failed for map with "
+                f"{self.goals_count_for_current_map}/{self.goals_per_map} goals. "
+                f"Forcing map regeneration."
+            )
+            map_ready = self.generate_and_set_obstacles()
+            while not map_ready:
+                map_ready = self.generate_and_set_obstacles()
+            self.generated_map_count += 1
+            self.goals_count_for_current_map = 1
+            spawn_ok = self._spawn_robot_and_target_from_current_costmap()
+
+        if not spawn_ok:
+            # 如果这里仍失败，说明地图生成/采样逻辑存在系统性问题
+            raise RuntimeError("reset(): failed to spawn robot and target after forced regeneration")
+
+        self.prev_distance_to_goal = None
+
+        # 第一次真实采样机器人状态，若发生碰撞则重新采样机器人和终点位置
+        max_spawn_retry = 5
+        retry_count = 0
+        while True:
+            (
+                latest_scan,
+                distance,
+                cos,
+                sin,
+                collision,
+                goal,
+                last_action,
+                reward,
+                current_linear_velocity,
+                current_angular_velocity,
+            ) = self.step(lin_velocity=0.0, ang_velocity=0.0, empty_step=False)
+
+            # 无碰撞，认为当前位置可用
+            if not collision:
+                break
+
+            # 若发生碰撞，则重新在当前 costmap 中采样机器人与终点位置
+            retry_count += 1
+            if retry_count > max_spawn_retry:
+                # 多次尝试仍失败，重新生成地图并重新采样
+                map_ready = self.generate_and_set_obstacles()
+                while not map_ready:
+                    map_ready = self.generate_and_set_obstacles()
+                self.generated_map_count += 1
                 self.goals_count_for_current_map = 1
+                spawn_ok = self._spawn_robot_and_target_from_current_costmap()
+                if not spawn_ok:
+                    raise RuntimeError(
+                        "reset(): failed to spawn robot and target after map regeneration in collision-retry loop"
+                    )
+                # 重置重试计数，继续在新地图上进行一次真实采样
+                retry_count = 0
             else:
-                # 成功重置机器人和目标位置，增加当前地图的目标点计数
-                self.goals_count_for_current_map += 1
+                # 在同一张地图上重新采样机器人与终点
+                spawn_ok = self._spawn_robot_and_target_from_current_costmap()
+                if not spawn_ok:
+                    # 若在当前地图上重新采样失败，则立即重新生成地图
+                    map_ready = self.generate_and_set_obstacles()
+                    while not map_ready:
+                        map_ready = self.generate_and_set_obstacles()
+                    self.generated_map_count += 1
+                    self.goals_count_for_current_map = 1
+                    should_regenerate_map=True
+                    spawn_ok = self._spawn_robot_and_target_from_current_costmap()
+                    if not spawn_ok:
+                        raise RuntimeError(
+                            "reset(): failed to spawn robot and target after forced regeneration in collision-retry loop"
+                        )
+                    # 在新地图上重新开始碰撞检测循环
+                    retry_count = 0
+            # 每次重新放置机器人后，需要清零上一距离，用新的真实采样结果作为 episode 起点
+            self.prev_distance_to_goal = None
+        # time.sleep(self.step_sleep_time*5)
+        # 如果当前地图还未达到goals_per_map个终点，且本次没有重新生成地图，则本次是“同图新目标”
+        if not should_regenerate_map:
+            self.goals_count_for_current_map += 1
 
-        self.publish_target.publish(self.target[0], self.target[1])
-        # 在Gazebo中设置目标圆柱体位置（高度0.1，中心0.05，底面贴地，对应 waffle.model 中 goal_cylinder）
-        self.goal_model_client.set_goal_position(self.target[0], self.target[1], z=0.05)
-        # 确保服务调用完成
-        rclpy.spin_once(self.goal_model_client, timeout_sec=0.1)
-        time.sleep(1)  # 短暂延迟，确保Gazebo处理位置设置
-        
-        # 要调用多次step，否则会因为gazebo加载等相关问题引发的错误
-        # 前几次仅发送0速度，不采样传感器，避免产生无意义奖励
-        for _ in range(max(1, self.reset_step_count)):
-            self.step(empty_step=True)
-
-        # 再进行一次真实的零速采样，确保返回有效观测，避免上层len()报错
-        latest_scan, distance, cos, sin, collision, goal, last_action, reward = self.step(
-            lin_velocity=0.0, ang_velocity=0.0, empty_step=False
-        )
         # 记录episode开始时的终点距离（用于终点距离惩罚计算）
-        if self.episode_start_position is not None and self.target is not None:
-            self.initial_target_distance = np.linalg.norm([
-                self.target[0] - self.episode_start_position[0],
-                self.target[1] - self.episode_start_position[1]
-            ])
-        else:
-            self.initial_target_distance = distance  # 如果无法计算，使用当前距离作为初始距离
+        # 直接使用step返回的distance，这是实际观测到的初始距离（可能包含定位噪声）
+        self.initial_target_distance = distance
         
         # 采样后重置计步，保证新episode从0开始计数
         self.step_count = 0
         # 重置阶段可能因为初始位置接近目标/障碍导致奖励被计入，出于公平性将奖励分解清零
         self.reset_episode_reward_breakdown()
         # print(f"环境 {env_id} reset地图完成")
-        return latest_scan, distance, cos, sin, collision, goal, last_action, reward
+        # 这里返回的第 5 个布尔量在 reset 阶段已经通过 IMU + Scan 做过稳定性与碰撞检测，
+        # 对于训练阶段，只保留 collision 标志即可，为保持接口结构，此处复用 collision 字段。
+        return (
+            latest_scan,
+            distance,
+            cos,
+            sin,
+            collision,
+            goal,
+            last_action,
+            reward,
+            float(current_linear_velocity),
+            float(current_angular_velocity),
+        )
 
-    def set_target_position(self, robot_position):
-        pos = False
-        while not pos:
-            # 使用极坐标采样，确保实际距离在 [target_reached_delta, target_dist] 范围内
-            # 采样角度（0到2π）
-            theta = np.random.uniform(0, 2 * np.pi)
-            # 采样距离：为了避免终点离机器人太近，这里改为在
-            # [max(target_dist-1, target_reached_delta+0.1), target_dist] 范围内均匀采样
-            r_min = max(self.target_reached_delta + 0.1, self.target_dist - 1.0)
-            r = np.random.uniform(r_min, self.target_dist)
-            # 转换为笛卡尔坐标
-            dist_x = r * np.cos(theta)
-            dist_y = r * np.sin(theta)
-            x = robot_position[0] + dist_x
-            y = robot_position[1] + dist_y
-            pos = self.check_position(x, y, self.obs_min_dist)
-        self.element_positions.append([x, y])
-        return [x, y]
 
-    def set_random_position(self, name):
-        """根据配置选择障碍物生成方式：均匀分布或随机分布
+    def generate_obstacle_pose(self, name):
+        """根据配置选择障碍物生成方式（仅生成障碍物位姿，不写入 Gazebo）：
+        - 均匀分布（默认）
+        - 随机分布（obs_distribution_mode=\"random\"）
 
         注意：会使用 obs_min_dist 约束障碍物之间的最小圆心距离。
         """
@@ -464,9 +682,9 @@ class ROS_env:
             if not self.candidate_points:
                 break
                 
-            # 选择离已有障碍物最远的点
-            if self.element_positions:
-                existing_points = np.array(self.element_positions)
+            # 选择离已有障碍物最远的点（只考虑障碍物，不包含机器人/终点）
+            if self.obstacle_poses:
+                existing_points = np.array([[p[0], p[1]] for p in self.obstacle_poses])
                 candidate_array = np.array(self.candidate_points)
                 
                 # 计算所有候选点到最近已有障碍物的距离
@@ -480,12 +698,10 @@ class ROS_env:
                 idx = np.random.randint(len(self.candidate_points))
                 x, y = self.candidate_points.pop(idx)
             
-            # 使用 obs_min_dist 约束：保证当前候选点与已有元素的最小圆心距离不小于 obs_min_dist
+            # 使用 obs_min_dist 约束：保证当前候选点与已有障碍物的最小圆心距离不小于 obs_min_dist
             if self.check_position(x, y, self.obs_min_dist):
                 # 只在内存中记录障碍物信息，暂不写入 Gazebo
-                self.element_positions.append([x, y])
-                self.obstacle_positions.append([x, y])
-                self.obstacle_angles.append(angle)
+                self.obstacle_poses.append([x, y, angle])
                 return True
             
             attempts += 1
@@ -556,8 +772,8 @@ class ROS_env:
     def _build_costmap_from_obstacles(self):
         """由当前障碍物圆心列表构建 costmap"""
         self._init_costmap()
-        for pos in self.obstacle_positions:
-            self._mark_obstacle_on_costmap(pos[0], pos[1])
+        for x, y, _yaw in self.obstacle_poses:
+            self._mark_obstacle_on_costmap(x, y)
 
     def _log_costmap(self, region_mask=None, robot_pos=None, target_pos=None):
         """
@@ -822,22 +1038,9 @@ class ROS_env:
             # 使用 obs_min_dist 约束障碍物之间的最小圆心距离
             if self.check_position(x, y, self.obs_min_dist):
                 # 只在内存中记录障碍物信息，暂不写入 Gazebo
-                self.element_positions.append([x, y])
-                self.obstacle_positions.append([x, y])
-                self.obstacle_angles.append(angle)
+                self.obstacle_poses.append([x, y, angle])
                 return True
         return False
-
-    def set_robot_position(self):
-        bias = self.world_size/2 # 机器人生成位置偏移范围（-1是安全阈值，避免机器人生成在围墙上）
-        angle = np.random.uniform(-np.pi, np.pi)
-        pos = False
-        while not pos:
-            x = np.random.uniform(-bias, bias)
-            y = np.random.uniform(-bias, bias)
-            pos = self.check_position(x, y, self.obs_min_dist)
-        self.set_position("turtlebot3_waffle", x, y, angle)
-        return x, y
 
     def set_position(self, name, x, y, angle):
         quaternion = Quaternion.from_euler(0.0, 0.0, angle)
@@ -858,108 +1061,106 @@ class ROS_env:
         success = self.robot_state_publisher.set_state(name, pose)
         return success
 
-    def set_spawn_and_target_position(self):
+    def generate_and_set_obstacles(self):
         """
-        使用 costmap 逻辑：
-        1) 由障碍物构建 costmap
-        2) 以region_select_bias概率选择最大连通区域，否则随机选择其他连通区域
-        3) 在该区域内采样机器人和目标位置（满足距离约束）
-        """
-        # 基于当前障碍物圆心构建 costmap
-        self._build_costmap_from_obstacles()
-        region_mask = self._find_largest_free_region()
-
-        if region_mask is None or not region_mask.any():
-            # 无可用连通区域，直接失败
-            self._log_costmap(region_mask, None, None)
-            return False
-
-        # 一次性尝试所有可能的机器人-目标位置组合
-        robot_pos, target_pos = self._find_best_robot_target_combination(region_mask)
+        生成障碍物位姿、更新 costmap，并将障碍物位姿写入 Gazebo。
         
-        if robot_pos is None or target_pos is None:
-            # 未找到满足条件的组合，打印 costmap 并返回失败
+        功能：
+        1) 生成障碍物位姿（保存到 self.obstacle_poses）
+        2) 基于障碍物更新 costmap，并校验存在可用自由连通区域
+        3) 根据当前缓存的障碍物位姿，将障碍物设置到 Gazebo
+        
+        返回：
+            bool: 成功返回 True，失败返回 False
+        """
+        # 1) 生成障碍物位姿（仅记录到内存）
+        self.generate_obstacle_poses()
+
+        # 2) 基于当前障碍物圆心构建 costmap
+        self._build_costmap_from_obstacles()
+
+        # 3) 轻量校验：必须存在可用连通自由区域
+        region_mask = self._find_largest_free_region()
+        if region_mask is None or not region_mask.any():
             self._log_costmap(region_mask, None, None)
             return False
 
-        # 使用找到的最佳组合
+        # 4) 将障碍物位姿真正写入 Gazebo
+        self.apply_obstacle_poses_to_gazebo()
+
+        # 当前仅维护障碍物位姿；距离约束统一基于 obstacle_poses 计算
+        return True
+
+    def generate_obstacle_poses(self):
+        """生成障碍物位姿（仅更新内存中的缓存，不写入 Gazebo）。"""
+        # 清空之前的障碍物数据
+        self.obstacle_poses = []
+
+        # 确保每次重新生成均匀候选点（均匀分布模式依赖）
+        if hasattr(self, "candidate_points"):
+            delattr(self, "candidate_points")
+
+        # 生成障碍物位姿（generate_obstacle_pose 会写入 obstacle_poses）
+        for i in range(0, self.obs_num):
+            name = "obstacle" + str(i + 1)
+            # 如果设置失败（例如实体不存在），就跳过该障碍物
+            if not self.generate_obstacle_pose(name):
+                continue
+
+    def apply_obstacle_poses_to_gazebo(self):
+        """根据当前缓存的障碍物位姿数组，将障碍物位置实际写入 Gazebo。"""
+        for idx, (ox, oy, oang) in enumerate(self.obstacle_poses):
+            name = f"obstacle{idx+1}"
+            if not self.set_position(name, ox, oy, oang):
+                print(f"[costmap][warn] final set_position failed for {name}")
+    def _spawn_robot_and_target_from_current_costmap(self):
+        """基于当前 costmap 生成机器人和终点（不改变障碍物）。"""
+        # costmap 可能在某些情况下丢失/未构建，这里兜底重建一次
+        if getattr(self, "costmap", None) is None:
+            self._build_costmap_from_obstacles()
+
+        region_mask = self._find_largest_free_region()
+        if region_mask is None or not region_mask.any():
+            self._log_costmap(region_mask, None, None)
+            return False
+
+        robot_pos, target_pos = self._find_best_robot_target_combination(region_mask)
+        if robot_pos is None or target_pos is None:
+            self._log_costmap(region_mask, None, None)
+            return False
+
         rx, ry = robot_pos
         tx, ty = target_pos
 
-        # ========== 到这里说明 costmap 方案已经确定成功 ==========
-        # 1) 先在 Gazebo 中真正设置所有障碍物位置
-        for idx, (ox, oy) in enumerate(self.obstacle_positions):
-            name = f"obstacle{idx+1}"
-            # 优先使用预先采样的角度，长度不够则随机一个
-            if idx < len(self.obstacle_angles):
-                oang = self.obstacle_angles[idx]
-            else:
-                oang = np.random.uniform(-np.pi, np.pi)
-            if not self.set_position(name, ox, oy, oang):
-                print(f"[costmap][warn] final set_position failed for {name}")
-
-        # 2) 再设置机器人初始位姿
         angle = np.random.uniform(-np.pi, np.pi)
         self.set_position("turtlebot3_waffle", rx, ry, angle)
 
         self.episode_start_position = [rx, ry]
         self.target = [tx, ty]
 
-        # 更新元素位置：障碍物 + 机器人 + 目标
-        self.element_positions = list(self.obstacle_positions) + [
-            self.episode_start_position,
-            self.target,
-        ]
+        # 终点位置在这里统一“实际设置”（发布 + Gazebo 模型位置）
+        self.publish_target.publish(self.target[0], self.target[1])
+        # 在Gazebo中设置目标圆柱体位置（高度0.1，中心0.05，底面贴地，对应 waffle.model 中 goal_cylinder）
+        self.goal_model_client.set_goal_position(self.target[0], self.target[1], z=0.05)
 
-        # 打印被采纳的 costmap 与机器人/目标位置
         self._log_costmap(region_mask, self.episode_start_position, self.target)
         return True
 
-    def set_positions(self):
+    def set_spawn_and_target_position(self):
         """
-        地图生成逻辑：
-        1) 先随机/均匀生成障碍物，记录障碍物中心点 self.obstacle_positions
-        2) 基于障碍物构建 costmap，并找到最大连通自由区域
-        3) 在该连通区域内生成机器人和终点位置（满足距离约束）
+        兼容旧调用：基于当前障碍物/地图，生成机器人和终点。
+        注意：障碍物/ costmap 的更新不在这里做（由 reset / set_positions 控制）。
         """
-        self.element_positions = []
-        self.obstacle_positions = []
-        # 确保每次重新生成均匀候选点
-        if hasattr(self, "candidate_points"):
-            delattr(self, "candidate_points")
-
-        max_attempts = 10  # 避免极端情况下无限循环
-        for attempt in range(max_attempts):
-            self.element_positions = []
-            self.obstacle_positions = []
-            if hasattr(self, "candidate_points"):
-                delattr(self, "candidate_points")
-
-            # 1) 先生成障碍物
-            for i in range(0, self.obs_num):
-                name = "obstacle" + str(i + 1)
-                # 尝试设置障碍物位置，如果实体不存在则跳过
-                if not self.set_random_position(name):
-                    # 如果设置位置失败（可能是实体不存在），跳过该障碍物
-                    continue
-
-            # 2&3) 基于 costmap 的机器人和目标点生成
-            if self.set_spawn_and_target_position():
-                return True
-
-            print(f"[costmap][warn] set_positions attempt {attempt+1}/{max_attempts} failed, retrying...")
-
-        print("[costmap][error] set_positions failed after max attempts, keep last state")
-        return False  # 仍返回False以示失败，但不会回退旧逻辑
+        return self._spawn_robot_and_target_from_current_costmap()
 
     def check_position(self, x, y, min_dist):
-        pos = True
-        for element in self.element_positions:
-            distance_vector = [element[0] - x, element[1] - y]
-            distance = np.linalg.norm(distance_vector)
-            if distance < min_dist:
-                pos = False
-        return pos
+        """检查给定位置与当前已生成障碍物之间的最小距离是否大于等于 min_dist。"""
+        for ox, oy, _yaw in self.obstacle_poses:
+            distance_vector = [ox - x, oy - y]
+            dist = np.linalg.norm(distance_vector)
+            if dist < min_dist:
+                return False
+        return True
 
     def check_collision(self, laser_scan):
         if min(laser_scan) < self.collision_delta:
@@ -999,30 +1200,122 @@ class ROS_env:
         return distance, cos, sin, angle
 
     def get_reward(self,goal, collision, action, laser_scan,distance, cos, sin):
+        # Debug helper (use is_debug, not reward_debug)
+        def _dbg(msg: str):
+            if getattr(self, "is_debug", False):
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                print(f"{timestamp} [DEBUG] [环境 {self.env_id}] get_reward: {msg}")
+        
+        scale = self.reward_scale
+
         if goal:
-            # return base_goal_reward*np.exp(-0.01 * self.step_count)  # 指数型奖励，用时越少奖励越高
-            #print(f"Reached goal in {self.step_count} steps.")
-            # 记录本 episode 的目标奖励（记录缩放后的值，以便与总reward一致）
-            self.episode_goal_reward += self.goal_reward * self.reward_scale
-            # 返回缩放后的奖励
-            return self.goal_reward * self.reward_scale
+            # 返回缩放后的奖励（不包含step_penalty）
+            goal_scaled = self.goal_reward * scale
+            total = goal_scaled
+            # 记录本step分量（raw+scaled）
+            self.last_step_reward_parts = {
+                "raw": {
+                    "goal": float(self.goal_reward),
+                    "collision": 0.0,
+                    "obs": 0.0,
+                    "yawrate": 0.0,
+                    "angle": 0.0,
+                    "linear": 0.0,
+                    "step_penalty": 0.0,
+                    "target_distance": 0.0,
+                    "progress": 0.0,
+                    "linear_acc_osc": 0.0,
+                    "yawrate_osc": 0.0,
+                },
+                "scaled": {
+                    "goal": float(goal_scaled),
+                    "collision": 0.0,
+                    "obs": 0.0,
+                    "yawrate": 0.0,
+                    "angle": 0.0,
+                    "linear": 0.0,
+                    "step_penalty": 0.0,
+                    "target_distance": 0.0,
+                    "progress": 0.0,
+                    "linear_acc_osc": 0.0,
+                    "yawrate_osc": 0.0,
+                },
+            }
+            _dbg(
+                f"GOAL=True step={self.step_count} "
+                f"distance={distance:.4f} cos={cos:.4f} sin={sin:.4f} "
+                f"action=[{action[0]:.3f},{action[1]:.3f}] "
+                f"goal_reward={self.goal_reward:.4f}/{goal_scaled:.4f} scale={scale:.3f} "
+                f"step_penalty=0.0000/0.0000 total={total:.4f}"
+            )
+            return total
         elif collision:
-            # 碰撞惩罚：每个 episode 只计算一次
-            if not getattr(self, "_has_collision_this_episode", False):
-                # 第一次碰撞：记录惩罚（记录缩放后的值，以便与总reward一致）
-                self._has_collision_this_episode = True
-                self.episode_collision_penalty += self.collision_penalty_base * self.reward_scale
-                # 返回缩放后的惩罚
-                return self.collision_penalty_base * self.reward_scale
-            else:
-                # 同一 episode 后续再次检测到 collision，不再重复扣分
-                return 0.0
+            # 碰撞：只给碰撞惩罚（不叠加时间步惩罚）
+            collision_scaled = self.collision_penalty_base * scale
+            total = collision_scaled
+            # 记录本step分量（raw+scaled）
+            self.last_step_reward_parts = {
+                "raw": {
+                    "goal": 0.0,
+                    "collision": float(self.collision_penalty_base),
+                    "obs": 0.0,
+                    "yawrate": 0.0,
+                    "angle": 0.0,
+                    "linear": 0.0,
+                    "step_penalty": 0.0,
+                    "target_distance": 0.0,
+                    "progress": 0.0,
+                    "linear_acc_osc": 0.0,
+                    "yawrate_osc": 0.0,
+                },
+                "scaled": {
+                    "goal": 0.0,
+                    "collision": float(collision_scaled),
+                    "obs": 0.0,
+                    "yawrate": 0.0,
+                    "angle": 0.0,
+                    "linear": 0.0,
+                    "step_penalty": 0.0,
+                    "target_distance": 0.0,
+                    "progress": 0.0,
+                    "linear_acc_osc": 0.0,
+                    "yawrate_osc": 0.0,
+                },
+            }
+            # 碰撞时必打印（定位训练崩坏/异常episode很有用）
+            laser_min = float(np.min(laser_scan)) if laser_scan is not None and len(laser_scan) > 0 else float("nan")
+            _dbg(
+                f"COLLISION=True step={self.step_count} "
+                f"distance={distance:.4f} laser_min={laser_min:.4f} "
+                f"action=[{action[0]:.3f},{action[1]:.3f}] "
+                f"collision_penalty={self.collision_penalty_base:.4f}/{collision_scaled:.4f} scale={scale:.3f} "
+                f"step_penalty=0.0000/0.0000 total={total:.4f}"
+            )
+            return total
         else:
-            # ================计算最近障碍物距离惩罚================
-            
+            step_penalty = self.step_penalty_base if self.enable_step_penalty else 0.0
+            # ================进度奖惩================
+            progress_reward = 0.0
+            delta_dist = None
+            if (
+                self.enable_progress_reward
+                and self.prev_distance_to_goal is not None
+                and np.isfinite(distance)
+                and np.isfinite(self.prev_distance_to_goal)
+            ):
+                denom = max(self.step_sleep_time * self.max_velocity, 1e-6)
+                delta_dist = self.prev_distance_to_goal - distance
+                progress_reward = self.progress_reward_base * (delta_dist / denom)
+            # ================时间步常数惩罚================
+            # ================计算障碍物距离惩罚================
             # 当最近障碍物距离低于阈值时，距离越接近0惩罚越大
             # 当distance >= threshold时，惩罚为0
             # 支持动态阈值：配置为-1时，阈值按|v| * sim_time计算
+            obs_penalty = 0.0
+            threshold = None
+            high_min = None
+            side_left_min = None
+            side_right_min = None
             if self.enable_obs_penalty:
                 # 获取最近障碍物距离（分段加权）
                 if self.obs_penalty_threshold < 0:
@@ -1063,34 +1356,27 @@ class ROS_env:
                 side_penalty = max(calc_penalty(side_left_min), calc_penalty(side_right_min)) * self.obs_penalty_low_weight
 
                 obs_penalty = high_penalty + side_penalty
-            else:
-                obs_penalty = 0.0
             # ================计算最近障碍物距离惩罚================ 
 
             # ================计算角速度惩罚================
+            yawrate_penalty = 0.0
             if self.enable_yawrate_penalty:
                 yawrate_penalty = self.yawrate_penalty_base * abs(action[1])
-            else:
-                yawrate_penalty = 0.0
             # ================计算角速度惩罚================
 
             # ================计算角度偏移惩罚================
-            # 计算当前角度（弧度）
-            # sin和cos是机器人朝向与目标方向夹角的正弦和余弦值
-            current_angle = math.atan2(sin, cos)
-            # 理想角度（正对目标点）为0，角度差就是current_angle的绝对值
-            # atan2已经将角度规范化到[-π, π]范围，直接取绝对值即可
-            angle_diff = abs(current_angle)
-            # 角度惩罚（角度差在0到π范围内）
-            # 将 (1 - cos(angle_diff)) 从 [0, 2] 归一化到 [0, 1]
+            angle_penalty = 0
             if self.enable_angle_penalty:
+                # atan2已经将角度规范化到[-π, π]范围，直接取绝对值即可
+                current_angle = math.atan2(sin, cos)
+                angle_diff = abs(current_angle)
+                # 将 (1 - cos(angle_diff)) 从 [0, 2] 归一化到 [0, 1]
                 normalized_angle_value = (1 - math.cos(angle_diff)) / 2.0
                 angle_penalty = self.angle_penalty_base * normalized_angle_value
-            else:
-                angle_penalty = 0
             # ================计算角度偏移惩罚==========================
 
             # ================线速度惩罚================
+            linear_penalty = 0
             if self.enable_linear_penalty:
                 # 线速度越接近最大速度，惩罚越小
                 # 将 action[0] 裁剪到 [0, max_velocity] 范围，然后归一化到 [0, 1]
@@ -1101,31 +1387,27 @@ class ROS_env:
                     # 如果 max_velocity 为 0，使用默认归一化值
                     normalized_value = 1.0 if action[0] <= 0 else 0.0
                 linear_penalty = self.linear_penalty_base * normalized_value
-            else:
-                linear_penalty = 0
             # ================线速度惩罚================
             
             # ================终点距离惩罚================
             # 根据当前终点距离/生成终点时的真实终点距离计算惩罚
             # 若当前终点距离为3，生成终点时的真实终点距离为6，则惩罚为3/6=0.5
             target_distance_penalty = 0.0
+            max_distane_ratio = 2.0
             if self.enable_target_distance_penalty and self.initial_target_distance is not None and self.initial_target_distance > 0:
                 # 检查distance是否为有效数值
                 if np.isfinite(distance) and distance >= 0:
                     # 限制distance的最大值，防止异常大值
-                    distance_clipped = min(distance, 50.0)
+                    distance_clipped = min(distance, 1000.0)
                     # 计算当前距离与初始距离的比值
                     distance_ratio = distance_clipped / max(self.initial_target_distance, 1.0)
                     # 限制distance_ratio的最大值，防止数值溢出（最大比值设为100）
-                    distance_ratio = min(distance_ratio, 1.0)
-                    # 惩罚 = base * 距离比值（距离越远，比值越大，惩罚越大）
-                    target_distance_penalty = self.target_distance_penalty_base * distance_ratio
+                    distance_ratio = min(distance_ratio, max_distane_ratio)
+                    # 惩罚 = base * 距离比值（距离越远，比值越大，惩罚越大）,通过除以max_distane_ratio来归一化
+                    target_distance_penalty = self.target_distance_penalty_base * distance_ratio / max_distane_ratio
                     # 最终检查：确保惩罚值是有限数值，防止NaN和inf
                     if not np.isfinite(target_distance_penalty):
                         target_distance_penalty = 0.0
-                else:
-                    # distance为NaN或inf时，不计算惩罚
-                    target_distance_penalty = 0.0
             # ================终点距离惩罚================
             
             # ================线速度加速度震荡惩罚================
@@ -1177,36 +1459,88 @@ class ROS_env:
                 self.prev_angular_velocity = current_angular_velocity
             # ================角速度震荡惩罚================
             
-            # 记录本 step 奖励分量到当前 episode 统计（记录缩放后的值，使各分量之和与实际使用的总 reward 对齐）
-            scale = self.reward_scale
-            self.episode_obs_penalty += obs_penalty * scale
-            self.episode_yawrate_penalty += yawrate_penalty * scale
-            self.episode_angle_penalty += angle_penalty * scale
-            self.episode_linear_penalty += linear_penalty * scale
-            self.episode_target_distance_penalty += target_distance_penalty * scale
-            self.episode_linear_acceleration_oscillation_penalty += linear_acceleration_oscillation_penalty * scale
-            self.episode_yawrate_oscillation_penalty += yawrate_oscillation_penalty * scale
-            if self.reward_debug:
-                parts = []
-                if self.enable_yawrate_penalty:
-                    parts.append(f"yawrate_penalty:{yawrate_penalty:.4f}")
-                if self.enable_obs_penalty:
-                    parts.append(f"obs_penalty:{obs_penalty:.4f}")
-                if self.enable_angle_penalty:
-                    parts.append(f"angle_penalty:{angle_penalty:.4f}")
-                if self.enable_linear_penalty:
-                    parts.append(f"linear_penalty:{linear_penalty:.4f}")
-                if self.enable_target_distance_penalty:
-                    parts.append(f"target_distance_penalty:{target_distance_penalty:.4f}")
-                if self.enable_linear_acceleration_oscillation_penalty:
-                    parts.append(f"linear_acc_osc_penalty:{linear_acceleration_oscillation_penalty:.4f}")
-                if self.enable_yawrate_oscillation_penalty:
-                    parts.append(f"yawrate_osc_penalty:{yawrate_oscillation_penalty:.4f}")
-                print(" | ".join(parts))
-            
-            # 计算所有惩罚项的总和，然后应用归一化
-            total_penalty = yawrate_penalty + obs_penalty + angle_penalty + linear_penalty + target_distance_penalty + linear_acceleration_oscillation_penalty + yawrate_oscillation_penalty
-            return total_penalty * self.reward_scale
+            # 记录本 step 奖励分量到当前 episode 统计（先各自缩放，再求和）
+            obs_penalty_scaled = obs_penalty * scale
+            yawrate_penalty_scaled = yawrate_penalty * scale
+            angle_penalty_scaled = angle_penalty * scale
+            linear_penalty_scaled = linear_penalty * scale
+            target_distance_penalty_scaled = target_distance_penalty * scale
+            linear_accel_osc_penalty_scaled = linear_acceleration_oscillation_penalty * scale
+            yawrate_osc_penalty_scaled = yawrate_oscillation_penalty * scale
+            progress_reward_scaled = progress_reward * scale
+            scaled_step_penalty = step_penalty * scale
+
+            # 记录本step分量（raw+scaled）：训练侧可直接读取，避免差分episode累计值
+            self.last_step_reward_parts = {
+                "raw": {
+                    "goal": 0.0,
+                    "collision": 0.0,
+                    "obs": float(obs_penalty),
+                    "yawrate": float(yawrate_penalty),
+                    "angle": float(angle_penalty),
+                    "linear": float(linear_penalty),
+                    "step_penalty": float(step_penalty),
+                    "target_distance": float(target_distance_penalty),
+                    "progress": float(progress_reward),
+                    "linear_acc_osc": float(linear_acceleration_oscillation_penalty),
+                    "yawrate_osc": float(yawrate_oscillation_penalty),
+                },
+                "scaled": {
+                    "goal": 0.0,
+                    "collision": 0.0,
+                    "obs": float(obs_penalty_scaled),
+                    "yawrate": float(yawrate_penalty_scaled),
+                    "angle": float(angle_penalty_scaled),
+                    "linear": float(linear_penalty_scaled),
+                    "step_penalty": float(scaled_step_penalty),
+                    "target_distance": float(target_distance_penalty_scaled),
+                    "progress": float(progress_reward_scaled),
+                    "linear_acc_osc": float(linear_accel_osc_penalty_scaled),
+                    "yawrate_osc": float(yawrate_osc_penalty_scaled),
+                },
+            }
+
+            # 计算所有惩罚项缩放后的总和（保证与各缩放分量之和完全一致）
+            total = (
+                yawrate_penalty_scaled
+                + obs_penalty_scaled
+                + angle_penalty_scaled
+                + linear_penalty_scaled
+                + scaled_step_penalty
+                + target_distance_penalty_scaled
+                + linear_accel_osc_penalty_scaled
+                + yawrate_osc_penalty_scaled
+                + progress_reward_scaled
+            )
+
+            # is_debug 调试输出：默认按步频节流，异常/危险情况额外输出
+            if getattr(self, "is_debug", False):
+                dbg_every = int(getattr(self, "reward_debug_every", 20))  # 可在外部临时设置 self.reward_debug_every
+                laser_min = float(np.min(laser_scan)) if laser_scan is not None and len(laser_scan) > 0 else float("nan")
+                near_obs = (threshold is not None) and np.isfinite(laser_min) and (laser_min < threshold)
+                bad_number = (not np.isfinite(total)) or (not np.isfinite(distance))
+                should_print = (dbg_every > 0 and (self.step_count % dbg_every == 0)) or near_obs or bad_number
+                if should_print:
+                    dd = "None" if delta_dist is None else f"{delta_dist:.4f}"
+                    _dbg(
+                        f"step={self.step_count} distance={distance:.4f} prev_dist={self.prev_distance_to_goal} "
+                        f"delta_dist={dd} cos={cos:.4f} sin={sin:.4f} "
+                        f"action=[{action[0]:.3f},{action[1]:.3f}] "
+                        f"laser_min={laser_min:.4f} threshold={threshold} "
+                        f"high_min={high_min} side_left_min={side_left_min} side_right_min={side_right_min} "
+                        f"progress={progress_reward:.4f}/{progress_reward_scaled:.4f} "
+                        f"obs={obs_penalty:.4f}/{obs_penalty_scaled:.4f} "
+                        f"yawrate={yawrate_penalty:.4f}/{yawrate_penalty_scaled:.4f} "
+                        f"angle={angle_penalty:.4f}/{angle_penalty_scaled:.4f} "
+                        f"linear={linear_penalty:.4f}/{linear_penalty_scaled:.4f} "
+                        f"tgt_dist_pen={target_distance_penalty:.4f}/{target_distance_penalty_scaled:.4f} "
+                        f"lin_acc_osc={linear_acceleration_oscillation_penalty:.4f}/{linear_accel_osc_penalty_scaled:.4f} "
+                        f"yaw_osc={yawrate_oscillation_penalty:.4f}/{yawrate_osc_penalty_scaled:.4f} "
+                        f"step_pen={step_penalty:.4f}/{scaled_step_penalty:.4f} "
+                        f"scale={self.reward_scale:.3f} total={total:.4f}"
+                    )
+
+            return total
 
     @staticmethod
     def cossin(vec1, vec2):

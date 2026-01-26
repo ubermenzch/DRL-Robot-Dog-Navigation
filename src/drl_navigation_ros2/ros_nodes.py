@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, Imu
+import numpy as np
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSReliabilityPolicy
 from rclpy.qos import QoSProfile
 from nav_msgs.msg import Odometry
@@ -14,7 +15,7 @@ SEVERITY = LoggingSeverity.ERROR
 
 
 class SensorSubscriber(Node):
-    def __init__(self, env_id=0):
+    def __init__(self, env_id=0, scan_range=None, localization_noise_stddev=0.0):
         super().__init__(f"sensor_subscriber_env_{env_id}")
         self.get_logger().set_level(SEVERITY)
         self.subscriber_ = self.create_subscription(
@@ -23,21 +24,67 @@ class SensorSubscriber(Node):
         self.subscriber_ = self.create_subscription(
             Odometry, "odom", self.odom_listener_callback, 1
         )
+        self.imu_subscriber_ = self.create_subscription(
+            Imu, "imu", self.imu_listener_callback, 1
+        )
         self.latest_position = None
+        self.latest_position_raw = None  # 未添加噪声的原始position
         self.latest_heading = None
         self.latest_scan = None
+        self.latest_linear_velocity = 0.0
+        self.latest_angular_velocity = 0.0
+        # IMU 相关最新数据
+        self.latest_imu_orientation = None
+        self.latest_imu_linear_acc = None
+        self.latest_imu_angular_vel = None
+        self.scan_range = float(scan_range) if scan_range is not None else None
+        self.localization_noise_stddev = float(localization_noise_stddev) if localization_noise_stddev is not None else 0.0
 
     def scan_listener_callback(self, msg):
-        self.latest_scan = msg.ranges[:]
+        scan = np.asarray(msg.ranges[:], dtype=np.float32)
+        if self.scan_range is not None:
+            scan[~np.isfinite(scan)] = self.scan_range
+            scan = np.minimum(scan, self.scan_range)
+        self.latest_scan = scan.tolist()
         #print(len(self.latest_scan))
 
     def odom_listener_callback(self, msg):
-        self.latest_position = msg.pose.pose.position
+        # copy + optional localization noise (Gaussian) on x/y
+        pos = msg.pose.pose.position
+        # 始终保存未添加噪声的原始position
+        self.latest_position_raw = pos
+        if self.localization_noise_stddev > 0.0:
+            noisy_x = float(pos.x) + float(np.random.normal(0.0, self.localization_noise_stddev))
+            noisy_y = float(pos.y) + float(np.random.normal(0.0, self.localization_noise_stddev))
+            self.latest_position = type(pos)()
+            self.latest_position.x = noisy_x
+            self.latest_position.y = noisy_y
+            self.latest_position.z = float(pos.z)
+            # print(f"noisy_position: {self.latest_position.x}, {self.latest_position.y}, {self.latest_position.z}")
+        else:
+            self.latest_position = pos
+
         self.latest_heading = msg.pose.pose.orientation
+        self.latest_linear_velocity = float(msg.twist.twist.linear.x)
+        self.latest_angular_velocity = float(msg.twist.twist.angular.z)
+        # print(f"latest_linear_velocity: {self.latest_linear_velocity}, latest_angular_velocity: {self.latest_angular_velocity}")
+
+    def imu_listener_callback(self, msg: Imu):
+        """IMU 回调：记录线加速度、角速度和姿态（用于 reset 阶段的静止检测）"""
+        self.latest_imu_orientation = msg.orientation
+        self.latest_imu_linear_acc = msg.linear_acceleration
+        self.latest_imu_angular_vel = msg.angular_velocity
 
     def get_latest_sensor(self):
         # print(self.latest_scan, self.latest_position, self.latest_heading)
-        return self.latest_scan, self.latest_position, self.latest_heading
+        return (
+            self.latest_scan,
+            self.latest_position,
+            self.latest_heading,
+            self.latest_linear_velocity,
+            self.latest_angular_velocity,
+            self.latest_position_raw,  # 返回未添加噪声的原始position
+        )
 
 
 class ScanSubscriber(Node):
@@ -155,6 +202,14 @@ class SetModelStateClient(Node):
     def set_state(self, name, new_pose):
         self.request.state.name = name
         self.request.state.pose = new_pose
+        # 清零线速度、角速度，避免重置后残留速度导致落下或晃动
+        self.request.state.twist.linear.x = 0.0
+        self.request.state.twist.linear.y = 0.0
+        self.request.state.twist.linear.z = 0.0
+        self.request.state.twist.angular.x = 0.0
+        self.request.state.twist.angular.y = 0.0
+        self.request.state.twist.angular.z = 0.0
+        self.request.state.reference_frame = "world"
         self.future = self.client.call_async(self.request)
         # 等待服务调用完成并返回结果
         rclpy.spin_until_future_complete(self, self.future)

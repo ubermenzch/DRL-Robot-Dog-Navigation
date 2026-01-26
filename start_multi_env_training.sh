@@ -14,7 +14,6 @@
 # 而是直到"前X次训练的平均损失小于阈值时，数据收集进程才同步训练线程的模型"
 # 
 # 配置参数：
-# CRITIC_LOSS_THRESHOLD=50.0   # 前X次平均损失<50时才更新模型
 # AVG_LOSS_WINDOW_SIZE=5       # 计算前5次训练的平均损失
 export ROS_LOCALHOST_ONLY=1
 DEBUG_MODE=false
@@ -127,10 +126,8 @@ BATCH_SIZE=$(parse_yaml_value "batch_size")
 TRAINING_ITERATIONS=$(parse_yaml_value "training_iterations")
 SAVE_EVERY=$(parse_yaml_value "save_every")
 BUFFER_SIZE=$(parse_yaml_value "buffer_size")
-REPORT_EVERY=$(parse_yaml_value "report_every")
 STATS_WINDOW_SIZE=$(parse_yaml_value "stats_window_size")
 MAX_TRAINING_COUNT=$(parse_yaml_value "max_training_count")
-CRITIC_LOSS_THRESHOLD=$(parse_yaml_value "critic_loss_threshold")
 ACTOR_UPDATE_FREQUENCY=$(parse_yaml_value "actor_update_frequency")
 CRITIC_TARGET_UPDATE_FREQUENCY=$(parse_yaml_value "critic_target_update_frequency")
 # 读取hidden_layers并转换为JSON字符串
@@ -166,7 +163,6 @@ ACTION_DIM=$(parse_yaml_value "action_dim")
 MAX_ACTION=$(parse_yaml_value "max_action")
 STATE_DIM=$(parse_yaml_value "state_dim")
 
-IS_CODE_DEBUG=$(parse_yaml_value "is_code_debug")
 # 优先使用 load_path，如果没有则使用 model_load_dir（向后兼容）
 MODEL_LOAD_DIR=$(parse_yaml_value "load_path")
 if [ -z "$MODEL_LOAD_DIR" ]; then
@@ -178,10 +174,12 @@ LOG_DIR=$(parse_yaml_value "multi_env_log_model_dir")
 GAZEBO_WAIT_TIME=$(parse_yaml_value "gazebo_wait_time")
 GAZEBO_START_INTERVAL=$(parse_yaml_value "gazebo_start_interval")
 GAZEBO_BASE_PORT=$(parse_yaml_value "gazebo_base_port")
+TURTLEBOT3_MODEL_CONFIG=$(parse_yaml_value "turtlebot3_model")
 
 # 兜底默认值（若YAML缺项）
 NUM_ENVS=${NUM_ENVS:-4}
 START_ROS_DOMAIN_ID=${START_ROS_DOMAIN_ID:-1}
+TURTLEBOT3_MODEL_CONFIG=${TURTLEBOT3_MODEL_CONFIG:-waffle}
 MAX_STEPS_RATIO=${MAX_STEPS_RATIO:-100}
 MAX_STEPS_MIN=${MAX_STEPS_MIN:-50}
 BATCH_SIZE=${BATCH_SIZE:-40}
@@ -191,7 +189,6 @@ BUFFER_SIZE=${BUFFER_SIZE:-100000}
 REPORT_EVERY=${REPORT_EVERY:-20}
 STATS_WINDOW_SIZE=${STATS_WINDOW_SIZE:-100}
 MAX_TRAINING_COUNT=${MAX_TRAINING_COUNT:-1000}
-CRITIC_LOSS_THRESHOLD=${CRITIC_LOSS_THRESHOLD:-100.0}
 ACTOR_UPDATE_FREQUENCY=${ACTOR_UPDATE_FREQUENCY:-1}
 CRITIC_TARGET_UPDATE_FREQUENCY=${CRITIC_TARGET_UPDATE_FREQUENCY:-4}
 HIDDEN_DIM=${HIDDEN_DIM:-1024}
@@ -216,7 +213,6 @@ ACTION_DIM=${ACTION_DIM:-2}
 MAX_ACTION=${MAX_ACTION:-1}
 STATE_DIM=${STATE_DIM:-25}
 
-IS_CODE_DEBUG=${IS_CODE_DEBUG:-false}
 MODEL_LOAD_DIR=${MODEL_LOAD_DIR:-"/home/zc/DRL-Robot-Navigation-ROS2/src/drl_navigation_ros2/models/SAC"}
 LOAD_MODEL=${LOAD_MODEL:-true}
 
@@ -228,11 +224,11 @@ LOGFILE="$LOG_DIR/train_${TIMESTAMP}.log"
 # 确保 Gazebo 相关参数有有效值（处理空字符串的情况）
 GAZEBO_WAIT_TIME=${GAZEBO_WAIT_TIME:-30}
 [ -z "$GAZEBO_WAIT_TIME" ] && GAZEBO_WAIT_TIME=30
-GAZEBO_START_INTERVAL=${GAZEBO_START_INTERVAL:-3}
+# 去除首尾空白并设置默认值
+GAZEBO_START_INTERVAL="$(echo "$GAZEBO_START_INTERVAL" | xargs)"
 [ -z "$GAZEBO_START_INTERVAL" ] && GAZEBO_START_INTERVAL=3
 GAZEBO_BASE_PORT=${GAZEBO_BASE_PORT:-11345}
 [ -z "$GAZEBO_BASE_PORT" ] && GAZEBO_BASE_PORT=11345
-export TRAINING_TIMESTAMP="$TIMESTAMP"
 
 # 定义临时目录（使用项目目录）
 TMP_DIR="$SCRIPT_DIR/tmp"
@@ -241,6 +237,9 @@ PID_FILE="$TMP_DIR/multi_env_training.pid"
 # 预先创建日志和临时目录（在首次 tee 之前）
 mkdir -p "$LOG_DIR"
 mkdir -p "$TMP_DIR"
+
+# 仅向 multi_env_train.py 传递时间戳；日志基目录由 train.yaml 的 multi_env_log_model_dir 提供
+export TRAINING_TIMESTAMP="$TIMESTAMP"
 
 # ===================== 输出函数 =====================
 log_output() {
@@ -471,48 +470,14 @@ init_logging() {
     echo "  - Gazebo端口基址: $GAZEBO_BASE_PORT (环境i使用端口 $((GAZEBO_BASE_PORT + 0))-$((GAZEBO_BASE_PORT + NUM_ENVS - 1)))" >> "$LOGFILE"
     echo "  - Gazebo启动间隔: $GAZEBO_START_INTERVAL 秒（每个环境启动后等待时间）" >> "$LOGFILE"
     echo "  - Gazebo等待时间: $GAZEBO_WAIT_TIME 秒（所有环境启动后的总等待时间）" >> "$LOGFILE"
-    echo "  - 批次大小: $BATCH_SIZE" >> "$LOGFILE"
-    echo "  - 每轮训练迭代次数: $TRAINING_ITERATIONS" >> "$LOGFILE"
-    echo "  - 每Episode最大步数比例: $MAX_STEPS_RATIO (max_steps = target_distance * max_steps_ratio)" >> "$LOGFILE"
-    echo "  - 每Episode最小步数: $MAX_STEPS_MIN (max_steps不会小于此值)" >> "$LOGFILE"
-    echo "  - 模型保存频率: 每 $SAVE_EVERY 次训练" >> "$LOGFILE"
-    echo "  - 重放缓冲区大小: $BUFFER_SIZE" >> "$LOGFILE"
-    echo "  - 统计报告频率: 每 $REPORT_EVERY 个episode" >> "$LOGFILE"
-    echo "  - 训练模式: 持续循环训练（真正的并行训练）" >> "$LOGFILE"
-    echo "  - 模型更新模式: 基于前${AVG_LOSS_WINDOW_SIZE}次训练的平均损失阈值更新 (${CRITIC_LOSS_THRESHOLD})" >> "$LOGFILE"
-    echo "环境参数:" >> "$LOGFILE"
-    echo "  - 最大速度: $MAX_VELOCITY" >> "$LOGFILE"
-    echo "  - 忽略角度: $NEGLECT_ANGLE 度" >> "$LOGFILE"
-    echo "  - 最大偏航率: $MAX_YAWRATE 度/秒" >> "$LOGFILE"
-    echo "  - 扫描范围: $SCAN_RANGE" >> "$LOGFILE"
-    echo "  - 最大目标距离: $MAX_TARGET_DIST" >> "$LOGFILE"
-    echo "  - 初始目标距离: $INIT_TARGET_DISTANCE" >> "$LOGFILE"
-    echo "  - 目标距离增加量: $TARGET_DIST_INCREASE" >> "$LOGFILE"
-    echo "  - 目标到达判断阈值: $TARGET_REACHED_DELTA" >> "$LOGFILE"
-    echo "  - 碰撞判断阈值: $COLLISION_DELTA" >> "$LOGFILE"
-    echo "  - 世界大小: $WORLD_SIZE 米" >> "$LOGFILE"
-    echo "  - 障碍物最小距离: $OBS_MIN_DIST 米" >> "$LOGFILE"
-    echo "  - 障碍物数量: $OBS_NUM" >> "$LOGFILE"
-    echo "模型参数:" >> "$LOGFILE"
-    echo "  - 动作维度: $ACTION_DIM" >> "$LOGFILE"
-    echo "  - 最大动作值: $MAX_ACTION" >> "$LOGFILE"
-    echo "  - 状态维度: $STATE_DIM" >> "$LOGFILE"
-    echo "调试参数:" >> "$LOGFILE"
-    echo "  - 调试模式: $IS_CODE_DEBUG" >> "$LOGFILE"
-    echo "模型配置:" >> "$LOGFILE"
-    echo "  - 模型加载目录: $MODEL_LOAD_DIR" >> "$LOGFILE"
-    echo "  - 加载已有模型: $LOAD_MODEL" >> "$LOGFILE"
-    echo "  - 模型文件名: SAC_actor.pth, SAC_critic.pth, SAC_critic_target.pth" >> "$LOGFILE"
-    echo "  - Actor更新频率: $ACTOR_UPDATE_FREQUENCY" >> "$LOGFILE"
-    echo "  - Critic目标更新频率: $CRITIC_TARGET_UPDATE_FREQUENCY" >> "$LOGFILE"
-    echo "  - 网络隐藏层维度: $HIDDEN_DIM" >> "$LOGFILE"
-    echo "  - 网络隐藏层深度: $HIDDEN_DEPTH" >> "$LOGFILE"
-    echo "  - 平均损失窗口大小: $AVG_LOSS_WINDOW_SIZE" >> "$LOGFILE"
+    # 训练相关参数将由 Python 端计算后再打印，此处 shell 只记录自身用到的核心参数
+    echo "  - 训练参数详情将在 Python 端输出" >> "$LOGFILE"
 }
 
 # ===================== 启动多个Gazebo环境 =====================
 start_gazebo_instances() {
     log_output "启动 $NUM_ENVS 个独立的Gazebo环境..."
+    log_output "使用世界文件: ${TURTLEBOT3_MODEL_CONFIG:-waffle} (来自 train.yaml: turtlebot3_model)"
     
     for i in $(seq 0 $((NUM_ENVS-1))); do
         # 为每个环境创建独立的启动脚本（无头模式）
@@ -522,6 +487,8 @@ start_gazebo_instances() {
 
 # 清除可能干扰的环境变量（确保脚本自包含）
 unset DISPLAY ROS_DOMAIN_ID RMW_IMPLEMENTATION FASTRTPS_DEFAULT_PROFILES_FILE RMW_FASTRTPS_USE_QOS_FROM_XML 2>/dev/null || true
+# 清除可能残留的 TURTLEBOT3 相关环境变量，确保使用正确的值
+unset TURTLEBOT3_MODEL TURTLEBOT3_ROBOT_MODEL 2>/dev/null || true
 
 # 设置环境变量
 export ROS_DOMAIN_ID=$((START_ROS_DOMAIN_ID + i))
@@ -559,6 +526,9 @@ source $SCRIPT_DIR/install/setup.bash
 [ -f "/usr/share/gazebo-11/setup.bash" ] && [ -z "\$GAZEBO_RESOURCE_PATH" ] && \
     source /usr/share/gazebo-11/setup.bash 2>/dev/null
 
+# 在 source 之后再次确保 TURTLEBOT3_ROBOT_MODEL 固定为 waffle（防止被其他脚本覆盖）
+export TURTLEBOT3_ROBOT_MODEL=waffle
+
 # 设置 Gazebo 路径
 orig_path="\${GAZEBO_RESOURCE_PATH:-}"
 share_dir=""
@@ -566,10 +536,14 @@ for path in /usr/share/gazebo-11 /usr/share/gazebo /opt/ros/foxy/share/gazebo_pl
     [ -d "\$path" ] && { share_dir="\$path"; break; }
 done
 
+# 强制将项目模型路径放在最前面，确保使用项目内的模型（如 100by100, obstacle_cube_5m）
+local_project_models_path="$SCRIPT_DIR/src/turtlebot3_simulations/turtlebot3_gazebo/models"
 if [ -z "\$GAZEBO_MODEL_PATH" ]; then
-    export GAZEBO_MODEL_PATH="$SCRIPT_DIR/src/turtlebot3_simulations/turtlebot3_gazebo/models"
+    export GAZEBO_MODEL_PATH="\$local_project_models_path"
 else
-    export GAZEBO_MODEL_PATH="\$GAZEBO_MODEL_PATH:$SCRIPT_DIR/src/turtlebot3_simulations/turtlebot3_gazebo/models"
+    # 移除可能存在的项目路径，然后前置（避免重复）
+    GAZEBO_MODEL_PATH=\$(echo "\$GAZEBO_MODEL_PATH" | sed "s|:\$local_project_models_path||g; s|\$local_project_models_path:||g; s|^\$local_project_models_path\$||")
+    export GAZEBO_MODEL_PATH="\$local_project_models_path\${GAZEBO_MODEL_PATH:+:}\$GAZEBO_MODEL_PATH"
 fi
 
 if [ -n "\$share_dir" ]; then
@@ -579,15 +553,32 @@ else
     export GAZEBO_RESOURCE_PATH="\${orig_path}\${orig_path:+:}\$GAZEBO_MODEL_PATH"
 fi
 
-export TURTLEBOT3_MODEL=waffle
+# 从配置文件读取 turtlebot3_model，确保多环境使用正确的世界文件（如 base_world_100by100）
+# 清除可能残留的 TURTLEBOT3_MODEL，确保使用配置文件的值
+unset TURTLEBOT3_MODEL 2>/dev/null || true
+# 注意：TURTLEBOT3_MODEL_CONFIG 在主脚本中已读取（第177行），heredoc 会在生成时展开变量
+# 如果 TURTLEBOT3_MODEL_CONFIG 为空，使用默认值 waffle（但应该不会为空，因为第182行已设置默认值）
+export TURTLEBOT3_MODEL="${TURTLEBOT3_MODEL_CONFIG:-waffle}"
+# TURTLEBOT3_ROBOT_MODEL 固定为 waffle（用于机器人 URDF），TURTLEBOT3_MODEL 用于世界文件
+# 重要：必须在 source ROS2 环境之后再次设置，确保不被其他脚本覆盖
+export TURTLEBOT3_ROBOT_MODEL=waffle
 
 # 强制无头模式环境变量
 export GAZEBO_IP=127.0.0.1
 export GAZEBO_MASTER_URI=http://127.0.0.1:$((GAZEBO_BASE_PORT + i)) # 不同的gazebo环境绑定不同的端口
-    export GAZEBO_GUI=0
+export GAZEBO_GUI=0
 
-# 启动无头 Gazebo
-ros2 launch turtlebot3_gazebo ros2_drl_headless.launch.py
+# 在启动 Gazebo 之前，最后一次确保环境变量正确设置
+# TURTLEBOT3_MODEL 用于世界文件（从 train.yaml 读取，如 base_world_100by100）
+# TURTLEBOT3_ROBOT_MODEL 固定为 waffle（用于机器人 URDF）
+export TURTLEBOT3_ROBOT_MODEL=waffle
+
+# 启动无头 Gazebo（使用 env 显式传递环境变量，确保正确传递）
+# 注意：在 heredoc 中，\$VAR 会在生成脚本时转义为 $VAR，然后在执行时展开
+env TURTLEBOT3_MODEL="\$TURTLEBOT3_MODEL" TURTLEBOT3_ROBOT_MODEL="\$TURTLEBOT3_ROBOT_MODEL" \
+    GAZEBO_MODEL_PATH="\$GAZEBO_MODEL_PATH" GAZEBO_RESOURCE_PATH="\$GAZEBO_RESOURCE_PATH" \
+    GAZEBO_MASTER_URI="\$GAZEBO_MASTER_URI" GAZEBO_IP="\$GAZEBO_IP" GAZEBO_GUI="\$GAZEBO_GUI" \
+    ros2 launch turtlebot3_gazebo ros2_drl_headless.launch.py
 EOF
         
         chmod +x "$TMP_DIR/start_gazebo_env_${i}.sh"
@@ -651,48 +642,14 @@ start_multi_env_training() {
     cd "$SCRIPT_DIR"
     
     # 设置训练脚本所需的环境变量（仅在当前函数作用域内）
-    # 让 Python 脚本将权重等冗长信息只写入日志文件
-    export TRAINING_LOGFILE="$LOGFILE"
-    
+
     # 确保训练进程不受外部ROS环境变量影响
     # 训练进程不需要ROS环境，只处理数据
     unset ROS_DOMAIN_ID ROS_PACKAGE_PATH AMENT_PREFIX_PATH COLCON_PREFIX_PATH 2>/dev/null || true
     
-    # 启动训练脚本
+    # 启动训练脚本（仅传递配置文件路径，训练参数全部由 train.yaml 决定）
     unbuffer python3 -u src/drl_navigation_ros2/multi_env_train.py \
-        --num_envs $NUM_ENVS \
-        --batch_size $BATCH_SIZE \
-        --training_iterations $TRAINING_ITERATIONS \
-        --max_steps_ratio $MAX_STEPS_RATIO \
-        --max_steps_min $MAX_STEPS_MIN \
-        --save_every $SAVE_EVERY \
-        --buffer_size $BUFFER_SIZE \
-        --report_every $REPORT_EVERY \
-        --stats_window_size $STATS_WINDOW_SIZE \
-        --gpu_id ${TORCH_GPU_ID:-$GPU_ID} \
-        --max_training_count $MAX_TRAINING_COUNT \
-        --critic_loss_threshold $CRITIC_LOSS_THRESHOLD \
-        --actor_update_frequency $ACTOR_UPDATE_FREQUENCY \
-        --critic_target_update_frequency $CRITIC_TARGET_UPDATE_FREQUENCY \
-        --hidden_layers "$HIDDEN_LAYERS" \
-        --avg_loss_window_size $AVG_LOSS_WINDOW_SIZE \
-        --max_velocity $MAX_VELOCITY \
-        --neglect_angle $NEGLECT_ANGLE \
-        --max_yawrate $MAX_YAWRATE \
-        --scan_range $SCAN_RANGE \
-        --max_target_dist $MAX_TARGET_DIST \
-        --init_target_distance $INIT_TARGET_DISTANCE \
-        --target_dist_increase $TARGET_DIST_INCREASE \
-        --target_reached_delta $TARGET_REACHED_DELTA \
-        --collision_delta $COLLISION_DELTA \
-        --world_size $WORLD_SIZE \
-        --obs_min_dist $OBS_MIN_DIST \
-        --obs_num $OBS_NUM \
-        --action_dim $ACTION_DIM \
-        --max_action $MAX_ACTION \
-        --is_code_debug $IS_CODE_DEBUG \
-        --model_load_dir "$MODEL_LOAD_DIR" \
-        --load_model $LOAD_MODEL \
+        --config "$CONFIG_FILE" \
         >> "$LOGFILE" 2>&1 &
     
     TRAINING_PID=$!
@@ -785,16 +742,17 @@ if [ "$DAEMON_MODE" = true ]; then
     export LOGFILE
     export NUM_ENVS START_ROS_DOMAIN_ID MAX_STEPS_RATIO MAX_STEPS_MIN BATCH_SIZE TRAINING_ITERATIONS
     export SAVE_EVERY BUFFER_SIZE REPORT_EVERY STATS_WINDOW_SIZE
-    export MAX_TRAINING_COUNT CRITIC_LOSS_THRESHOLD ACTOR_UPDATE_FREQUENCY
+    export MAX_TRAINING_COUNT ACTOR_UPDATE_FREQUENCY
     export CRITIC_TARGET_UPDATE_FREQUENCY HIDDEN_DIM HIDDEN_DEPTH AVG_LOSS_WINDOW_SIZE
     export GPU_ID TORCH_GPU_ID MAX_VELOCITY
     export NEGLECT_ANGLE MAX_YAWRATE SCAN_RANGE MAX_TARGET_DIST INIT_TARGET_DISTANCE
     export TARGET_DIST_INCREASE TARGET_REACHED_DELTA COLLISION_DELTA WORLD_SIZE
-    export OBS_MIN_DIST OBS_NUM ACTION_DIM MAX_ACTION STATE_DIM IS_CODE_DEBUG
+    export OBS_MIN_DIST OBS_NUM ACTION_DIM MAX_ACTION STATE_DIM
     export MODEL_LOAD_DIR LOAD_MODEL LOG_DIR
     export GAZEBO_WAIT_TIME GAZEBO_BASE_PORT TRAINING_TIMESTAMP
     export SCRIPT_DIR TIMESTAMP LOG_DIR_BASE DAEMON_MODE
     export TMP_DIR PID_FILE CONFIG_FILE
+    export TURTLEBOT3_MODEL_CONFIG
     # 外层直接重定向到日志，避免 nohup 提示输出到 nohup.out
     nohup bash -c "
         $(declare -f log_output)

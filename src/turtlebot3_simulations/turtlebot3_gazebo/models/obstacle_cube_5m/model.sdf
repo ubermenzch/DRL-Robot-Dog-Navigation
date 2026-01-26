@@ -1,0 +1,62 @@
+<?xml version='1.0'?>
+<sdf version='1.6'>
+  <model name='obstacle_cube_5m'>
+      <pose>-2.06176 -3.02362 2.5 0 -0 0</pose>
+      <link name='link'>
+        <inertial>
+          <!-- 设置很大的质量（10000），使被撞击后位移小到可以忽略 -->
+          <mass>10000</mass>
+          <inertia>
+            <!-- 惯性矩与质量成比例增加 -->
+            <!-- 对于边长5m的正方体，ixx = iyy = izz = m * a² / 6 = 10000 * 5² / 6 = 41666.67 -->
+            <ixx>41666.67</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>41666.67</iyy>
+            <iyz>0</iyz>
+            <izz>41666.67</izz>
+          </inertia>
+          <pose>0 0 0 0 -0 0</pose>
+        </inertial>
+        <collision name='collision'>
+          <geometry>
+            <box>
+              <size>5 5 5</size>
+            </box>
+          </geometry>
+          <max_contacts>10</max_contacts>
+          <surface>
+            <contact>
+              <ode/>
+            </contact>
+            <bounce/>
+            <friction>
+              <torsional>
+                <ode/>
+              </torsional>
+              <ode/>
+            </friction>
+          </surface>
+        </collision>
+        <visual name='visual'>
+          <geometry>
+            <box>
+              <size>5 5 5</size>
+            </box>
+          </geometry>
+          <material>
+            <script>
+              <name>Gazebo/Grey</name>
+              <uri>file://media/materials/scripts/gazebo.material</uri>
+            </script>
+          </material>
+        </visual>
+        <self_collide>0</self_collide>
+        <enable_wind>0</enable_wind>
+        <kinematic>0</kinematic>
+      </link>
+    </model>
+</sdf>
+
+
+
