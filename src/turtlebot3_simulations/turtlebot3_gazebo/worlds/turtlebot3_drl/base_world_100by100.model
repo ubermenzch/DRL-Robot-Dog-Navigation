@@ -113,7 +113,7 @@
     <include>
       <uri>model://turtlebot3_waffle</uri>
       <!-- 显式设置机器人初始位姿，放在围墙外侧的地面上 -->
-      <pose>-55 -55 0 0 0 0</pose>
+      <pose>-55 -55 0.1 0 0 0</pose>
     </include>
 
     <include>

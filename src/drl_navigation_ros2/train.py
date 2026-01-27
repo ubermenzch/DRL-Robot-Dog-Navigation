@@ -19,6 +19,8 @@ from datetime import datetime
 from collections import deque
 import time
 
+from logging_utils import CollectLogger, EnvLogger, RewardLogger, NodesLogger
+
 def concatenate_state_history(current_state, state_history, state_history_steps, base_state_dim):
     """将当前state与历史state拼接
     
@@ -243,6 +245,10 @@ def load_config(config_path=None):
 
 def main(args=None):
     """Main training function"""
+    clog = None
+    env_logger = None
+    reward_logger = None
+    nodes_logger = None
     # ==================== 加载配置文件 ====================
     # 加载配置文件（不再依赖 TRAIN_CONFIG_PATH 环境变量，可通过函数参数传入）
     config = load_config(args.config_path) if args and hasattr(args, 'config_path') else load_config()
@@ -259,6 +265,35 @@ def main(args=None):
     print(f"ROS_DOMAIN_ID: {ros_domain_id}")
     print(f"使用配置文件: {actual_config_path}")
     
+    # ==================== 单环境日志系统（对齐 multi_env_train.py） ====================
+    # 单环境默认开启日志：基于 TRAINING_TIMESTAMP + single_env_log_dir（或启动脚本传入的 LOG_DIR）自动生成路径。
+    # 若用户显式在 config 中提供 collect/env/reward/nodes_log_path，则优先使用显式配置。
+    training_timestamp = os.environ.get("TRAINING_TIMESTAMP", datetime.now().strftime("%Y%m%d_%H%M%S"))
+    env_log_dir = os.environ.get("LOG_DIR", "").strip()
+    if env_log_dir:
+        log_dir = Path(env_log_dir)
+    else:
+        base_log_dir = Path(config.get('single_env_log_dir', "log/single_env_training"))
+        log_dir = base_log_dir / f"train_{training_timestamp}"
+
+    # 自动生成日志文件路径（默认启用）
+    default_collect_log_path = str(log_dir / f"collect_log_{training_timestamp}.log")
+    default_env_log_path = str(log_dir / f"env_log_{training_timestamp}.log")
+    default_reward_log_path = str(log_dir / f"reward_log_{training_timestamp}.log")
+    default_nodes_log_path = str(log_dir / f"nodes_log_{training_timestamp}.log")
+
+    collect_log_path = (config.get('collect_log_path') or default_collect_log_path).strip()
+    env_log_path = (config.get('env_log_path') or default_env_log_path).strip()
+    reward_log_path = (config.get('reward_log_path') or default_reward_log_path).strip()
+    nodes_log_path = (config.get('nodes_log_path') or default_nodes_log_path).strip()
+
+    clog = CollectLogger(collect_log_path)
+    env_logger = EnvLogger(env_log_path)
+    reward_logger = RewardLogger(reward_log_path)
+    nodes_logger = NodesLogger(nodes_log_path)
+
+    clog.log(0, "train_start", {"ros_domain_id": ros_domain_id, "log_dir": str(log_dir)}, "started")
+
     # ==================== 设置TURTLEBOT3_MODEL ====================
     # 从配置文件读取TURTLEBOT3_MODEL，如果环境变量已设置则优先使用环境变量
     turtlebot3_model = config.get('turtlebot3_model', 'waffle')
@@ -357,20 +392,10 @@ def main(args=None):
     # ==================== 路径参数 ====================
     # 模型加载路径
     load_path = Path(config.get('load_path', "/home/zc/DRL-Robot-Navigation-ROS2/src/drl_navigation_ros2/models/SAC"))
-    
-    # 模型/配置快照保存目录：
-    # - 单环境训练的所有输出信息都应通过 print 输出，由 start_training.sh 负责重定向到日志文件。
-    # - 这里仅负责确定“本次训练产物目录”（模型权重/配置快照等）。
-    # - 优先使用 start_training.sh 导出的 LOG_DIR（通常形如 log/single_env_training/train_<TIMESTAMP>）
-    # - 其次使用 train.yaml 的 single_env_log_dir + TRAINING_TIMESTAMP
-    training_timestamp = os.environ.get("TRAINING_TIMESTAMP", datetime.now().strftime("%Y%m%d_%H%M%S"))
-    env_log_dir = os.environ.get("LOG_DIR", "").strip()
-    if env_log_dir:
-        log_dir = Path(env_log_dir)
-    else:
-        base_log_dir = Path(config.get('single_env_log_dir', "log/single_env_training"))
-        log_dir = base_log_dir / f"train_{training_timestamp}"
-    
+
+    # 使用上方日志系统生成的 log_dir 作为单环境训练的产物根目录
+    # 说明：log_dir 在“单环境日志系统”段落里已按 LOG_DIR 或 single_env_log_dir + TRAINING_TIMESTAMP 计算。
+
     # 模型保存目录：实时模型保存到 model 子目录，最佳模型保存到 best_model 子目录
     model_save_dir = log_dir / "model"
     best_model_save_dir = log_dir / "best_model"
@@ -466,6 +491,10 @@ def main(args=None):
     )  # instantiate a model
     print("Model Loaded")
     ros = ROS_env(
+        env_id=0,
+        env_logger=env_logger,
+        reward_logger=reward_logger,
+        nodes_logger=nodes_logger,
         max_velocity=max_velocity,
         neglect_angle=neglect_angle,
         scan_range=scan_range,
@@ -596,7 +625,9 @@ def main(args=None):
         while not reset_success:
             reset_success, latest_scan, distance, distance_raw, cos, sin, collision, goal, last_action, reward, current_v, current_w = ros.reset()
             if not reset_success:
-                print("reset()失败，重试中...")
+                # 只写入 env_log，不再输出到综合训练日志/stdout；标记为 [ERROR]
+                if env_logger is not None:
+                    env_logger.log(0, "[ERROR] reset()失败，重试中...")
         
         # 计算当前episode的max_steps
         if max_steps_ratio == 0:
@@ -844,6 +875,16 @@ def main(args=None):
             episode += 1
     
     # ==================== 训练完成 ====================
+    if clog:
+        clog.log(0, "train_end", {"episodes": episode}, "done")
+
+    for _lg in (clog, env_logger, reward_logger, nodes_logger):
+        try:
+            if _lg:
+                _lg.close()
+        except Exception:
+            pass
+
     print(f"\n{'='*60}")
     print(f"训练完成！")
     print(f"{'='*60}\n")

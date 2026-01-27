@@ -113,7 +113,12 @@ setup_display() {
     
     # 查找可能的Xauthority文件（用于X11认证）
     find_xauthority() {
-        # 优先使用环境变量中的XAUTHORITY
+        # 如果当前用户是 root，优先使用 /root/.Xauthority，避免误用其他用户（如 zc）的 XAUTHORITY
+        if [ "$(id -u)" -eq 0 ] && [ -f "/root/.Xauthority" ]; then
+            echo "/root/.Xauthority"
+            return
+        fi
+        # 优先使用环境变量中的XAUTHORITY（非root或root没有 /root/.Xauthority 时）
         [ -n "$XAUTHORITY" ] && [ -f "$XAUTHORITY" ] && {
             echo "$XAUTHORITY"
             return

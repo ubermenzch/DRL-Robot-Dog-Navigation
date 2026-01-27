@@ -208,7 +208,9 @@ class ROS_env:
         self.reset_step_count = reset_step_count
         # 地图复用参数
         self.goals_per_map = goals_per_map
-        self.goals_count_for_current_map = 0  # 当前地图已使用的目标点数量
+        # 为了避免首次 reset 时 obstacle_poses 为空导致 apply_obstacle_poses n=0，
+        # 初始化时将计数置为 goals_per_map，强制第一次 reset 进入“重新生成地图/障碍物”分支。
+        self.goals_count_for_current_map = int(goals_per_map)  # 当前地图已使用的目标点数量
         self.generated_map_count = 0  # 已生成的地图数量（仅在真正重新生成地图时递增）
         # 奖励分解统计（按 episode 累积）
         # _log("ROS接口与参数初始化完成，准备reset...")
@@ -220,10 +222,9 @@ class ROS_env:
         # _log("环境初始化完成")
 
     def _env_log(self, msg):
-        """环境调试输出：若有 env_logger 则始终写入 env_log；始终 print。"""
+        """环境调试输出：若有 env_logger 则始终写入 env_log。"""
         if self.env_logger is not None:
             self.env_logger.log(self.env_id, msg)
-        print(f"[ROS_env {self.env_id}] {msg}")
 
     def reset_episode_reward_breakdown(self):
         """重置当前 episode 的奖励分解统计"""
@@ -477,11 +478,43 @@ class ROS_env:
         settle_start_time = time.time()
         max_settle_time = 5.0  # 防止极端情况下死循环
         robot_settled = False
+        # 缓存最近一次“静止检测”相关的数值，便于超时时打印原因（对齐多环境 env_log 诊断风格）
+        last_lin_vel = None
+        last_ang_vel = None
+        last_lin_acc_xy = None
+        last_roll = None
+        last_pitch = None
+        last_lin_vel_ok = None
+        last_ang_vel_ok = None
+        last_lin_acc_ok = None
+        last_attitude_ok = None
         while not robot_settled:
             # 检查超时
             elapsed = time.time() - settle_start_time
             if elapsed > max_settle_time:
-                self._env_log(f"[WARNING] 静止检测超时 (>{max_settle_time}s，实际 {elapsed:.2f}s)，reset失败")
+                # 组装超时原因（仅包含未满足项）
+                reasons = []
+                try:
+                    # 线速度/角速度/加速度/姿态：与下方判定条件保持一致
+                    if last_lin_vel is not None and last_lin_vel_ok is False:
+                        reasons.append(f"vel超时({last_lin_vel:.4f})")
+                    if last_ang_vel is not None and last_ang_vel_ok is False:
+                        reasons.append(f"ang超时({last_ang_vel:.4f})")
+                    if last_lin_acc_xy is not None and last_lin_acc_ok is False:
+                        reasons.append(f"acc超时({last_lin_acc_xy:.4f})")
+                    if last_roll is not None and last_pitch is not None and last_attitude_ok is False:
+                        reasons.append(f"attitude超时(roll={last_roll:.4f}, pitch={last_pitch:.4f})")
+                except Exception:
+                    pass
+
+                reason_str = "、".join(reasons) if reasons else "unknown(传感器数据不足或未更新)"
+                self._env_log(
+                    f"[reset 超时] 静止检测超时 (>{max_settle_time}s，实际 {elapsed:.2f}s)，跳出等待。 "
+                    f"超时原因: {reason_str}。 "
+                    f"settled={robot_settled} "
+                    f"lin_vel_ok={last_lin_vel_ok} ang_vel_ok={last_ang_vel_ok} "
+                    f"lin_acc_ok={last_lin_acc_ok} attitude_ok={last_attitude_ok}"
+                )
                 return (False, None, None, None, None, None, None, None, None, None, None, None)
             
             # 发送零速度指令，让机器人逐渐停稳
@@ -526,25 +559,42 @@ class ROS_env:
             lin_acc_ok = abs(lin_acc_xy) < 1e-1
             attitude_ok = abs(roll) < 0.02 and abs(pitch) < 0.02
 
+            # 更新缓存：用于超时诊断
+            last_lin_vel = float(current_linear_velocity)
+            last_ang_vel = float(current_angular_velocity)
+            last_lin_acc_xy = float(lin_acc_xy)
+            last_roll = float(roll)
+            last_pitch = float(pitch)
+            last_lin_vel_ok = bool(lin_vel_ok)
+            last_ang_vel_ok = bool(ang_vel_ok)
+            last_lin_acc_ok = bool(lin_acc_ok)
+            last_attitude_ok = bool(attitude_ok)
+
             robot_settled = lin_vel_ok and ang_vel_ok and lin_acc_ok and attitude_ok
 
         if not robot_settled:
-            self._env_log("[WARNING] Robot not settled during reset")
+            self._env_log("[ERROR] Robot not settled during reset")
             return (False, None, None, None, None, None, None, None, None, None, None, None)
         
+        # 缓存当前障碍物位姿，失败时可恢复
+        old_obstacle_poses = [p[:] for p in self.obstacle_poses]
+
         # 先完成所有可能失败的操作，全部成功后再统一修改计数器
         should_regenerate_map = (self.goals_count_for_current_map >= self.goals_per_map)
         
         if should_regenerate_map:
             if not self.generate_and_set_obstacles():
-                self._env_log("[WARNING] Failed to generate and set obstacles during reset")
+                self._env_log("[ERROR] Failed to generate and set obstacles during reset")
+                # 恢复旧障碍物位姿与 costmap
+                self.obstacle_poses = [p[:] for p in old_obstacle_poses]
+                self._build_costmap_from_obstacles()
                 return (False, None, None, None, None, None, None, None, None, None, None, None)
         else:
             # 不重新生成地图：reset_world() 会把 Gazebo 中的障碍物恢复到初始位姿
             # 这里用缓存的 obstacle_poses 重新设置一次障碍物，
             # 等效于“地图不变”，只是把 Gazebo 世界恢复到当前地图状态
             if not self.apply_obstacle_poses_to_gazebo():
-                self._env_log("[WARNING] Failed to restore obstacle poses during reset")
+                self._env_log("[ERROR] Failed to restore obstacle poses during reset")
                 return (False, None, None, None, None, None, None, None, None, None, None, None)
         
         if not self._spawn_robot_and_target_from_current_costmap():
@@ -567,7 +617,7 @@ class ROS_env:
         ) = self.step(lin_velocity=0, ang_velocity=0, empty_step=False)
         
         if collision:
-            self._env_log("[WARNING] Collision detected during reset")
+            self._env_log("[ERROR] Collision detected during reset")
             return (False, None, None, None, None, None, None, None, None, None, None, None)
 
         def _all_finite(x) -> bool:
@@ -612,7 +662,7 @@ class ROS_env:
             float(current_angular_velocity),
         )
         if not _all_finite(_reset_payload):
-            self._env_log("[WARNING] NaN/Inf detected during reset payload validation")
+            self._env_log("[ERROR] NaN/Inf detected during reset payload validation")
             return (False, None, None, None, None, None, None, None, None, None, None, None)
 
         # 所有操作成功，更新计数器
@@ -1074,14 +1124,14 @@ class ROS_env:
             
             time.sleep(0.05)  # 短暂等待后重试
         
-        # 超时后记录警告，但不失败
+        # 超时后记录错误（视为负面事件），但不直接使调用失败
         if position_raw is not None:
             odom_x = position_raw.x
             odom_y = position_raw.y
             distance = np.linalg.norm([odom_x - expected_x, odom_y - expected_y])
-            self._env_log(f"[WARNING] odom update timeout: current=({odom_x:.2f}, {odom_y:.2f}), expected=({expected_x:.2f}, {expected_y:.2f}), distance={distance:.3f}")
+            self._env_log(f"[ERROR] odom update timeout: current=({odom_x:.2f}, {odom_y:.2f}), expected=({expected_x:.2f}, {expected_y:.2f}), distance={distance:.3f}")
         else:
-            self._env_log(f"[WARNING] odom update timeout: no odom data received")
+            self._env_log(f"[ERROR] odom update timeout: no odom data received")
         return False
 
     def set_position(self, name, x, y, angle, wait_for_odom_update=False):
@@ -1102,7 +1152,7 @@ class ROS_env:
 
         success = self.robot_state_publisher.set_state(name, pose)
         if not success:
-            self._env_log(f"set_position failed name={name} x={x:.2f} y={y:.2f} angle={angle:.2f}")
+            self._env_log(f"[ERROR] set_position failed name={name} x={x:.2f} y={y:.2f} angle={angle:.2f}")
             return success
         
         # 如果是机器人位置设置，且需要等待里程计更新，则等待里程计更新到新位置

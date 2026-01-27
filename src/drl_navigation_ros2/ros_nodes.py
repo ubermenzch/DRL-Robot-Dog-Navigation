@@ -110,7 +110,7 @@ class SensorSubscriber(Node):
                 self._executor.spin()
             except Exception as e:
                 if not self._shutdown_flag.is_set():
-                    self.get_logger().error(f"Error in spin thread: {e}")
+                    self.get_logger().error(f"[ERROR] Error in spin thread: {e}")
         
         self._spin_thread = threading.Thread(target=spin_loop, daemon=True, name=f"sensor_subscriber_spin_{self.env_id}")
         self._spin_thread.start()
@@ -373,7 +373,7 @@ class ScanSubscriber(Node):
                 self._executor.spin()
             except Exception as e:
                 if not self._shutdown_flag.is_set():
-                    self.get_logger().error(f"Error in spin thread: {e}")
+                    self.get_logger().error(f"[ERROR] Error in spin thread: {e}")
         
         self._spin_thread = threading.Thread(target=spin_loop, daemon=True, name=f"scan_subscriber_spin_{self.env_id}")
         self._spin_thread.start()
@@ -458,7 +458,7 @@ class OdomSubscriber(Node):
                 self._executor.spin()
             except Exception as e:
                 if not self._shutdown_flag.is_set():
-                    self.get_logger().error(f"Error in spin thread: {e}")
+                    self.get_logger().error(f"[ERROR] Error in spin thread: {e}")
         
         self._spin_thread = threading.Thread(target=spin_loop, daemon=True, name=f"odom_subscriber_spin_{self.env_id}")
         self._spin_thread.start()
@@ -530,7 +530,7 @@ class ResetWorldClient(Node):
         if future.result() is not None:
             self.get_logger().info("World reset successfully.")
         else:
-            self.get_logger().error(f"Failed to reset world: {future.exception()}")
+            self.get_logger().error(f"[ERROR] Failed to reset world: {future.exception()}")
 
 
 class PhysicsClient(Node):
@@ -559,7 +559,7 @@ class PhysicsClient(Node):
         if future.result() is not None:
             self.get_logger().info("Physics paused successfully.")
         else:
-            self.get_logger().error(f"Failed to pause physics: {future.exception()}")
+            self.get_logger().error(f"[ERROR] Failed to pause physics: {future.exception()}")
 
     def unpause_physics(self):
         self.get_logger().info("Calling /gazebo/unpause_physics service...")
@@ -570,7 +570,7 @@ class PhysicsClient(Node):
         if future.result() is not None:
             self.get_logger().info("Physics unpaused successfully.")
         else:
-            self.get_logger().error(f"Failed to unpause physics: {future.exception()}")
+            self.get_logger().error(f"[ERROR] Failed to unpause physics: {future.exception()}")
 
 
 class SetModelStateClient(Node):
@@ -631,7 +631,7 @@ class GoalModelClient(Node):
             self.nodes_logger.log(self.env_id, "GoalModelClient::wait_for_service")
         self.get_logger().info("Waiting for Gazebo services to be available...")
         if not self.set_state_client.wait_for_service(timeout_sec=timeout):
-            self.get_logger().warn(f"Service set_entity_state not available after {timeout}s, will retry later")
+            self.get_logger().warn(f"[ERROR] Service set_entity_state not available after {timeout}s, will retry later")
             return False
         
         self.services_ready = True
@@ -690,11 +690,11 @@ class GoalModelClient(Node):
                 error_msg = response.status_message if hasattr(response, 'status_message') else "Unknown error"
                 if self.nodes_logger is not None:
                     self.nodes_logger.log(self.env_id, f"GoalModelClient::set_goal_position failed {error_msg}")
-                self.get_logger().warn(f"Failed to set goal cylinder position: {error_msg}")
+                self.get_logger().warn(f"[ERROR] Failed to set goal cylinder position: {error_msg}")
         else:
             if self.nodes_logger is not None:
                 self.nodes_logger.log(self.env_id, "GoalModelClient::set_goal_position failed Service returned None")
-            self.get_logger().warn(f"Failed to set goal cylinder position: Service returned None")
+            self.get_logger().warn(f"[ERROR] Failed to set goal cylinder position: Service returned None")
 
 
 class CmdVelPublisher(Node):

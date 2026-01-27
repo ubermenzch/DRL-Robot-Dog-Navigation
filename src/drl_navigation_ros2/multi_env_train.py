@@ -57,10 +57,10 @@ def load_config(config_path=None):
         with open(path, "r") as f:
             return yaml.safe_load(f) or {}
     except FileNotFoundError:
-        print(f"警告: 未找到配置文件 {path}")
+        print(f"[ERROR] 警告: 未找到配置文件 {path}")
         return {}
     except Exception as e:
-        print(f"警告: 读取配置文件失败 {path}: {e}")
+        print(f"[ERROR] 警告: 读取配置文件失败 {path}: {e}")
         return {}
 
 
@@ -280,7 +280,7 @@ def verify_actor_weight_consistency(local_model, latest_model_state, env_id, con
                             print(f"    文件权重标准差: {subvalue.std().item():.2f}, 本地权重标准差: {local_subvalue.std().item():.2f}")
                             weights_match = False
             else:
-                print(f"  警告: 键 {key} 不在本地模型状态字典中")
+                print(f"  [ERROR] [ERROR] 警告: 键 {key} 不在本地模型状态字典中")
         elif hasattr(value, 'shape') and value.numel() > 0:
             # 直接是tensor的情况（不应该出现在actor_only模式下）
             if key in local_state_dict:
@@ -717,11 +717,11 @@ class SharedModelManager:
             device_model_state = torch.load(self.model_file_path, map_location=target_device, weights_only=True)
             # 验证加载的数据是否为字典类型（state_dict应该是字典）
             if not isinstance(device_model_state, dict):
-                print(f"警告: 从文件 {self.model_file_path} 加载的数据不是字典类型，类型: {type(device_model_state)}")
+                print(f"[ERROR] 警告: 从文件 {self.model_file_path} 加载的数据不是字典类型，类型: {type(device_model_state)}")
                 return None
             return device_model_state
         except Exception as e:
-            print(f"错误: 从文件 {self.model_file_path} 加载模型权重失败: {e}")
+            print(f"[ERROR] 错误: 从文件 {self.model_file_path} 加载模型权重失败: {e}")
             return None
     
     def _convert_from_serializable(self, obj):
@@ -827,7 +827,7 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
         sensor_log_config = config.get('sensor_log_enable', {})
         print(f"环境 {env_id} sensor_log_enable 配置类型: {type(sensor_log_config)}, 内容: {sensor_log_config}")
         if isinstance(sensor_log_config, dict) and len(sensor_log_config) == 0:
-            print(f"环境 {env_id} 警告: sensor_log_enable 是空字典！检查配置文件格式。")
+            print(f"环境 {env_id} [ERROR] [ERROR] 警告: sensor_log_enable 是空字典！检查配置文件格式。")
         
         # 辅助函数：将值转换为布尔值（处理字符串形式的 true/false）
         def to_bool(val, default=False):
@@ -966,9 +966,9 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             clog.log(env_id, "create_local_model", {"state_dim": state_dim_effective, "action_dim": config["action_dim"], "max_action": config["max_action"], "actor_only": True, "bin_num": config.get("bin_num", 72), "base_state_dim": base_state_dim}, {"created": True, "has_actor": has_actor, "has_critic": has_critic})
         print(f"环境 {env_id} 本地SAC副本创建完成 - Actor: {has_actor}, Critic: {has_critic}, CriticTarget: {has_critic_target}")
         if has_critic or has_critic_target:
-            print(f"警告: 环境 {env_id} 在actor_only模式下仍然创建了critic模型！这不应该发生。")
+            print(f"[ERROR] 警告: 环境 {env_id} 在actor_only模式下仍然创建了critic模型！这不应该发生。")
         if not has_actor:
-            print(f"错误: 环境 {env_id} 未能创建actor模型！")
+            print(f"[ERROR] 环境 {env_id} 未能创建actor模型！")
         
         # 创建共享模型管理器实例（子进程版本）
         # 从共享字典获取临时目录路径
@@ -1005,7 +1005,7 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             wait_attempt += 1
         
         if wait_attempt >= max_wait_attempts:
-            print(f"环境 {env_id} 警告: 未能获取到有效的模型权重，使用随机初始化的模型")
+            print(f"环境 {env_id} [ERROR] [ERROR] 警告: 未能获取到有效的模型权重，使用随机初始化的模型")
             if clog:
                 clog.log(env_id, "model_sync", None, {"ok": False, "msg": "timeout"})
         
@@ -1134,7 +1134,7 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                         if clog:
                             clog.log(env_id, "model_verify", {"sync_type": "episode"}, {"ok": verify_ok})
                     else:
-                        print(f"环境 {env_id} 警告: 未能获取到模型权重")
+                        print(f"环境 {env_id} [ERROR] [ERROR] 警告: 未能获取到模型权重")
                         if clog:
                             clog.log(env_id, "model_sync_episode", None, {"ok": False})
                 
@@ -1145,7 +1145,9 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     if not reset_success:
                         if clog:
                             clog.log(env_id, "reset_failed", None, {"reason": "reset returned False, retrying"})
-                        print(f"环境 {env_id} reset()失败，重试中...")
+                        # 只写入 env_log，不再额外刷综合训练日志；标记为 [ERROR]
+                        if env_logger is not None:
+                            env_logger.log(env_id, "[ERROR] reset()失败，重试中...")
                         continue
                 local_episode_counter += 1  # 每次reset时递增局部episode计数器
                 if clog:
@@ -1272,8 +1274,9 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     ):
                         latest_scan_has_nan_inf = _has_nan_inf(latest_scan)
                         last_action_has_nan_inf = _has_nan_inf(last_action)
+                        # 记录错误日志到控制台
                         print(
-                            f"环境 {env_id} step()返回值包含NaN/Inf，中断并丢弃本次episode（不占用episode编号）。"
+                            f"[ERROR] 环境 {env_id} step()返回值包含NaN/Inf，中断并丢弃本次episode（不占用episode编号）。"
                             f"已收集 {len(experiences)} 条样本将被丢弃。"
                             f"latest_scan包含NaN/Inf: {latest_scan_has_nan_inf}, "
                             f"distance: {distance}, distance_raw: {distance_raw}, cos: {cos}, sin: {sin}, reward: {reward}, "
@@ -1281,6 +1284,27 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                             f"ros_action包含NaN/Inf: {ros_action_has_nan_inf}, "
                             f"last_action包含NaN/Inf: {last_action_has_nan_inf}"
                         )
+                        # 同时追加到 collect_log
+                        if clog:
+                            clog.log(
+                                env_id,
+                                "[ERROR] step_nan_inf",
+                                {
+                                    "episode_number": local_episode_counter,
+                                    "episode_step": ros_env.step_count,
+                                    "distance": distance,
+                                    "cos": cos,
+                                    "sin": sin,
+                                    "collision": collision,
+                                    "goal": goal,
+                                    "reward": reward,
+                                },
+                                {
+                                    "latest_scan_has_nan_inf": latest_scan_has_nan_inf,
+                                    "ros_action_has_nan_inf": ros_action_has_nan_inf,
+                                    "last_action_has_nan_inf": last_action_has_nan_inf,
+                                },
+                            )
                         # 标记episode因NaN/Inf被丢弃，中断循环
                         episode_discarded_due_to_nan_inf = True
                         terminal = True  # 设置terminal为True以退出内层循环
@@ -1439,7 +1463,7 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                         if clog:
                             clog.log(env_id, "episode_end", {"episode_steps": ros_env.step_count, "episode_reward": episode_reward, "ending": episode_ending, "experiences_len": len(experiences)}, "submitted")
                     except Exception as e:
-                        print(f"环境 {env_id} 推送经验到队列失败: {e}")
+                        print(f"[ERROR] 环境 {env_id} 推送经验到队列失败: {e}")
                         if clog:
                             clog.log(env_id, "episode_end", {"episode_steps": ros_env.step_count}, "submit_failed")
                 
@@ -2168,7 +2192,7 @@ class ParallelMultiEnvTrainer:
                 with open(self.config_path, 'r', encoding='utf-8') as f:
                     self._loaded_config = yaml.safe_load(f) or {}
             except Exception as e:
-                print(f"警告: 读取配置文件失败: {e}")
+                print(f"[ERROR] 警告: 读取配置文件失败: {e}")
                 self._loaded_config = {}
         else:
             self._loaded_config = {}
@@ -2211,7 +2235,7 @@ class ParallelMultiEnvTrainer:
                     config_data = yaml.safe_load(f) or {}
                 config_to_image(config_data, target_config_path, "DRL Robot Dog Navigation - Training Config")
             except Exception as e:
-                print(f"警告: 保存配置快照到保存目录失败: {e}")
+                print(f"[ERROR] 警告: 保存配置快照到保存目录失败: {e}")
         
         print(f"初始化SAC模型...")
         print(f"使用state_dim={(self.base_state_dim * (1 + self.state_history_steps) if self.state_history_steps > 0 else self.base_state_dim)} (base_state_dim={self.base_state_dim}, state_history_steps={self.state_history_steps})")
@@ -2528,7 +2552,7 @@ class ParallelMultiEnvTrainer:
                           f"碰撞率={self.best_collision_rate:.4f} ({self.best_collision_rate*100:.2f}%)")
                     print(f"{'='*60}\n")
             except Exception as e:
-                msg = f"警告: [评估最好模型] 保存最好模型失败: {e}"
+                msg = f"[ERROR] 警告: [评估最好模型] 保存最好模型失败: {e}"
                 if getattr(self, "train_logger", None):
                     self.train_logger.log(msg)
                 else:
