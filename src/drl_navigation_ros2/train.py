@@ -437,9 +437,6 @@ def main(args=None):
     step_sleep_time = config.get('step_sleep_time', 0.1)
     reset_step_count = config.get('reset_step_count', 3)
     
-    # ==================== 调试参数 ====================
-    is_debug = config.get('is_debug', False)
-    
     # ==================== 动作噪声参数 ====================
     action_noise_std = config.get('action_noise_std', 0.2)
     
@@ -516,7 +513,6 @@ def main(args=None):
         reset_step_count=reset_step_count,
         goals_per_map=goals_per_map,
         reward_scale=reward_scale,  # 奖励缩放因子
-        is_debug=is_debug,  # 是否为调试模式
     )  # instantiate ROS environment
 
     # 只有在预训练开启时，才加载预存经验并进行预训练
@@ -595,8 +591,12 @@ def main(args=None):
         discounted_linear_acc_osc_sum = 0.0
         discounted_yawrate_osc_sum = 0.0
         
-        # 重置环境并获取初始状态
-        latest_scan, distance, cos, sin, collision, goal, last_action, reward, current_v, current_w = ros.reset()
+        # 重置环境并获取初始状态，循环调用直到成功
+        reset_success = False
+        while not reset_success:
+            reset_success, latest_scan, distance, distance_raw, cos, sin, collision, goal, last_action, reward, current_v, current_w = ros.reset()
+            if not reset_success:
+                print("reset()失败，重试中...")
         
         # 计算当前episode的max_steps
         if max_steps_ratio == 0:
@@ -633,9 +633,11 @@ def main(args=None):
                 max_deceleration=max_deceleration,
                 step_time=step_sleep_time,
             )
-            latest_scan, distance, cos, sin, collision, goal, last_action, reward, current_v, current_w = ros.step(
+            latest_scan, distance, distance_raw, cos, sin, collision, goal, reward, current_v, current_w = ros.step(
                 lin_velocity=ros_action[0], ang_velocity=ros_action[1]
             )  # get data from the environment
+            # 调用方维护 last_action（本次实际执行动作），用于下一时刻观测拼接/动作约束
+            last_action = [float(ros_action[0]), float(ros_action[1])]
             # 计算折扣回报：G_0 = r_0 + γ*r_1 + γ²*r_2 + ...（使用统一的 discount_factor）
             episode_reward += gamma_power * reward
             
@@ -698,40 +700,39 @@ def main(args=None):
                 steps_since_last_train = 0
                 if critic_loss is not None:
                     loss_tracker.add_loss(critic_loss, batch_size, 1)
-                    # 当处于调试模式时，打印每次梯度更新的训练信息（单步在线更新）
-                    if is_debug:
-                        current_stats = statistics.get_statistics()
-                        buffer_current_size = replay_buffer.size()
-                        avg_sample_usage = loss_tracker.get_avg_sample_usage()
-                        current_time = datetime.now()
-                        # 处理可能为None的ActorLoss和梯度统计
-                        actor_loss_str = f"{actor_loss:.4f}" if actor_loss is not None else "None"
-                        critic_grad_before = critic_grad.get("before") if isinstance(critic_grad, dict) else None
-                        critic_grad_after = critic_grad.get("after") if isinstance(critic_grad, dict) else None
-                        actor_grad_before = actor_grad.get("before") if isinstance(actor_grad, dict) else None
-                        actor_grad_after = actor_grad.get("after") if isinstance(actor_grad, dict) else None
-                        critic_grad_str = (
-                            f"before={critic_grad_before:.4f},after={critic_grad_after:.4f}"
-                            if critic_grad_before is not None and critic_grad_after is not None
-                            else "None"
-                        )
-                        actor_grad_str = (
-                            f"before={actor_grad_before:.4f},after={actor_grad_after:.4f}"
-                            if actor_grad_before is not None and actor_grad_after is not None
-                            else "None"
-                        )
-                        print(
-                            f"{current_time.strftime('%Y-%m-%d %H:%M:%S')} "
-                            f"[DEBUG] GradUpdate #{loss_tracker.total_trainings} "
-                            f"CriticLoss={critic_loss:.4f} "
-                            f"ActorLoss={actor_loss_str} "
-                            f"CriticGrad({critic_grad_str}) "
-                            f"ActorGrad({actor_grad_str}) "
-                            f"BatchSize={batch_size} "
-                            f"BufferSize={buffer_current_size} "
-                            f"AvgSampleUsage={avg_sample_usage:.2f} "
-                            f"Episodes={current_stats.get('total_episodes', 0)}"
-                        )
+                    # 打印每次梯度更新的训练信息（单步在线更新）
+                    current_stats = statistics.get_statistics()
+                    buffer_current_size = replay_buffer.size()
+                    avg_sample_usage = loss_tracker.get_avg_sample_usage()
+                    current_time = datetime.now()
+                    # 处理可能为None的ActorLoss和梯度统计
+                    actor_loss_str = f"{actor_loss:.4f}" if actor_loss is not None else "None"
+                    critic_grad_before = critic_grad.get("before") if isinstance(critic_grad, dict) else None
+                    critic_grad_after = critic_grad.get("after") if isinstance(critic_grad, dict) else None
+                    actor_grad_before = actor_grad.get("before") if isinstance(actor_grad, dict) else None
+                    actor_grad_after = actor_grad.get("after") if isinstance(actor_grad, dict) else None
+                    critic_grad_str = (
+                        f"before={critic_grad_before:.4f},after={critic_grad_after:.4f}"
+                        if critic_grad_before is not None and critic_grad_after is not None
+                        else "None"
+                    )
+                    actor_grad_str = (
+                        f"before={actor_grad_before:.4f},after={actor_grad_after:.4f}"
+                        if actor_grad_before is not None and actor_grad_after is not None
+                        else "None"
+                    )
+                    print(
+                        f"{current_time.strftime('%Y-%m-%d %H:%M:%S')} "
+                        f"[DEBUG] GradUpdate #{loss_tracker.total_trainings} "
+                        f"CriticLoss={critic_loss:.4f} "
+                        f"ActorLoss={actor_loss_str} "
+                        f"CriticGrad({critic_grad_str}) "
+                        f"ActorGrad({actor_grad_str}) "
+                        f"BatchSize={batch_size} "
+                        f"BufferSize={buffer_current_size} "
+                        f"AvgSampleUsage={avg_sample_usage:.2f} "
+                        f"Episodes={current_stats.get('total_episodes', 0)}"
+                    )
 
             # 检查episode是否结束（terminal或达到max_steps）
             if terminal or ros.step_count >= max_steps:

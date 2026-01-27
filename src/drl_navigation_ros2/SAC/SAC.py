@@ -9,6 +9,7 @@ from statistics import mean
 import SAC.SAC_utils as utils
 from SAC.SAC_critic import DoubleQCritic as critic_model
 from SAC.SAC_actor import DiagGaussianActor as actor_model
+from logging_utils import append_timestamped_line
 
 
 class SAC(object):
@@ -44,6 +45,7 @@ class SAC(object):
         actor_grad_clip_value=0.0,  # Actor网络梯度裁剪值（>0时启用梯度裁剪，将梯度裁剪到[-actor_grad_clip_value, actor_grad_clip_value]范围；0或负数表示不进行梯度裁剪）
         critic_grad_clip_value=0.0,  # Critic网络梯度裁剪值（>0时启用梯度裁剪，将梯度裁剪到[-critic_grad_clip_value, critic_grad_clip_value]范围；0或负数表示不进行梯度裁剪）
         bin_num=72,  # 激光扫描分区（bin）的数量
+        train_log_path=None,  # 训练调试日志路径；若设置，SAC 内部训练相关 print 将写入该文件
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -150,16 +152,25 @@ class SAC(object):
         self.action_noise_std = action_noise_std
         self.actor_grad_clip_value = actor_grad_clip_value if actor_grad_clip_value > 0 else None  # 只有>0时才启用梯度裁剪
         self.critic_grad_clip_value = critic_grad_clip_value if critic_grad_clip_value > 0 else None  # 只有>0时才启用梯度裁剪
+        self.train_log_path = (train_log_path or "").strip() or None
     
         # print(f"SAC initialized")
 
+    def _train_log(self, msg):
+        """若已设置 train_log_path，将训练调试信息写入该文件；否则不输出。"""
+        if not self.train_log_path:
+            return
+        append_timestamped_line(self.train_log_path, msg)
 
     def save(self, filename, directory):
         """保存模型权重"""
         if self.actor_only:
             # actor_only模式下只保存actor权重
             torch.save(self.actor.state_dict(), "%s/%s_actor.pth" % (directory, filename))
-            print(f"Saved actor model to: {directory}")
+            if self.train_log_path:
+                self._train_log(f"Saved actor model to: {directory}")
+            else:
+                print(f"Saved actor model to: {directory}")
         else:
             # 完整模式下保存所有组件
             torch.save(self.actor.state_dict(), "%s/%s_actor.pth" % (directory, filename))
@@ -168,7 +179,10 @@ class SAC(object):
                 self.critic_target.state_dict(),
                 "%s/%s_critic_target.pth" % (directory, filename),
             )
-            print(f"Saved models to: {directory}")
+            if self.train_log_path:
+                self._train_log(f"Saved models to: {directory}")
+            else:
+                print(f"Saved models to: {directory}")
 
     @staticmethod
     def infer_network_structure_from_weights(actor_weights_path, action_dim):
@@ -370,9 +384,30 @@ class SAC(object):
             
             # 检查输入观察值是否包含NaN或Inf
             if not torch.isfinite(obs).all():
-                # 如果输入包含NaN/Inf，使用零动作作为安全回退
-                print(f"警告: act方法收到包含NaN/Inf的观察值，使用零动作作为回退。NaN count: {(~torch.isfinite(obs)).sum().item()}")
-                obs = torch.zeros_like(obs)
+                # 如果输入包含NaN/Inf，直接返回安全动作：线速度0（-1），角速度0（0）
+                nan_count = (~torch.isfinite(obs)).sum().item()
+                inf_count = torch.isinf(obs).sum().item()
+                nan_indices = torch.where(~torch.isfinite(obs))[0].cpu().numpy()
+                
+                # 将obs转换为numpy数组以便完整打印
+                obs_np = obs.cpu().numpy()
+                
+                # 记录完整的obs到train_log（无论obs多大都完整打印）
+                log_msg = (
+                    f"警告: act方法收到包含NaN/Inf的观察值，使用零动作作为回退。\n"
+                    f"  NaN数量: {nan_count}, Inf数量: {inf_count}\n"
+                    f"  异常索引: {nan_indices}\n"
+                    f"  完整obs (shape={obs_np.shape}):\n"
+                    f"  {np.array2string(obs_np, max_line_width=np.inf, separator=', ', precision=6, floatmode='general', suppress_small=False)}"
+                )
+                if self.train_log_path:
+                    self._train_log(log_msg)
+                else:
+                    print(log_msg)
+                
+                # 动作格式：[线速度, 角速度]，其中-1表示线速度0，0表示角速度0
+                safe_action = np.array([-1.0, 0.0])
+                return safe_action
             
             obs = obs.unsqueeze(0)
             
@@ -387,10 +422,10 @@ class SAC(object):
                 return utils.to_np(action[0])
             except (ValueError, RuntimeError) as e:
                 # 如果Actor网络出现问题，使用零动作作为安全回退
+                # 动作格式：[线速度, 角速度]，其中-1表示线速度0，0表示角速度0
                 print(f"警告: Actor网络出错 ({e})，使用零动作作为回退")
-                action_shape = (1, self.action_dim)
-                action = torch.zeros(action_shape, device=self.device)
-                return utils.to_np(action[0])
+                safe_action = np.array([-1.0, 0.0])
+                return safe_action
 
     def update_critic(self, obs, action, reward, next_obs, done, step):
         dist = self.actor(next_obs)
@@ -537,7 +572,11 @@ class SAC(object):
             batch_data = replay_buffer.sample_batch(batch_size)
         sample_dt = time.time() - t0
         if batch_data is None:
-            print(f"警告: 缓冲区大小({replay_buffer.size()})小于批次大小({batch_size})，跳过训练")
+            msg = f"警告: 缓冲区大小({replay_buffer.size()})小于批次大小({batch_size})，跳过训练"
+            if self.train_log_path:
+                self._train_log(msg)
+            else:
+                print(msg)
             return None, None, None, None, sample_dt, time.time() - t0
         (
             batch_states,

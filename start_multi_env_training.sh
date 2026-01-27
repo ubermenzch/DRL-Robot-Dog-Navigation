@@ -238,6 +238,14 @@ PID_FILE="$TMP_DIR/multi_env_training.pid"
 mkdir -p "$LOG_DIR"
 mkdir -p "$TMP_DIR"
 
+# 将本脚本执行的所有指令记录到 sh_log_<timestamp>.log（含时间戳）
+SH_LOG="$LOG_DIR/sh_log_${TIMESTAMP}.log"
+exec 19>>"$SH_LOG"
+echo "=== 脚本指令追踪开始 $(date '+%Y-%m-%d %H:%M:%S') ===" >&19
+export BASH_XTRACEFD=19
+PS4='+ [$(date "+%Y-%m-%d %H:%M:%S")] '
+set -x
+
 # 仅向 multi_env_train.py 传递时间戳；日志基目录由 train.yaml 的 multi_env_log_model_dir 提供
 export TRAINING_TIMESTAMP="$TIMESTAMP"
 
@@ -753,6 +761,7 @@ if [ "$DAEMON_MODE" = true ]; then
     export SCRIPT_DIR TIMESTAMP LOG_DIR_BASE DAEMON_MODE
     export TMP_DIR PID_FILE CONFIG_FILE
     export TURTLEBOT3_MODEL_CONFIG
+    export SH_LOG
     # 外层直接重定向到日志，避免 nohup 提示输出到 nohup.out
     nohup bash -c "
         $(declare -f log_output)
@@ -771,6 +780,13 @@ if [ "$DAEMON_MODE" = true ]; then
         # 重新定义输出重定向
         exec 1>> \"\$LOGFILE\" 2>&1
         echo \"===== 后台训练进程启动 - \$(date '+%Y-%m-%d %H:%M:%S') =====\"
+        
+        # 将本脚本执行的所有指令记录到 sh_log（后台子进程）
+        exec 19>> \"\$SH_LOG\"
+        echo \"=== 脚本指令追踪开始（后台进程） \$(date '+%Y-%m-%d %H:%M:%S') ===\" >&19
+        export BASH_XTRACEFD=19
+        PS4='+ [\$(date \"+%Y-%m-%d %H:%M:%S\")] '
+        set -x
         main
     " >> "$LOGFILE" 2>&1 &
     

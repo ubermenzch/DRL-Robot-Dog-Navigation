@@ -1,5 +1,5 @@
 # ==================== 启动参数 ====================
-gpu_id: 0  # 使用的GPU编号（可用于导出 CUDA_VISIBLE_DEVICES）
+gpu_id: 2  # 使用的GPU编号（可用于导出 CUDA_VISIBLE_DEVICES）
 num_envs: 8  # 并行环境数量(一个环境要占用800m左右的显存)
 multi_env_log_model_dir: "log/multi_env_training"  # 日志和模型保存基目录，启动训练时会在此下按时间戳创建子目录存放日志与模型
 gazebo_wait_time: 10 # Gazebo启动等待时间（秒），建议设置为30-60秒以确保所有环境完全启动；对于32个环境，建议至少30秒
@@ -7,7 +7,6 @@ gazebo_start_interval: 5  # 每个Gazebo环境启动后的间隔时间（秒）�
 gazebo_base_port: 10001  # Gazebo Master端口基址，每个环境使用 gazebo_base_port + env_id 作为端口（例如：gazebo_base_port=11345, env_id=0 则使用端口11345）；不同容器应设置不同的基址以避免端口冲突
 start_ros_domain_id: 1  # 起始ROS_DOMAIN_ID，多环境从此ID开始递增（例如：start_ros_domain_id=1, num_envs=4，则使用ROS_DOMAIN_ID 1,2,3,4）；重要：多个Docker容器同时运行时，每个容器必须使用不同的起始值以避免DDS类型冲突（例如：容器1用1，容器2用100）
 enable_weight_consistency_check: false  # 是否进行模型权重一致性详细检验（为true时会在每个环境初始化时打印大量权重信息）
-is_debug: false  # 是否为调试模式
 
 # ==================== 模型参数 ====================
 hidden_layers: [1024,1024,1024,1024,1024]  # 神经网络隐藏层结构
@@ -87,6 +86,17 @@ max_yawrate: 30  # 最大偏航率（单位：度/秒）
 neglect_angle: 0  # 前方视野左右两边忽略的角度（单位：度）
 scan_range: 10  # 激光雷达扫描范围
 localization_noise_stddev: 0.304  # 0.304约等于90%的取值的绝对值分布在0.5内；对odom的x,y添加 N(0, stddev) 高斯噪声；0表示不加噪声
+sensor_freq_limit:
+  scan_max_freq: 10.0   # 激光雷达最大处理频率（Hz），0表示不限制；建议值：5-20
+  odom_max_freq: 30.0   # 里程计最大处理频率（Hz），0表示不限制；建议值：20-50
+  imu_max_freq: 30.0   # IMU最大处理频率（Hz），0表示不限制；建议值：50-200
+
+# ==================== 传感器日志开关 ====================
+# 控制是否记录各传感器的详细日志（只有实际更新数据时才记录，被频率限制跳过的callback不记录）
+sensor_log_enable:
+  scan_enable_log: true  # 是否记录激光雷达日志（true=记录，false=不记录）
+  odom_enable_log: true  # 是否记录里程计日志（true=记录，false=不记录）
+  imu_enable_log: true  # 是否记录IMU日志（true=记录，false=不记录）
 
 # ==================== 奖励函数参数 ====================
 reward_scale: 0.05  # 奖励缩放因子，用于控制每步整体奖励大小；1.0表示不缩放；统一应用于所有奖励（goal_reward、collision_penalty、各惩罚项）
@@ -150,5 +160,5 @@ max_episodes: 0  # 最大episode数（单环境训练使用；达到此数量后
 save_every_single_env: 300  # 单环境训练：每多少次训练后保存一次模型（如果未设置，则使用save_every的值）
 gazebo_port: 19999  # 单环境训练：Gazebo Master端口地址（默认11345，避免与多环境训练端口冲突）
 # ==================== 不太重要的参数 ====================
-step_sleep_time: 0.2  # step方法中的sleep时间（秒）
+step_sleep_time: 0.3  # step方法中的sleep时间（秒）
 reset_step_count: 25  # reset方法中调用step的次数

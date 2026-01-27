@@ -36,6 +36,7 @@ from SAC.SAC import SAC
 from ros_python import ROS_env
 from replay_buffer import ReplayBuffer, StratifiedReplayBuffer, NumpyReplayBuffer, NumpyStratifiedReplayBuffer
 import utils
+from logging_utils import CollectLogger, TrainLogger, EnvLogger, RewardLogger, NodesLogger, multi_env_log_paths, append_timestamped_line
 
 
 # ==================== Phase定义 ====================
@@ -167,36 +168,55 @@ def config_to_image(config_data, output_path, title="Training Configuration"):
     print(f"包含 {len(config_lines)} 个配置项")
 
 
-def _is_valid_env_return(latest_scan, distance, cos, sin, collision, goal, last_action, reward):
-    """检查环境reset/step返回值是否包含NaN或Inf值
+def _is_valid_env_return(latest_scan, distance, distance_raw, cos, sin, collision, goal, reward, current_v, current_w):
+    """检查环境 reset/step 返回值是否包含 NaN 或 Inf 值。
+
+    注意：ROS_env.step() 不再返回 last_action，动作由调用方维护，
+    因此这里不再校验 last_action。
     
     Args:
         latest_scan: 激光扫描数据（数组）
         distance: 距离（标量）
+        distance_raw: 原始距离（标量）
         cos: 余弦值（标量）
         sin: 正弦值（标量）
         collision: 碰撞标志（布尔值）
         goal: 目标到达标志（布尔值）
-        last_action: 上一个动作（数组）
         reward: 奖励（标量）
+        current_v: 当前线速度（标量）
+        current_w: 当前角速度（标量）
         
     Returns:
         bool: True表示返回值有效，False表示包含无效值
     """
-    # 检查数组类型的数据
-    for name, data in [("latest_scan", latest_scan), ("last_action", last_action)]:
-        arr = np.asarray(data)
-        if not np.isfinite(arr).all():
+    def _all_finite(x) -> bool:
+        """对标量/数组统一做 isfinite 检查；遇到异常直接判为无效。"""
+        try:
+            return bool(np.isfinite(np.asarray(x)).all())
+        except Exception:
+            try:
+                return bool(np.isfinite(float(x)))
+            except Exception:
+                return False
+
+    # latest_scan 为数组（或可转数组）
+    if not _all_finite(latest_scan):
+        return False
+
+    # 其余为标量/布尔：统一用 _all_finite 覆盖（布尔也会返回 True）
+    for value in (distance, distance_raw, cos, sin, reward, current_v, current_w, collision, goal):
+        if not _all_finite(value):
             return False
-    
-    # 检查标量类型的数据
-    for name, value in [("distance", distance), ("cos", cos), ("sin", sin), ("reward", reward)]:
-        if not np.isfinite(value):
-            return False
-    
-    # collision 和 goal 是布尔值，不需要检查 NaN/Inf
-    
+
     return True
+
+
+def _has_nan_inf(x) -> bool:
+    """安全判断对象是否包含 NaN/Inf（异常也视为无效）。"""
+    try:
+        return not bool(np.isfinite(np.asarray(x)).all())
+    except Exception:
+        return True
 
 
 def verify_actor_weight_consistency(local_model, latest_model_state, env_id, config):
@@ -778,10 +798,16 @@ class SharedModelManager:
 
 def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue, total_added_step, global_stats, config, init_complete_counter, total_episodes_counter, training_count_ref, critic_loss_ref, recent_losses_ref, avg_loss_window_size, phase_ref, eval_target_ref, eval_collected_lock, eval_collected_ref, current_buffer_size_ref, check_best_model_ref, round_done_counter, current_round_ref, env_target_dist_list=None):
     """单个环境的数据收集进程 - 真正的并行版本"""
+    collect_log_path = (config.get('collect_log_path') or '').strip()
+    clog = CollectLogger(collect_log_path) if collect_log_path else None
+    env_log_path = (config.get('env_log_path') or '').strip()
+    env_logger = EnvLogger(env_log_path) if env_log_path else None
+    reward_log_path = (config.get('reward_log_path') or '').strip()
+    reward_logger = RewardLogger(reward_log_path) if reward_log_path else None
+    nodes_log_path = (config.get('nodes_log_path') or '').strip()
+    nodes_logger = NodesLogger(nodes_log_path) if nodes_log_path else None
     try:
         print(f"环境 {env_id} 开始初始化...")
-        
-        is_debug = config.get('is_debug', False)
         
         # 设置正确的ROS域ID，确保与对应的Gazebo环境通信
         # 从配置文件中读取起始ROS_DOMAIN_ID，如果没有则默认为1（向后兼容）
@@ -789,11 +815,38 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
         ros_domain_id = start_ros_domain_id + env_id  # 环境0使用start_ros_domain_id，环境1使用start_ros_domain_id+1...
         os.environ['ROS_DOMAIN_ID'] = str(ros_domain_id)
         print(f"环境 {env_id} 设置ROS_DOMAIN_ID={ros_domain_id}")
+        if clog:
+            clog.log(env_id, "set_ros_domain_id", None, {"ROS_DOMAIN_ID": ros_domain_id})
+        if clog:
+            clog.log(env_id, "collect_start", {"env_id": env_id, "ros_domain_id": ros_domain_id, "start_ros_domain_id": start_ros_domain_id}, "started")
         
         print(f"环境 {env_id} 开始初始化ROS环境")
+        # 调试：打印传感器日志开关配置
+        print(f"环境 {env_id} 调试: config 中是否包含 'sensor_log_enable': {'sensor_log_enable' in config}")
+        print(f"环境 {env_id} 调试: config 中所有键: {list(config.keys())[:20]}...")  # 只打印前20个键
+        sensor_log_config = config.get('sensor_log_enable', {})
+        print(f"环境 {env_id} sensor_log_enable 配置类型: {type(sensor_log_config)}, 内容: {sensor_log_config}")
+        if isinstance(sensor_log_config, dict) and len(sensor_log_config) == 0:
+            print(f"环境 {env_id} 警告: sensor_log_enable 是空字典！检查配置文件格式。")
+        
+        # 辅助函数：将值转换为布尔值（处理字符串形式的 true/false）
+        def to_bool(val, default=False):
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                return val.lower() in ('true', '1', 'yes', 'on')
+            return bool(val) if val is not None else default
+        
+        scan_enable_log_val = to_bool(sensor_log_config.get('scan_enable_log', False)) if isinstance(sensor_log_config, dict) else False
+        odom_enable_log_val = to_bool(sensor_log_config.get('odom_enable_log', False)) if isinstance(sensor_log_config, dict) else False
+        imu_enable_log_val = to_bool(sensor_log_config.get('imu_enable_log', False)) if isinstance(sensor_log_config, dict) else False
+        print(f"环境 {env_id} 传感器日志开关配置: scan={scan_enable_log_val} (type={type(scan_enable_log_val)}), odom={odom_enable_log_val} (type={type(odom_enable_log_val)}), imu={imu_enable_log_val} (type={type(imu_enable_log_val)})")
         # 初始化ROS环境（奖励/惩罚参数从 train.yaml 配置读取）
         ros_env = ROS_env(
             env_id=env_id,  # 传递正确的环境ID
+            env_logger=env_logger,
+            reward_logger=reward_logger,
+            nodes_logger=nodes_logger,
             max_velocity=config['max_velocity'],
             init_target_distance=config['init_target_distance'],
             target_dist_increase=config['target_dist_increase'],
@@ -803,6 +856,14 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             neglect_angle=config['neglect_angle'],
             scan_range=config['scan_range'],
             localization_noise_stddev=config.get('localization_noise_stddev', 0.0),
+            # 传感器频率限制参数
+            scan_max_freq=config.get('sensor_freq_limit', {}).get('scan_max_freq', 0.0),
+            odom_max_freq=config.get('sensor_freq_limit', {}).get('odom_max_freq', 0.0),
+            imu_max_freq=config.get('sensor_freq_limit', {}).get('imu_max_freq', 0.0),
+            # 传感器日志开关（从 train.yaml 的 sensor_log_enable 配置读取）
+            scan_enable_log=scan_enable_log_val,
+            odom_enable_log=odom_enable_log_val,
+            imu_enable_log=imu_enable_log_val,
             world_size=config['world_size'],
             goals_per_map=config.get('goals_per_map', 1),
             obs_min_dist=config['obs_min_dist'],
@@ -850,10 +911,10 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             region_select_bias=config.get('region_select_bias', 1.0),
             # 奖励归一化参数
             reward_scale=config.get('reward_scale', 1.0),  # 奖励缩放因子，用于控制每步整体奖励大小
-            # 调试参数
-            is_debug=config.get('is_debug', False),  # 是否为调试模式
         )
         print(f"环境 {env_id} ROS环境初始化完成")
+        if clog:
+            clog.log(env_id, "init_ros_env", {"env_id": env_id, "ros_domain_id": ros_domain_id}, "created")
         
         # 在spawn模式下，需要重新创建模型实例
         # 确保数据收集进程使用与主进程相同的GPU设备
@@ -901,6 +962,8 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
         has_actor = hasattr(local_model, 'actor') and local_model.actor is not None
         has_critic = hasattr(local_model, 'critic') and local_model.critic is not None
         has_critic_target = hasattr(local_model, 'critic_target') and local_model.critic_target is not None
+        if clog:
+            clog.log(env_id, "create_local_model", {"state_dim": state_dim_effective, "action_dim": config["action_dim"], "max_action": config["max_action"], "actor_only": True, "bin_num": config.get("bin_num", 72), "base_state_dim": base_state_dim}, {"created": True, "has_actor": has_actor, "has_critic": has_critic})
         print(f"环境 {env_id} 本地SAC副本创建完成 - Actor: {has_actor}, Critic: {has_critic}, CriticTarget: {has_critic_target}")
         if has_critic or has_critic_target:
             print(f"警告: 环境 {env_id} 在actor_only模式下仍然创建了critic模型！这不应该发生。")
@@ -911,9 +974,13 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
         # 从共享字典获取临时目录路径
         shared_temp_dir = shared_model_dict.get('shared_temp_dir', None)
         model_manager = SharedModelManager(local_model, shared_model_dict, model_lock, training_count_ref, critic_loss_ref, recent_losses_ref, is_main_process=False, shared_temp_dir=shared_temp_dir)
+        if clog:
+            clog.log(env_id, "create_model_manager", {"shared_temp_dir": shared_temp_dir}, "created")
         
         # 等待主进程创建模型文件并同步权重
         print(f"环境 {env_id} 等待主进程模型文件...")
+        if clog:
+            clog.log(env_id, "model_wait_start", {"max_wait_attempts": 50}, "waiting")
         max_wait_attempts = 50  # 最多等待50次，每次0.1秒
         wait_attempt = 0
         
@@ -925,9 +992,13 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 # 加载模型权重到本地模型
                 local_model.load_state_dict(latest_model_state)
                 print(f"环境 {env_id} 模型权重同步完成")
+                if clog:
+                    clog.log(env_id, "model_sync", None, {"keys": list(latest_model_state.keys()), "ok": True})
                 
                 # 验证actor网络权重一致性
-                verify_actor_weight_consistency(local_model, latest_model_state, env_id, config)
+                verify_ok = verify_actor_weight_consistency(local_model, latest_model_state, env_id, config)
+                if clog:
+                    clog.log(env_id, "model_verify", {"sync_type": "initial"}, {"ok": verify_ok})
                 
                 break
             time.sleep(0.1)  # 等待0.1秒
@@ -935,11 +1006,15 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
         
         if wait_attempt >= max_wait_attempts:
             print(f"环境 {env_id} 警告: 未能获取到有效的模型权重，使用随机初始化的模型")
+            if clog:
+                clog.log(env_id, "model_sync", None, {"ok": False, "msg": "timeout"})
         
         
         # 增加初始化完成计数器
         with init_complete_counter.get_lock():
             init_complete_counter.value += 1
+            if clog:
+                clog.log(env_id, "init_complete", {"env_id": env_id}, {"counter": int(init_complete_counter.value)})
             print(f"环境 {env_id} 初始化完成，开始持续数据收集...")
         
         total_steps = 0
@@ -953,18 +1028,28 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
         last_is_eval = False
 
         global_episode_number = -1  # 安全初始化，防止异常时未定义
+        local_episode_counter = 0  # 局部episode计数器，用于在step()日志中标记episode编号
         # 关键约束：每个环境在同一轮（current_round_ref）内最多“提交/计入”一次训练episode。
         # 注意：被丢弃的episode（NaN/Inf、过滤规则、phase切换边界丢弃等）不会计入 round_done_counter，
         # 因此不会触发该闸门，仍允许在同一轮内重试，避免单环境因为偶发异常导致整轮卡住。
         last_committed_round = None
 
+        # 用于跟踪上一次 phase_skip 的状态，只在状态变化时记录日志
+        last_phase_skip_state = None
+
         while True:
             current_phase = phase_ref.value
             # STOP: 直接退出
             if current_phase == PHASE_STOP:
+                if clog:
+                    clog.log(env_id, "collect_exit", {"reason": "stop", "phase": current_phase}, "exiting")
                 break
             # PAUSE 或 EVAL_DRAIN: 等待主进程切换phase，不启动新episode
             if current_phase == PHASE_PAUSE or current_phase == PHASE_EVAL_DRAIN:
+                current_skip_state = {"phase": current_phase, "reason": "pause_or_eval_drain"}
+                if clog and current_skip_state != last_phase_skip_state:
+                    clog.log(env_id, "phase_skip", current_skip_state, None)
+                    last_phase_skip_state = current_skip_state
                 time.sleep(0.1)
                 continue
             
@@ -975,6 +1060,10 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             if not is_eval:
                 # TRAIN_DRAIN: 不允许开始新episode，等待当前episode结束
                 if current_phase == PHASE_TRAIN_DRAIN:
+                    current_skip_state = {"phase": current_phase, "reason": "train_drain"}
+                    if clog and current_skip_state != last_phase_skip_state:
+                        clog.log(env_id, "phase_skip", current_skip_state, None)
+                        last_phase_skip_state = current_skip_state
                     time.sleep(0.1)
                     continue
                 # TRAIN_COLLECT: 允许开始新episode
@@ -982,14 +1071,25 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     local_round = current_round_ref.value
                     # 每轮每环境最多提交一次：如果本环境已经在该轮提交过一个有效训练episode，则等待进入下一轮
                     if last_committed_round is not None and local_round == last_committed_round:
+                        current_skip_state = {"phase": current_phase, "reason": "round_committed", "local_round": local_round, "last_committed_round": last_committed_round}
+                        if clog and current_skip_state != last_phase_skip_state:
+                            clog.log(env_id, "phase_skip", current_skip_state, None)
+                            last_phase_skip_state = current_skip_state
                         time.sleep(0.1)
                         continue
                 else:
                     # 未知phase，等待
+                    current_skip_state = {"phase": current_phase, "reason": "unknown_phase"}
+                    if clog and current_skip_state != last_phase_skip_state:
+                        clog.log(env_id, "phase_skip", current_skip_state, None)
+                        last_phase_skip_state = current_skip_state
                     time.sleep(0.1)
                     continue
             else:
                 local_round = -1
+
+            # 当不再处于 phase_skip 状态时，重置状态跟踪变量
+            last_phase_skip_state = None
 
             # 阶段切换处理：每次进入评估阶段时，允许同步一次最新模型
             if is_eval and not last_is_eval:
@@ -999,17 +1099,26 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             if is_eval:
                 # 评估阶段固定使用最大目标距离，避免沿用训练阶段的递增值
                 ros_env.target_dist = config['max_target_dist']
-                if is_debug and env_id == 0:  # 只在环境0打印，避免刷屏
-                    print(f"[DEBUG] [环境 {env_id}] 进入评估阶段，target_dist={ros_env.target_dist:.2f}, eval_target={eval_target_ref.value}")
+                if clog:
+                    clog.log(env_id, "eval_target_dist_set", {"max_target_dist": config["max_target_dist"]}, {"target_dist": ros_env.target_dist, "eval_target": eval_target_ref.value})
+                if env_id == 0:  # 只在环境0打印，避免刷屏
+                    print(f"[环境 {env_id}] 进入评估阶段，target_dist={ros_env.target_dist:.2f}, eval_target={eval_target_ref.value}")
 
             # 评估阶段：首次进入时同步模型一次，之后不再更新
             if is_eval and not eval_model_synced:
                 latest_model_state = model_manager.get_model_state_dict_for_inference()
                 if latest_model_state:
                     local_model.load_state_dict(latest_model_state)
+                    if clog:
+                        clog.log(env_id, "model_sync_eval", None, {"ok": True})
                     print(f"环境 {env_id} 评估阶段模型同步完成")
                     # 验证actor网络权重一致性
-                    verify_actor_weight_consistency(local_model, latest_model_state, env_id, config)
+                    verify_ok = verify_actor_weight_consistency(local_model, latest_model_state, env_id, config)
+                    if clog:
+                        clog.log(env_id, "model_verify", {"sync_type": "eval"}, {"ok": verify_ok})
+                else:
+                    if clog:
+                        clog.log(env_id, "model_sync_eval", None, {"ok": False})
                 eval_model_synced = True
 
             try:
@@ -1018,30 +1127,37 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     latest_model_state = model_manager.get_model_state_dict_for_inference()
                     if latest_model_state:
                         local_model.load_state_dict(latest_model_state)
+                        if clog:
+                            clog.log(env_id, "model_sync_episode", None, {"ok": True})
                         # 验证actor网络权重一致性
-                        verify_actor_weight_consistency(local_model, latest_model_state, env_id, config)
+                        verify_ok = verify_actor_weight_consistency(local_model, latest_model_state, env_id, config)
+                        if clog:
+                            clog.log(env_id, "model_verify", {"sync_type": "episode"}, {"ok": verify_ok})
                     else:
                         print(f"环境 {env_id} 警告: 未能获取到模型权重")
+                        if clog:
+                            clog.log(env_id, "model_sync_episode", None, {"ok": False})
                 
-                # 重置环境
-                latest_scan, distance, cos, sin, collision, goal, last_action, reward, current_v, current_w = ros_env.reset()
-                
-                # 检查reset返回值是否包含NaN/Inf
-                if not _is_valid_env_return(latest_scan, distance, cos, sin, collision, goal, last_action, reward):
-                    print(
-                        f"环境 {env_id} reset()返回值包含NaN/Inf，丢弃本次episode（不占用episode编号）。"
-                        f"latest_scan包含NaN/Inf: {not np.isfinite(np.asarray(latest_scan)).all()}, "
-                        f"distance: {distance}, cos: {cos}, sin: {sin}, reward: {reward}, "
-                        f"last_action包含NaN/Inf: {not np.isfinite(np.asarray(last_action)).all()}"
-                    )
-                    continue
+                # 重置环境，循环调用直到成功
+                reset_success = False
+                while not reset_success:
+                    reset_success, latest_scan, distance, distance_raw, cos, sin, collision, goal, last_action, reward, current_v, current_w = ros_env.reset()
+                    if not reset_success:
+                        if clog:
+                            clog.log(env_id, "reset_failed", None, {"reason": "reset returned False, retrying"})
+                        print(f"环境 {env_id} reset()失败，重试中...")
+                        continue
+                local_episode_counter += 1  # 每次reset时递增局部episode计数器
+                if clog:
+                    clog.log(env_id, "reset", None, {"distance": distance, "cos": cos, "sin": sin, "collision": collision, "goal": goal, "reward": reward, "last_action": last_action, "current_v": current_v, "current_w": current_w})
                 
                 state, terminal = local_model.prepare_state(
                     latest_scan, distance, cos, sin, collision, goal, last_action, current_v, current_w
                 )
+                if clog:
+                    clog.log(env_id, "prepare_state", {"source": "reset", "distance": distance, "cos": cos, "sin": sin, "collision": collision, "goal": goal, "last_action": last_action, "current_v": current_v, "current_w": current_w}, {"state": state, "state_len": len(state), "terminal": terminal})
                 
                 episode_reward = 0
-                episode_steps = 0
                 gamma_power = 1.0  # 折扣因子幂次（γ^t），用于统一计算总回报和所有 Reward Detail 分项的折扣回报
                 experiences = []
                 episode_discarded_due_to_nan_inf = False  # 标记是否因NaN/Inf而丢弃episode
@@ -1081,17 +1197,19 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 # 收集一个episode的数据；当达到全局停止信号且超过最小门槛时提前结束
                 min_step_threshold = max(1, min(max_steps, int(math.ceil(max_steps * config.get('min_collection_ratio', 0.25)))))
                 forced_stop_flag = False
-                while not terminal and episode_steps < max_steps:
+                if clog:
+                    clog.log(env_id, "episode_start", {"is_eval": is_eval, "max_steps": max_steps, "min_step_threshold": min_step_threshold, "target_dist": ros_env.target_dist, "distance": distance, "state_len": len(state), "state_history_steps": state_history_steps, "discount_factor": discount_factor, "local_round": local_round}, "loop_started")
+                while not terminal and ros_env.step_count < max_steps:
                     current_phase_in_loop = phase_ref.value
                     # 训练阶段：如果phase切换到TRAIN_DRAIN或已离开训练阶段
                     if not is_eval:
                         if current_phase_in_loop == PHASE_TRAIN_DRAIN or current_phase_in_loop != PHASE_TRAIN_COLLECT:
                             # 如果满足最小门槛，可以截断（如果是terminal导致的自然结束，也会正常退出循环）
-                            if episode_steps >= min_step_threshold:
+                            if ros_env.step_count >= min_step_threshold:
                                 forced_stop_flag = True
                                 break
                             # 如果未满足最小门槛，继续运行直到满足min_threshold或发生terminal
-                            # （terminal时循环会自然退出，此时episode_steps可能 < min_threshold，但后续会判断terminal允许完成）
+                            # （terminal时循环会自然退出，此时ros_env.step_count可能 < min_threshold，但后续会判断terminal允许完成）
                     # 评估阶段：如果phase离开EVAL_COLLECT（例如进入EVAL_DRAIN/PAUSE等），满足最小门槛后尽快截断，
                     # 且该episode后续不会计入统计（见后面的phase判断）
                     else:
@@ -1101,34 +1219,76 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     # 1. 构造当前输入 x_t（统一从 current_state_with_history 中读取；
                     #    当 state_history_steps 为 0 时，current_state_with_history 仅包含当前 state）
                     model_action = local_model.get_action(current_state_with_history, add_noise=not is_eval)
-                    ros_action = utils.transfor_action(
-                        model_action, 
-                        max_velocity=config['max_velocity'], 
-                        max_yawrate=config['max_yawrate'],
-                        prev_linear_velocity=last_action[0],
-                        max_acceleration=config.get('max_acceleration', 1.0),
-                        max_deceleration=config.get('max_deceleration', 1.0),
-                        step_time=config.get('step_sleep_time', 0.1),
-                    )
+                    if clog:
+                        clog.log(env_id, "get_action", {"state": current_state_with_history, "state_len": len(current_state_with_history), "add_noise": not is_eval}, {"model_action": model_action})
+                    # 手动转换动作：
+                    # - 线速度：将 model_action[0] 从 [-1, 1] 重新投影到 [0, max_velocity]
+                    # - 角速度：保持与 utils.transfor_action() 相同的转换方式
+                    max_velocity = float(config["max_velocity"])
+                    lin_velocity = (float(model_action[0]) + 1.0) * (max_velocity / 2.0)
+                    lin_velocity = min(max(lin_velocity, 0.0), max_velocity)
+
+                    max_yawrate = float(config["max_yawrate"])
+                    ang_velocity = float(model_action[1]) * (max_yawrate / 180.0) * math.pi
+
+                    ros_action = [lin_velocity, ang_velocity]
+                    if clog:
+                        clog.log(
+                            env_id,
+                            "manual_action_transform",
+                            {"model_action": model_action, "max_velocity": max_velocity, "max_yawrate": max_yawrate},
+                            {"lin_velocity": ros_action[0], "ang_velocity": ros_action[1]},
+                        )
                     
                     # 执行动作
-                    latest_scan, distance, cos, sin, collision, goal, last_action, reward, current_v, current_w = ros_env.step(
+                    latest_scan, distance, distance_raw, cos, sin, collision, goal, reward, current_v, current_w = ros_env.step(
                         lin_velocity=ros_action[0], ang_velocity=ros_action[1]
                     )
-                    
-                    # 检查step返回值是否包含NaN/Inf
-                    if not _is_valid_env_return(latest_scan, distance, cos, sin, collision, goal, last_action, reward):
+                    if clog:
+                        # 为避免语义混淆：step 的 output 里同时记录“上一动作(last_action)”与“本次执行动作(action)”
+                        clog.log(
+                            env_id,
+                            "step",
+                            {"lin_velocity": ros_action[0], "ang_velocity": ros_action[1], "episode_number": local_episode_counter, "episode_step": ros_env.step_count},
+                            {
+                                "distance": distance,
+                                "cos": cos,
+                                "sin": sin,
+                                "reward": reward,
+                                "collision": collision,
+                                "goal": goal,
+                                # step 日志中的 last_action = 上一动作（即执行本次 action 之前的 last_action）
+                                "last_action": last_action,
+                                # step 日志中的 action = 本次实际下发动作
+                                "action": [float(ros_action[0]), float(ros_action[1])],
+                                "current_v": current_v,
+                                "current_w": current_w,
+                            },
+                        )
+                                        # 检查step返回值是否包含NaN/Inf
+                    ros_action_has_nan_inf = _has_nan_inf(ros_action)
+                    if ros_action_has_nan_inf or not _is_valid_env_return(
+                        latest_scan, distance, distance_raw, cos, sin, collision, goal, reward, current_v, current_w
+                    ):
+                        latest_scan_has_nan_inf = _has_nan_inf(latest_scan)
+                        last_action_has_nan_inf = _has_nan_inf(last_action)
                         print(
                             f"环境 {env_id} step()返回值包含NaN/Inf，中断并丢弃本次episode（不占用episode编号）。"
                             f"已收集 {len(experiences)} 条样本将被丢弃。"
-                            f"latest_scan包含NaN/Inf: {not np.isfinite(np.asarray(latest_scan)).all()}, "
-                            f"distance: {distance}, cos: {cos}, sin: {sin}, reward: {reward}, "
-                            f"last_action包含NaN/Inf: {not np.isfinite(np.asarray(last_action)).all()}"
+                            f"latest_scan包含NaN/Inf: {latest_scan_has_nan_inf}, "
+                            f"distance: {distance}, distance_raw: {distance_raw}, cos: {cos}, sin: {sin}, reward: {reward}, "
+                            f"collision: {collision}, goal: {goal}, current_v: {current_v}, current_w: {current_w}, "
+                            f"ros_action包含NaN/Inf: {ros_action_has_nan_inf}, "
+                            f"last_action包含NaN/Inf: {last_action_has_nan_inf}"
                         )
                         # 标记episode因NaN/Inf被丢弃，中断循环
                         episode_discarded_due_to_nan_inf = True
                         terminal = True  # 设置terminal为True以退出内层循环
                         break
+                    # 调用方维护 last_action：用于下一时刻的观测拼接
+                    last_action = [float(ros_action[0]), float(ros_action[1])]
+                    
+
                     
                     # 计算折扣回报：G_0 = r_0 + γ*r_1 + γ²*r_2 + ...（使用统一的 discount_factor）
                     episode_reward += gamma_power * reward
@@ -1149,13 +1309,14 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     discounted_yawrate_osc_sum += gamma_power * float(parts_scaled.get("yawrate_osc", 0.0) or 0.0)
                     
                     gamma_power *= discount_factor  # 更新折扣因子幂次
-                    episode_steps += 1
                     total_steps += 1
                     
                     # 准备下一个状态（单步 state）
                     next_state, terminal = local_model.prepare_state(
                         latest_scan, distance, cos, sin, collision, goal, last_action, current_v, current_w
                     )
+                    if clog:
+                        clog.log(env_id, "prepare_state", {"source": "step", "episode_step": ros_env.step_count, "distance": distance, "cos": cos, "sin": sin, "collision": collision, "goal": goal, "last_action": last_action, "current_v": current_v, "current_w": current_w}, {"state": next_state, "state_len": len(next_state), "terminal": terminal})
                     
                     # 更新历史并构造下一时刻输入 x_{t+1}
                     # 将 next_state 压入历史，形成 [s_{t-k+1}, ..., s_t, s_{t+1}]
@@ -1173,12 +1334,16 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                                 # 如果episode因NaN/Inf被丢弃，跳过后续所有处理，不占用episode编号
 
                 if episode_discarded_due_to_nan_inf:
+                    if clog:
+                        clog.log(env_id, "episode_end", {"episode_steps": ros_env.step_count, "experiences_len": len(experiences)}, "discarded_step_nan_inf")
                     continue
 
                 # 强制停止：达到全局停止信号并手动截断
                 if forced_stop_flag and len(experiences) > 0:
                     # 末条transition置为非终止，避免错误的bootstrap截断
                     last_exp = experiences[-1]
+                    if clog:
+                        clog.log(env_id, "transition_trim", {"reason": "force_stop", "episode_steps": ros_env.step_count, "experiences_len": len(experiences), "last_done_before": last_exp[3]}, {"last_done_after": False})
                     experiences[-1] = (last_exp[0], last_exp[1], last_exp[2], False, last_exp[4])
                 
                 # 修复风险A：如果是因为timeout退出（步数达到上限且未发生goal/collision），将最后一个transition的done改为False
@@ -1186,9 +1351,11 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 # 1. timeout时episode确实会结束（退出内层循环，开启新的episode）
                 # 2. 但是done标志必须为False，这样在模型更新时会对后续回报的期望进行估计（bootstrap），而不是只使用即时回报
                 # 3. 如果同时达到max_steps和goal/collision，terminal已经是True，episode_ending会正确判断为Goal/Collision，无需修复
-                if episode_steps >= max_steps and not terminal and len(experiences) > 0:
+                if ros_env.step_count >= max_steps and not terminal and len(experiences) > 0:
                     # 将最后一个transition的done标志改为False，确保训练时bootstrap下一个状态的价值估计
                     last_exp = experiences[-1]
+                    if clog:
+                        clog.log(env_id, "transition_trim", {"reason": "timeout", "episode_steps": ros_env.step_count, "max_steps": max_steps, "experiences_len": len(experiences), "last_done_before": last_exp[3]}, {"last_done_after": False})
                     experiences[-1] = (last_exp[0], last_exp[1], last_exp[2], False, last_exp[4])
                 
                 # 判断episode结束原因
@@ -1206,9 +1373,11 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     timeout = True
                 
                 # 过滤规则：步数小于10且碰撞的episode不采用
-                should_filter = (episode_steps < 2 and (collision or goal))
+                should_filter = (ros_env.step_count < 2 and (collision or goal))
                 
                 if should_filter:
+                    if clog:
+                        clog.log(env_id, "episode_end", {"episode_steps": ros_env.step_count, "ending": episode_ending}, "filtered")
                     continue
 
                 # 若episode在阶段切换边界被截断完成（或切换后才结束），则直接丢弃：
@@ -1221,18 +1390,24 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     # 训练阶段：TRAIN_DRAIN阶段需要特殊处理
                     if current_phase_after_episode == PHASE_TRAIN_DRAIN:
                         # 如果满足完成条件（step>=min_threshold 或 terminal），允许完成
-                        if episode_steps >= min_step_threshold or terminal:
+                        if ros_env.step_count >= min_step_threshold or terminal:
                             # 允许继续，不丢弃
                             pass
                         else:
                             # step < min_threshold 且没有terminal，丢弃
+                            if clog:
+                                clog.log(env_id, "episode_end", {"episode_steps": ros_env.step_count, "ending": episode_ending}, "discarded_phase_drain")
                             continue
                     elif current_phase_after_episode != PHASE_TRAIN_COLLECT:
                         # 其他非TRAIN_COLLECT的phase，丢弃
+                        if clog:
+                            clog.log(env_id, "episode_end", {"episode_steps": ros_env.step_count, "ending": episode_ending}, "discarded_phase")
                         continue
                 else:
                     # 评估阶段：只有EVAL_COLLECT阶段的episode才计入统计
                     if current_phase_after_episode != PHASE_EVAL_COLLECT:
+                        if clog:
+                            clog.log(env_id, "episode_end", {"episode_steps": ros_env.step_count, "ending": episode_ending}, "discarded_eval_phase")
                         continue
                 
                 # 训练阶段才写入经验队列；评估阶段仅统计
@@ -1252,13 +1427,21 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                             f"环境 {env_id} 当前episode包含 {invalid_count}/{len(experiences)} 条包含NaN/Inf的经验，"
                             f"整条episode将被丢弃且不写入经验队列，不占用episode编号。"
                         )
+                        if clog:
+                            clog.log(env_id, "episode_end", {"episode_steps": ros_env.step_count, "invalid_count": invalid_count}, "discarded_nan_inf")
                         continue
                     
                     # 所有样本均为有效数值，直接写入经验队列
                     try:
                         experience_queue.put({"outcome": episode_ending, "experiences": experiences})
+                        if clog:
+                            clog.log(env_id, "queue_put", {"outcome": episode_ending, "experiences_len": len(experiences)}, "ok")
+                        if clog:
+                            clog.log(env_id, "episode_end", {"episode_steps": ros_env.step_count, "episode_reward": episode_reward, "ending": episode_ending, "experiences_len": len(experiences)}, "submitted")
                     except Exception as e:
                         print(f"环境 {env_id} 推送经验到队列失败: {e}")
+                        if clog:
+                            clog.log(env_id, "episode_end", {"episode_steps": ros_env.step_count}, "submit_failed")
                 
                 # 以 ros_env.initial_target_distance 为准（reset 后首步 step 的 distance）
                 target_distance = getattr(ros_env, "initial_target_distance", None)
@@ -1300,14 +1483,19 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     with eval_collected_lock:
                         eval_collected_ref.value += 1
                         current_eval_count = eval_collected_ref.value
-                    if is_debug and env_id == 0:  # 只在环境0打印，避免刷屏
-                        print(f"[DEBUG] [环境 {env_id}] 评估episode完成，eval_collected={current_eval_count}/{eval_target_ref.value}")
+                    if clog:
+                        clog.log(env_id, "episode_end", {"episode_steps": ros_env.step_count, "episode_reward": episode_reward, "ending": episode_ending}, "eval_recorded")
+                    if env_id == 0:  # 只在环境0打印，避免刷屏
+                        print(f"[环境 {env_id}] 评估episode完成，eval_collected={current_eval_count}/{eval_target_ref.value}")
                 
                 # 标记当前轮次的收集完成（或被截断）
                 # 训练线程会根据round_done_counter的值来设置phase_ref为TRAIN_DRAIN
                 if not is_eval:
                     with round_done_counter.get_lock():
                         round_done_counter.value += 1
+                        new_round_done = int(round_done_counter.value)
+                    if clog:
+                        clog.log(env_id, "round_done", {"local_round": local_round, "round_done_counter": new_round_done}, "incremented")
                     # 记录本环境在该轮已提交过一个有效训练episode，防止同轮再次提交
                     last_committed_round = local_round
                 
@@ -1403,27 +1591,52 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 episode_info = (
                     f"{current_time.strftime('%Y-%m-%d %H:%M:%S')} 环境 {env_id} "
                     f"Mode: {mode_str} Round: {local_round} Episode: {global_episode_number} "
-                    f"Target Distance: {ros_env.target_dist:.2f} (actual: {target_distance:.2f}) Steps: {episode_steps}\n"
+                    f"Target Distance: {ros_env.target_dist:.2f} (actual: {target_distance:.2f}) Steps: {ros_env.step_count}\n"
                     f"  Reward Detail: {detail_str}"
                 )
+                if clog:
+                    clog.log(env_id, "episode_reward_detail", {"episode_number": global_episode_number, "steps": ros_env.step_count, "ending": episode_ending, "mode": mode_str, "round": local_round, "target_dist": ros_env.target_dist, "target_distance": target_distance, "episode_reward": episode_reward}, {"detail": detail_str, "queue_size_episodes": queue_size_episodes})
                 print(episode_info)
                 
             except Exception as e:
                 print(f"环境 {env_id} Episode {global_episode_number} 出错: {e}")
                 time.sleep(0.1)
     except Exception as e:
+        if clog:
+            clog.log(env_id, "collect_exit", {"reason": "exception", "msg": str(e)}, "exiting")
         print(f"环境 {env_id} 初始化失败: {e}")
+    finally:
+        if clog is not None:
+            clog.close()
+        if env_logger is not None:
+            env_logger.close()
 
 
-def training_thread(model_manager, env_queues, config, total_added_step, total_episodes_counter, current_buffer_size_ref, round_done_counter, current_round_ref, phase_ref, eval_target_ref, eval_collected_lock, eval_collected_ref, global_stats, env_target_dist_list, max_steps_for_pause, check_best_model_fn):
+def training_thread(model_manager, env_queues, config, total_added_step, total_episodes_counter, current_buffer_size_ref, round_done_counter, current_round_ref, phase_ref, eval_target_ref, eval_collected_lock, eval_collected_ref, global_stats, env_target_dist_list, max_steps_for_pause, check_best_model_fn, train_logger=None, collect_logger=None):
     """按轮次训练：每轮收集完一定比例的episode后统一训练
     
     周期性评估触发位置：每轮训练完成后、开启下一轮收集之前。
     """
+    def _log(msg):
+        """通用日志：写入train_log，同时输出到综合日志"""
+        if train_logger:
+            train_logger.log(msg)
+        print(msg)  # 同时输出到综合日志
+    
+    def _collect_log(msg):
+        """收集相关日志：写入collect_log"""
+        if collect_logger and collect_logger.log_path:
+            append_timestamped_line(collect_logger.log_path, msg)
+        else:
+            _log(msg)
+    
+    def _train_log(msg):
+        """训练相关日志：写入train_log"""
+        _log(msg)
+
     try:
-        print("训练线程启动，按轮次等待数据再启动训练")
+        _log("训练线程启动，按轮次等待数据再启动训练")
         
-        is_debug = config.get('is_debug', False)
         training_count = 0
         total_samples_drawn = 0  # 总抽样样本数统计
         recent_actor_losses = []  # 存储最近N次训练的actor损失
@@ -1437,8 +1650,7 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
         last_eval_training_count = 0
         max_reached_logged = False
         
-        if is_debug:
-            print(f"[DEBUG] 训练线程初始化: threshold_envs={threshold_envs}, num_envs={num_envs}")
+        _train_log(f"训练线程初始化: threshold_envs={threshold_envs}, num_envs={num_envs}")
         
         # 本地缓冲区（固定使用 float32 以降低内存占用并提升速度）
         if config.get('enable_stratified_replay', False):
@@ -1461,14 +1673,13 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
         current_round_ref.value = 0
         phase_ref.value = PHASE_TRAIN_COLLECT
         
-        if is_debug:
-            print(f"[DEBUG] 初始轮次: current_round={current_round_ref.value}, phase_ref已设置为TRAIN_COLLECT")
+        _train_log(f"初始轮次: current_round={current_round_ref.value}, phase_ref已设置为TRAIN_COLLECT")
         
         while True:
             try:
                 max_rounds_cfg = config.get('max_rounds', config.get('max_training_count', 0))
                 if max_rounds_cfg and max_rounds_cfg > 0 and training_count >= max_rounds_cfg:
-                    print(f"达到最大轮次数 {max_rounds_cfg}，训练完成！")
+                    _log(f"达到最大轮次数 {max_rounds_cfg}，训练完成！")
                     break
                 
                 # 准备新一轮收集
@@ -1478,12 +1689,11 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                 round_index = current_round_ref.value
                 round_steps = 0
                 
-                if is_debug:
-                    print(f"[DEBUG] 开始新一轮收集: round_index={round_index}, round_done_counter已重置为0, phase_ref已设置为TRAIN_COLLECT")
+                _collect_log(f"开始新一轮收集: round_index={round_index}, round_done_counter已重置为0, phase_ref已设置为TRAIN_COLLECT")
                 
                 # 等待达到阈值并让所有进程提交本轮数据
                 wait_iteration = 0
-                last_debug_time = time.time()
+                last_logged_done = -1  # 记录上一次记录的round_done_counter值
                 while True:
                     pulled_any = False
                     queue_sizes = []
@@ -1516,22 +1726,18 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                     if current_done >= threshold_envs:
                         if phase_ref.value == PHASE_TRAIN_COLLECT:
                             phase_ref.value = PHASE_TRAIN_DRAIN
-                            if is_debug:
-                                print(f"[DEBUG] 达到阈值({threshold_envs}), 设置phase_ref为TRAIN_DRAIN, round_done_counter={current_done}")
+                            _collect_log(f"达到阈值({threshold_envs}), 设置phase_ref为TRAIN_DRAIN, round_done_counter={current_done}")
                     if current_done >= num_envs:
-                        if is_debug:
-                            print(f"[DEBUG] 所有进程完成({current_done}/{num_envs}), 退出等待循环, round_steps={round_steps}")
+                        _collect_log(f"所有进程完成({current_done}/{num_envs}), 退出等待循环, round_steps={round_steps}")
                         break
                     
-                    # 每0.5秒打印一次调试信息
-                    if is_debug:
-                        current_time = time.time()
-                        if current_time - last_debug_time >= 0.5:
-                            phase_str = ["TRAIN_COLLECT", "TRAIN_DRAIN", "EVAL_COLLECT", "PAUSE", "STOP"][phase_ref.value]
-                            print(f"[DEBUG] 等待中: round_done_counter={current_done}/{num_envs} (阈值={threshold_envs}), "
-                                  f"round_steps={round_steps}, 队列大小={queue_sizes}, "
-                                  f"phase_ref={phase_str}")
-                            last_debug_time = current_time
+                    # 只在round_done_counter更新时记录日志
+                    if current_done != last_logged_done:
+                        phase_str = ["TRAIN_COLLECT", "TRAIN_DRAIN", "EVAL_COLLECT", "PAUSE", "STOP"][phase_ref.value]
+                        _collect_log(f"等待中: round_done_counter={current_done}/{num_envs} (阈值={threshold_envs}), "
+                              f"round_steps={round_steps}, 队列大小={queue_sizes}, "
+                              f"phase_ref={phase_str}")
+                        last_logged_done = current_done
                     
                     wait_iteration += 1
                     time.sleep(0.1)
@@ -1565,14 +1771,12 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                     final_queue_sizes.append(queue_size)
                 pull_time = time.time() - pull_start_time if round_steps > 0 else 0.0
                 
-                if is_debug:
-                    print(f"[DEBUG] 队列清空完成: 最终round_steps={round_steps}, 清空时各队列大小={final_queue_sizes}, 耗时={pull_time:.3f}秒")
+                _collect_log(f"队列清空完成: 最终round_steps={round_steps}, 清空时各队列大小={final_queue_sizes}, 耗时={pull_time:.3f}秒")
                 
                 # 关闭本轮采集，准备训练（设置为PAUSE，防止新episode开始）
                 phase_ref.value = PHASE_PAUSE
                 
-                if is_debug:
-                    print(f"[DEBUG] 关闭本轮采集: phase_ref已设置为PAUSE, 准备训练")
+                _collect_log(f"关闭本轮采集: phase_ref已设置为PAUSE, 准备训练")
                 
                 # 计算缓冲区大小（总）以及子缓冲区大小（若启用分层采样）
                 buffer_size = local_buffer.size()
@@ -1596,13 +1800,11 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                 batch_size = config['batch_size']
                 
                 if round_steps == 0 or buffer_size == 0:
-                    if is_debug:
-                        print(f"[DEBUG] 本轮未收集到有效step: round_steps={round_steps}, buffer_size={buffer_size}, 跳过训练")
-                    print("本轮未收集到有效step，跳过训练，等待下一轮。")
+                    _collect_log(f"本轮未收集到有效step: round_steps={round_steps}, buffer_size={buffer_size}, 跳过训练")
+                    _collect_log("本轮未收集到有效step，跳过训练，等待下一轮。")
                     current_round_ref.value = round_index + 1
                     phase_ref.value = PHASE_TRAIN_COLLECT
-                    if is_debug:
-                        print(f"[DEBUG] 重新开启收集: phase_ref已设置为TRAIN_COLLECT, current_round={current_round_ref.value}")
+                    _collect_log(f"重新开启收集: phase_ref已设置为TRAIN_COLLECT, current_round={current_round_ref.value}")
                     time.sleep(0.1)
                     continue
                 
@@ -1610,9 +1812,8 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                 current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 
                 
-                if is_debug:
-                    print(f"[DEBUG] 开始训练: training_count={training_count+1}, round_steps={round_steps}, "
-                          f"training_iterations={training_iterations}, buffer_size={buffer_size}")
+                _train_log(f"开始训练: training_count={training_count+1}, round_steps={round_steps}, "
+                      f"training_iterations={training_iterations}, buffer_size={buffer_size}")
                 
                 message = (
                     f"{current_time} 第{training_count+1}次训练开始："
@@ -1620,7 +1821,7 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                     f"当前总episode数: {total_episodes_counter.value}，"
                     f"当前总step数: {total_added_step.value}，"
                 )
-                print(message)
+                _log(message)
                 
                 # 训练
                 start_time = time.time()
@@ -1651,12 +1852,12 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                     f"当前缓冲区大小: {buffer_size}" if not stratified_enabled else
                     f"当前缓冲区大小: {buffer_size} (Goal: {goal_buf_size}, Collision: {coll_buf_size}, Timeout: {timeout_buf_size})"
                 )
-                print(
+                _log(
                     f"{end_time_str} 第{training_count}次训练完成 | {buffer_info} | "
                     f"分层采样启用: {stratified_enabled}, 实际生效: {stratified_active}"
                 )
                 # 训练完成后再输出分层采样信息
-                print(
+                _log(
                     f"  本轮step: {round_steps} | 总抽样数: {total_samples_drawn} | 总样本数: {total_experiences_added} "
                     f"| 样本平均抽样次数: {avg_training_times:.2f}"
                 )
@@ -1670,7 +1871,7 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                         grad_info = f" | critic全局参数梯度L2范数: {avg_critic_grad:.6f}"
                 else:
                     grad_info = ""
-                print(f"  本次训练的平均critic网络损失: {avg_critic_loss:.6f}{grad_info}")
+                _log(f"  本次训练的平均critic网络损失: {avg_critic_loss:.6f}{grad_info}")
                 
                 if avg_actor_loss is not None:
                     recent_actor_losses.append(avg_actor_loss)
@@ -1683,7 +1884,7 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                             actor_grad_info = f" | actor全局参数梯度L2范数: {avg_actor_grad:.6f}"
                     else:
                         actor_grad_info = ""
-                    print(f"  本次训练的平均actor网络损失: {avg_actor_loss:.6f}{actor_grad_info}")
+                    _log(f"  本次训练的平均actor网络损失: {avg_actor_loss:.6f}{actor_grad_info}")
                 
                 entropy_info = ""
                 if avg_entropy is not None:
@@ -1691,19 +1892,19 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                 if avg_alpha_grad is not None:
                     entropy_info += f" | alpha梯度L2范数: {avg_alpha_grad:.6f}"
                 if entropy_info:
-                    print(f"  熵值统计:{entropy_info}")
+                    _log(f"  熵值统计:{entropy_info}")
                 
                 if sample_time is not None and update_time is not None:
                     total_sample_time = pull_time + sample_time
                     total_train_log_time = total_sample_time + compute_time if compute_time is not None else total_sample_time
-                    print(f"  训练耗时: {total_train_log_time:.2f}秒")
-                    print(
+                    _log(f"  训练耗时: {total_train_log_time:.2f}秒")
+                    _log(
                         f"  采样耗时总计: {total_sample_time:.2f}秒 "
                         f"(拉取到本地buffer: {pull_time:.2f}秒, 从本地buffer随机采样: {sample_time:.2f}秒)"
                     )
-                    print(f"  前向/反向(网络更新)耗时: {compute_time:.2f}秒")
+                    _log(f"  前向/反向(网络更新)耗时: {compute_time:.2f}秒")
                 else:
-                    print(f"  训练耗时: {total_train_time:.2f}秒")
+                    _log(f"  训练耗时: {total_train_time:.2f}秒")
                 
                 if hasattr(model_manager, 'training_count_ref') and model_manager.training_count_ref is not None:
                     model_manager.training_count_ref.value = training_count
@@ -1715,12 +1916,14 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                 if training_count % config.get('save_every', 50) == 0:
                     save_dir = Path(config['model_save_dir'])
                     save_dir.mkdir(parents=True, exist_ok=True)
-                    model_manager.model.save(filename=f"SAC_train_{training_count}", directory=save_dir)
+                    # 实时模型保存：始终覆盖同名文件，避免训练时间长导致生成过多模型文件
+                    # 输出文件名固定为：
+                    #   SAC_actor.pth, SAC_critic.pth, SAC_critic_target.pth
+                    model_manager.model.save(filename="SAC", directory=save_dir)
                 
                 
-                if is_debug:
-                    phase_str = ["TRAIN_COLLECT", "TRAIN_DRAIN", "EVAL_COLLECT", "PAUSE", "STOP"][phase_ref.value]
-                    print(f"[DEBUG] 训练完成，准备下一轮: current_round={current_round_ref.value}, phase_ref={phase_str}")
+                phase_str = ["TRAIN_COLLECT", "TRAIN_DRAIN", "EVAL_COLLECT", "PAUSE", "STOP"][phase_ref.value]
+                _train_log(f"训练完成，准备下一轮: current_round={current_round_ref.value}, phase_ref={phase_str}")
                 
                 # ==================== 周期性评估（训练线程尾部，开启下一轮前） ====================
                 if periodic_eval_enabled:
@@ -1731,12 +1934,12 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                     except Exception:
                         all_at_max = False
                     if all_at_max and not max_reached_logged:
-                        print(f"[周期性评估] 已检测到所有环境 target_dist 达到 max_target_dist={max_target_dist:.2f}，将开始按轮次触发评估。")
+                        _log(f"[周期性评估] 已检测到所有环境 target_dist 达到 max_target_dist={max_target_dist:.2f}，将开始按轮次触发评估。")
                         max_reached_logged = True
                     
                     if (not eval_start_after_all_max) or all_at_max:
                         if (training_count - last_eval_training_count) >= eval_every_rounds:
-                            print(f"[周期性评估] 触发评估：training_count={training_count}，本轮评估 episode 数={eval_episodes_per_round}（无动作噪声）")
+                            _log(f"[周期性评估] 触发评估：training_count={training_count}，本轮评估 episode 数={eval_episodes_per_round}（无动作噪声）")
                         
                             
                             # 切换到评估阶段
@@ -1745,8 +1948,7 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                             eval_collected_ref.value = 0
                             global_stats.reset()
                             
-                            if is_debug:
-                                print(f"[DEBUG] [周期性评估] 已设置phase_ref=EVAL_COLLECT, eval_target={eval_episodes_per_round}, eval_collected=0")
+                            _collect_log(f"[周期性评估] 已设置phase_ref=EVAL_COLLECT, eval_target={eval_episodes_per_round}, eval_collected=0")
                             
                             # 等待评估完成
                             wait_count = 0
@@ -1759,17 +1961,16 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                                     # - 此时仍在运行评估 episode 的 worker，会在各自循环中检测到current_phase_in_loop != PHASE_EVAL_COLLECT（见约1139行），
                                     # 从而设置 forced_stop_flag 跳出本次 episode，并在统计阶段被丢弃
                                     phase_ref.value = PHASE_TRAIN_COLLECT
-                                    if is_debug:
-                                        print(f"[DEBUG] [周期性评估] 达到目标episode数({current_eval}/{eval_episodes_per_round})，切回phase_ref=TRAIN_COLLECT")
+                                    _collect_log(f"[周期性评估] 达到目标episode数({current_eval}/{eval_episodes_per_round})，切回phase_ref=TRAIN_COLLECT")
                                     break
                                 wait_count += 1
-                                if is_debug and wait_count % 10 == 0:  # 每5秒打印一次
-                                    print(f"[DEBUG] [周期性评估] 等待中: eval_collected={current_eval}/{eval_episodes_per_round}, phase_ref=EVAL_COLLECT")
+                                if wait_count % 10 == 0:  # 每5秒打印一次
+                                    _collect_log(f"[周期性评估] 等待中: eval_collected={current_eval}/{eval_episodes_per_round}, phase_ref=EVAL_COLLECT")
                                 time.sleep(0.1)
                             
-                            print("[周期性评估] 本轮评估完成，输出统计报告")
+                            _log("[周期性评估] 本轮评估完成，输出统计报告")
                             stats = global_stats.get_statistics(use_window=False)
-                            _print_statistics_report(stats)
+                            _print_statistics_report(stats, train_logger=train_logger)
                             # 按评估终点率保存最好模型
                             check_best_model_fn(stats)
                             
@@ -1785,14 +1986,14 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
                 time.sleep(0.1)
                 
             except Exception as e:
-                print(f"训练线程出错: {e}")
+                _log(f"训练线程出错: {e}")
                 if "Broken pipe" in str(e) or "Errno 32" in str(e):
-                    print("检测到Broken pipe错误，训练线程退出")
+                    _log("检测到Broken pipe错误，训练线程退出")
                     break
                 time.sleep(0.1)
                 
     except Exception as e:
-        print(f"训练线程初始化失败: {e}")
+        _log(f"训练线程初始化失败: {e}")
 
 
 
@@ -1981,6 +2182,7 @@ class ParallelMultiEnvTrainer:
 
         base_log_dir = Path(self._loaded_config.get("multi_env_log_model_dir", "log/multi_env_training"))
         self.log_dir = base_log_dir / f"train_{self.timestamp}"
+        self._log_paths = multi_env_log_paths(self.log_dir, self.timestamp)
         # 实时模型保存目录
         self.model_save_dir = self.log_dir / "model"
         # 最好模型单独保存到 best_model 子目录，便于区分
@@ -2042,6 +2244,7 @@ class ParallelMultiEnvTrainer:
             bin_num=self._loaded_config.get('bin_num', 72),  # 激光scan分桶数量
             actor_grad_clip_value=actor_grad_clip_value,  # 传递Actor梯度裁剪值
             critic_grad_clip_value=critic_grad_clip_value,  # 传递Critic梯度裁剪值
+            train_log_path=self._log_paths["train_log_path"],
         )
         print(f"初始化SAC模型完成")
         
@@ -2170,6 +2373,11 @@ class ParallelMultiEnvTrainer:
             'stratified_replay': self._loaded_config.get('stratified_replay', {}),
             'min_batches_for_training': self._loaded_config.get('min_batches_for_training', 0),  # 训练开始前需要收集的最少batch数量（0表示只要有数据就训练）
             'model_save_dir': self.model_save_dir,
+            'collect_log_path': self._log_paths['collect_log_path'],
+            'train_log_path': self._log_paths['train_log_path'],
+            'env_log_path': self._log_paths['env_log_path'],
+            'reward_log_path': self._log_paths['reward_log_path'],
+            'nodes_log_path': self._log_paths['nodes_log_path'],
             'max_velocity': self.max_velocity,
             'neglect_angle': self.neglect_angle,
             'max_yawrate': self.max_yawrate,
@@ -2243,8 +2451,12 @@ class ParallelMultiEnvTrainer:
             'reward_scale': self.reward_scale,
             # ROS域ID参数（从配置文件读取）
             'start_ros_domain_id': self._loaded_config.get('start_ros_domain_id', 1),
-            # 调试模式参数（从配置文件读取）
-            'is_debug': self._loaded_config.get('is_debug', False),
+            # 传感器频率限制参数（从配置文件读取）
+            'sensor_freq_limit': self._loaded_config.get('sensor_freq_limit', {}),
+            # 传感器日志开关（从配置文件读取）
+            'sensor_log_enable': self._loaded_config.get('sensor_log_enable', {}),
+            # 定位噪声参数（从配置文件读取）
+            'localization_noise_stddev': self._loaded_config.get('localization_noise_stddev', 0.0),
         }
         
                 # 打印训练配置汇总（包含 YAML 原始项和运行时派生字段）
@@ -2299,21 +2511,39 @@ class ParallelMultiEnvTrainer:
             try:
                 # 确保最好模型目录存在
                 self.best_model_save_dir.mkdir(parents=True, exist_ok=True)
-                self.model.save(filename="SAC_best", directory=self.best_model_save_dir)
-                print(f"\n{'='*60}")
-                print(f"[评估最好模型] 保存最好模型到: {self.best_model_save_dir}")
-                print(f"[评估最好模型] 当前最好统计: 终点率={self.best_goal_rate:.4f} ({self.best_goal_rate*100:.2f}%), "
-                      f"碰撞率={self.best_collision_rate:.4f} ({self.best_collision_rate*100:.2f}%)")
-                print(f"{'='*60}\n")
+                # 最好模型保存：覆盖写入同名文件，避免生成过多模型文件
+                # 输出文件名固定为：
+                #   SAC_actor.pth, SAC_critic.pth, SAC_critic_target.pth
+                self.model.save(filename="SAC", directory=self.best_model_save_dir)
+                if getattr(self, "train_logger", None):
+                    self.train_logger.log(f"\n{'='*60}")
+                    self.train_logger.log(f"[评估最好模型] 保存最好模型到: {self.best_model_save_dir}")
+                    self.train_logger.log(f"[评估最好模型] 当前最好统计: 终点率={self.best_goal_rate:.4f} ({self.best_goal_rate*100:.2f}%), "
+                          f"碰撞率={self.best_collision_rate:.4f} ({self.best_collision_rate*100:.2f}%)")
+                    self.train_logger.log(f"{'='*60}\n")
+                else:
+                    print(f"\n{'='*60}")
+                    print(f"[评估最好模型] 保存最好模型到: {self.best_model_save_dir}")
+                    print(f"[评估最好模型] 当前最好统计: 终点率={self.best_goal_rate:.4f} ({self.best_goal_rate*100:.2f}%), "
+                          f"碰撞率={self.best_collision_rate:.4f} ({self.best_collision_rate*100:.2f}%)")
+                    print(f"{'='*60}\n")
             except Exception as e:
-                print(f"警告: [评估最好模型] 保存最好模型失败: {e}")
+                msg = f"警告: [评估最好模型] 保存最好模型失败: {e}"
+                if getattr(self, "train_logger", None):
+                    self.train_logger.log(msg)
+                else:
+                    print(msg)
         
     
     def run_training(self):
         """运行真正的并行多环境训练"""
+        train_log_path = (self.config.get("train_log_path") or "").strip()
+        train_logger = TrainLogger(train_log_path) if train_log_path else None
+        self.train_logger = train_logger
         
-        # 创建进程间通信队列
-        
+        collect_log_path = (self.config.get("collect_log_path") or "").strip()
+        collect_logger = CollectLogger(collect_log_path) if collect_log_path else None
+
         # 启动数据收集进程
         collect_processes = []
         for env_id in range(self.num_envs):
@@ -2367,17 +2597,22 @@ class ParallelMultiEnvTrainer:
                 self.env_target_dist_list,
                 self.max_steps,
                 self._check_and_save_best_model_by_eval_goal_rate,
+                train_logger,
+                collect_logger,
             )
         )
         training_thread_obj.daemon = True
         training_thread_obj.start()
-        
+
         try:
             # 等待训练线程结束（周期性评估已在训练线程内部完成）
             while training_thread_obj.is_alive():
                 time.sleep(0.1)
         except KeyboardInterrupt:
-            print("\n收到中断信号，正在停止训练...")
+            if train_logger:
+                train_logger.log("\n收到中断信号，正在停止训练...")
+            else:
+                print("\n收到中断信号，正在停止训练...")
         finally:
             # 不做“训练结束后一次性评估”的特殊处理；
             # 若最后一轮训练结束时恰好触发周期性评估，则训练线程已完成评估并输出报告。
@@ -2393,32 +2628,45 @@ class ParallelMultiEnvTrainer:
                     p.join(timeout=5)
                     if p.is_alive():
                         p.kill()
-            
+
             # 保存最终模型
-            # 确保保存目录存在
             self.model_save_dir.mkdir(parents=True, exist_ok=True)
             self.model.save(filename="SAC_final", directory=self.model_save_dir)
-            print(f"最终模型已保存到 {self.model_save_dir}")
-            
-            # 清理临时文件
+            if train_logger:
+                train_logger.log(f"最终模型已保存到 {self.model_save_dir}")
+            else:
+                print(f"最终模型已保存到 {self.model_save_dir}")
+
             self.model_manager.cleanup_temp_files()
-            
-            print("真正的并行训练已停止")
+
+            if train_logger:
+                train_logger.log("真正的并行训练已停止")
+            else:
+                print("真正的并行训练已停止")
+            if train_logger is not None:
+                train_logger.close()
+            if collect_logger is not None:
+                collect_logger.close()
     
     
-def _print_statistics_report(stats):
-    """打印统计报告"""
+def _print_statistics_report(stats, train_logger=None):
+    """打印统计报告；若提供 train_logger 则写入训练日志，否则 print。"""
     from datetime import datetime
     current_time = datetime.now()
-    print(f"\n{'='*60}")
-    print(f"统计报告 - {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Episode总数：{stats['total_episodes']}")
-    print(f"统计窗口大小：{stats['window_size']}")
-    print(f"平均奖励: {stats['avg_reward']:.2f}")
-    print(f"成功率: {stats['goal_rate']:.2f} ({stats['goal_rate']*100:.2f}%)")
-    print(f"碰撞率: {stats['collision_rate']:.2f} ({stats['collision_rate']*100:.2f}%)")
-    print(f"超时率: {stats['timeout_rate']:.2f} ({stats['timeout_rate']*100:.2f}%)")
-    print(f"{'='*60}")
+    def _out(msg):
+        if train_logger:
+            train_logger.log(msg)
+        else:
+            print(msg)
+    _out(f"\n{'='*60}")
+    _out(f"统计报告 - {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    _out(f"Episode总数：{stats['total_episodes']}")
+    _out(f"统计窗口大小：{stats['window_size']}")
+    _out(f"平均奖励: {stats['avg_reward']:.2f}")
+    _out(f"成功率: {stats['goal_rate']:.2f} ({stats['goal_rate']*100:.2f}%)")
+    _out(f"碰撞率: {stats['collision_rate']:.2f} ({stats['collision_rate']*100:.2f}%)")
+    _out(f"超时率: {stats['timeout_rate']:.2f} ({stats['timeout_rate']*100:.2f}%)")
+    _out(f"{'='*60}")
 
 
 def parse_args():
@@ -2505,6 +2753,13 @@ def main():
     # 获取实际使用的配置文件路径用于打印
     actual_config_path = config_path if config_path else (Path(__file__).parent.parent.parent / "config" / "train.yaml")
     print(f"使用配置文件: {actual_config_path}")
+    
+    # 调试：打印 sensor_log_enable 配置
+    if 'sensor_log_enable' in config:
+        print(f"调试: sensor_log_enable 存在，类型: {type(config['sensor_log_enable'])}, 值: {config['sensor_log_enable']}")
+    else:
+        print(f"调试: sensor_log_enable 不存在于配置中")
+        print(f"调试: 配置中的所有键: {list(config.keys())}")
     
     # ==================== 设置TURTLEBOT3_MODEL ====================
     # 从配置文件读取turtlebot3_model，用于指定世界模型文件
