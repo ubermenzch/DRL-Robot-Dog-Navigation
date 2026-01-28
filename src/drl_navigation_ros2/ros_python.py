@@ -289,7 +289,7 @@ class ROS_env:
         latest_scan = np.array(latest_scan) 
         # print("latest_scan_len:",len(latest_scan))
         # 裁剪掉忽略的视野
-        neglect_scan = int(np.ceil((self.neglect_angle/180)*len(latest_scan)))
+        neglect_scan = int(np.ceil((self.neglect_angle/360)*len(latest_scan)))
         latest_scan = latest_scan[neglect_scan:len(latest_scan)-neglect_scan]
         #print(f" Laser scan data: {latest_scan}")
         distance, cos, sin, _ = self.get_dist_sincos(
