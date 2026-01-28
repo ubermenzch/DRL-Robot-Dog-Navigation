@@ -16,7 +16,7 @@ max_action: 1  # 输出动作的最大绝对值
 # base_state_dim: 79
 bin_num: 72  # 将laser_scan按角度分区的数量（bin），用于对scan进行分桶/聚合；需与代码中读取该参数的逻辑一致
 state_history_steps: 20  # 包含历史多少step的state信息（例如：2表示包含当前step和之前2个step，共3个step的状态信息）；当state_history_steps > 0时启用历史state，state_dim = base_state_dim * (1 + state_history_steps)；当为0时不启用历史state，state_dim = base_state_dim
-load_model: true  # 是否加载已有模型
+load_model: false  # 是否加载已有模型
 load_path: "/root/DRL-Robot-Dog-Navigation/log/baseline/sc97.5/train_20260127_204223/best_model"  # 模型加载路径
 
 # ==================== 训练参数 ====================
@@ -63,7 +63,7 @@ max_steps: 300  # 限制每个回合最多执行max_steps步操作，超过会�
 max_steps_ratio: 0  # 每Episode最大步数比例 (max_steps = target_distance * max_steps_ratio)，当为0时使用固定值max_steps
 max_steps_min: 50  # 每Episode最小步数 (max_steps不会小于此值)
 max_target_dist: 20.0  # 最大目标距离
-init_target_distance: 20.0  # 初始目标距离
+init_target_distance: 2.0  # 初始目标距离
 target_dist_increase: 0.01  # 目标距离增加量
 target_reached_delta: 1.0  # 判定到达目标的阈值
 collision_delta: 0.5  # 碰撞检测阈值
@@ -83,7 +83,7 @@ max_velocity: 2.5  # 最大速度
 max_acceleration: 4.0  # 最大加速度（m/s^2）
 max_deceleration: -4.0  # 最大减速度（m/s^2，建议填负值表示减速幅度，代码会取绝对值）
 max_yawrate: 30  # 最大偏航率（单位：度/秒）
-neglect_angle: 0  # 前方视野左右两边忽略的角度（单位：度）
+neglect_angle: 90  # 前方视野左右两边忽略的角度（单位：度）(90度则由全向变为前向)
 scan_range: 10  # 激光雷达扫描范围
 localization_noise_stddev: 0.304  # 0.304约等于90%的取值的绝对值分布在0.5内；对odom的x,y添加 N(0, stddev) 高斯噪声；0表示不加噪声
 sensor_freq_limit:

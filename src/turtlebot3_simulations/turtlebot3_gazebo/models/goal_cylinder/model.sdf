@@ -1,47 +1,26 @@
 <?xml version='1.0'?>
 <sdf version='1.6'>
   <model name='goal_cylinder'>
-      <pose>0 0 0.05 0 -0 0</pose>
+      <pose>0 0 0.25 0 -0 0</pose>
       <link name='link'>
         <gravity>0</gravity>
         <inertial>
-          <mass>1</mass>
+          <mass>0.001</mass>
           <inertia>
-            <ixx>0.166667</ixx>
+            <ixx>0.000001</ixx>
             <ixy>0</ixy>
             <ixz>0</ixz>
-            <iyy>0.166667</iyy>
+            <iyy>0.000001</iyy>
             <iyz>0</iyz>
-            <izz>0.166667</izz>
+            <izz>0.000001</izz>
           </inertia>
           <pose>0 0 0 0 -0 0</pose>
         </inertial>
-        <collision name="collision">
-          <geometry>
-            <cylinder>
-              <radius>0.1</radius>
-              <length>0.1</length>
-            </cylinder>
-          </geometry>
-          <max_contacts>10</max_contacts>
-          <surface>
-            <contact>
-              <ode/>
-            </contact>
-            <bounce/>
-            <friction>
-              <torsional>
-                <ode/>
-              </torsional>
-              <ode/>
-            </friction>
-          </surface>
-        </collision>
         <visual name="visual">
           <geometry>
             <cylinder>
-              <radius>0.1</radius>
-              <length>0.1</length>
+              <radius>0.2</radius>
+              <length>0.5</length>
             </cylinder>
           </geometry>
           <material>
@@ -52,7 +31,7 @@
         </visual>
         <self_collide>0</self_collide>
         <enable_wind>0</enable_wind>
-        <kinematic>0</kinematic>
+        <kinematic>1</kinematic>
       </link>
     </model>
 </sdf>
