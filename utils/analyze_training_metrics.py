@@ -14,7 +14,7 @@
 # ============================================================================
 
 # 滑动窗口大小（用于平滑曲线）
-DEFAULT_WINDOW_SIZE = 100
+DEFAULT_WINDOW_SIZE = 50
 
 # 是否生成曲线图（True: 生成, False: 仅显示统计信息）
 DEFAULT_GENERATE_PLOT = True
@@ -157,7 +157,11 @@ class TrainingMetricsAnalyzer:
         self.regex_critic_loss = re.compile(r'本次训练的平均critic网络损失:\s+([-\d.]+)')
         self.regex_actor_loss = re.compile(r'本次训练的平均actor网络损失:\s+([-\d.]+)')
         self.regex_critic_grad = re.compile(r'critic全局参数梯度L2范数\(裁剪前:([\d.]+),\s*裁剪后:([\d.]+)\)')
-        self.regex_actor_grad = re.compile(r'actor梯度\(裁剪前:([\d.]+),\s*裁剪后:([\d.]+)\)')
+        # 兼容旧格式 "actor梯度(裁剪前:x, 裁剪后:y)" 和新格式
+        # "actor全局参数梯度L2范数(裁剪前:x, 裁剪后:y)" 等变体
+        self.regex_actor_grad = re.compile(
+            r'actor.*?梯度.*?\(裁剪前:([\d.]+),\s*裁剪后:([\d.]+)\)'
+        )
         self.regex_entropy = re.compile(r'熵值:\s+([-\d.]+)')
         self.regex_alpha_grad = re.compile(r'alpha梯度L2范数:\s+([\d.]+)')
         self.regex_training_duration = re.compile(r'训练耗时:\s+([\d.]+)秒')
