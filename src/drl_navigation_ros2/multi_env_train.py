@@ -2377,6 +2377,8 @@ class ParallelMultiEnvTrainer:
         # 配置字典（供采集子进程初始化 ROS_env 等读取）
         self.config = {
             'num_envs': self.num_envs,
+            # 关键：bin_num 必须下发给采集子进程，否则子进程会走默认值(72)导致 state_dim/base_state_dim 与主进程不一致
+            'bin_num': int(self.bin_num),
             'state_dim': int(self.base_state_dim * (1 + self.state_history_steps) if self.state_history_steps > 0 else self.base_state_dim),
             'base_state_dim': self.base_state_dim,
             'state_history_steps': self.state_history_steps,
