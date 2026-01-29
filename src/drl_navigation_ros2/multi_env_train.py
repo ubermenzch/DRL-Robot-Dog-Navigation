@@ -1414,12 +1414,12 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                     timeout = True
                 
                 # 过滤规则：步数小于10且碰撞的episode不采用
-                should_filter = (ros_env.step_count < 2 and (collision or goal))
-                
-                if should_filter:
-                    if clog:
-                        clog.log(env_id, "episode_end", {"episode_steps": ros_env.step_count, "ending": episode_ending}, "filtered")
-                    continue
+                # should_filter = (ros_env.step_count < 2 and (collision or goal))
+                # 
+                # if should_filter:
+                #     if clog:
+                #         clog.log(env_id, "episode_end", {"episode_steps": ros_env.step_count, "ending": episode_ending}, "filtered")
+                #     continue
 
                 # 若episode在阶段切换边界被截断完成（或切换后才结束），则直接丢弃：
                 # - 训练阶段：

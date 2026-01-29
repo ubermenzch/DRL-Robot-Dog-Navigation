@@ -239,11 +239,12 @@ class ROS_env:
         self.prev_linear_acceleration = None
 
 
-    def step(self, lin_velocity=0.0, ang_velocity=0.0, empty_step=False):
+    def step(self, lin_velocity=0.0, ang_velocity=0.0, empty_step=False, log_terminal=True):
         """执行一步仿真。
 
         注意：该方法不再返回 last_action（动作由调用方自行维护）。
         empty_step=True 时仅发送零速度指令并更新一次传感器缓存，不采样状态或计算奖励。
+        log_terminal=True 时记录 step terminal 日志（用于正常 episode 收集），False 时不记录（用于 reset 阶段采样初始状态）。
         """
         if empty_step:
             self.cmd_vel_publisher.publish_cmd_vel(0.0, 0.0)
@@ -312,7 +313,7 @@ class ROS_env:
             self.prev_distance_to_goal = distance
 
         if goal or collision:
-            if self.env_logger is not None:
+            if log_terminal and self.env_logger is not None:
                 self.env_logger.log(self.env_id, f"step terminal step={self.step_count} goal={goal} collision={collision} distance={distance:.4f} reward={reward:.4f}")
 
         return (
@@ -602,6 +603,7 @@ class ROS_env:
             return (False, None, None, None, None, None, None, None, None, None, None, None)
         
         # 采样初始状态并检查碰撞
+        # 使用 log_terminal=False 避免 reset 失败时的 step 被误计入 episode 统计
         self.prev_distance_to_goal = None
         (
             latest_scan,
@@ -614,7 +616,7 @@ class ROS_env:
             reward,
             current_linear_velocity,
             current_angular_velocity,
-        ) = self.step(lin_velocity=0, ang_velocity=0, empty_step=False)
+        ) = self.step(lin_velocity=0, ang_velocity=0, empty_step=False, log_terminal=False)
         
         if collision:
             self._env_log("[ERROR] Collision detected during reset")

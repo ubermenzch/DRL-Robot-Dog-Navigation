@@ -1,6 +1,6 @@
 # ==================== 启动参数 ====================
 gpu_id: 2  # 使用的GPU编号（可用于导出 CUDA_VISIBLE_DEVICES）
-num_envs: 2  # 并行环境数量(一个环境要占用800m左右的显存)
+num_envs: 8  # 并行环境数量(一个环境要占用800m左右的显存)
 multi_env_log_model_dir: "log/multi_env_training"  # 日志和模型保存基目录，启动训练时会在此下按时间戳创建子目录存放日志与模型
 gazebo_wait_time: 10 # Gazebo启动等待时间（秒），建议设置为30-60秒以确保所有环境完全启动；对于32个环境，建议至少30秒
 gazebo_start_interval: 5  # 每个Gazebo环境启动后的间隔时间（秒），建议设置为3-5秒以避免资源竞争；对于32个环境，建议至少3秒
@@ -61,8 +61,8 @@ turtlebot3_model: "waffle" #"base_world_100by100"  # TurtleBot3模型名称，�
 max_steps: 300  # 限制每个回合最多执行max_steps步操作，超过会强制结束回合（当max_steps_ratio=0时使用此固定值）
 max_steps_ratio: 0  # 每Episode最大步数比例 (max_steps = target_distance * max_steps_ratio)，当为0时使用固定值max_steps
 max_steps_min: 50  # 每Episode最小步数 (max_steps不会小于此值)
-max_target_dist: 15.0  # 最大目标距离
-init_target_distance: 15.0  # 初始目标距离
+max_target_dist: 10.0  # 最大目标距离
+init_target_distance: 2.0  # 初始目标距离
 target_dist_increase: 0.01  # 目标距离增加量
 target_reached_delta: 1.0  # 判定到达目标的阈值
 collision_delta: 0.5  # 碰撞检测阈值
