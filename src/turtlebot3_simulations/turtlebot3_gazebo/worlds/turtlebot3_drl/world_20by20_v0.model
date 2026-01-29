@@ -123,131 +123,131 @@
     <!-- 25 个圆柱障碍物：全部放在围墙外（围墙边界约±10.075），分布在四个象限 -->
     <!-- 左下象限 (x < -12, y < -12) -->
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle1</name>
       <pose>-25.0 -25.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle2</name>
       <pose>-20.0 -25.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle3</name>
       <pose>-15.0 -25.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle4</name>
       <pose>-25.0 -20.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle5</name>
       <pose>-20.0 -20.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle6</name>
       <pose>-15.0 -20.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle7</name>
       <pose>-25.0 -15.0 0.0 0 0 0</pose>
     </include>
 
     <!-- 右下象限 (x > 12, y < -12) -->
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle8</name>
       <pose>15.0 -25.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle9</name>
       <pose>20.0 -25.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle10</name>
       <pose>25.0 -25.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle11</name>
       <pose>15.0 -20.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle12</name>
       <pose>20.0 -20.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle13</name>
       <pose>25.0 -20.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle14</name>
       <pose>15.0 -15.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle15</name>
       <pose>20.0 -15.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle16</name>
       <pose>25.0 -15.0 0.0 0 0 0</pose>
     </include>
 
     <!-- 左上象限 (x < -12, y > 12) -->
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle17</name>
       <pose>-25.0 15.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle18</name>
       <pose>-20.0 15.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle19</name>
       <pose>-15.0 15.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle20</name>
       <pose>-25.0 20.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle21</name>
       <pose>-20.0 20.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle22</name>
       <pose>-15.0 20.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle23</name>
       <pose>-25.0 25.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle24</name>
       <pose>-20.0 25.0 0.0 0 0 0</pose>
     </include>
     <include>
-      <uri>model://obstacle5</uri>
+      <uri>model://cylinder_r1m</uri>
       <name>obstacle25</name>
       <pose>-15.0 25.0 0.0 0 0 0</pose>
     </include>
