@@ -798,13 +798,30 @@ class SharedModelManager:
 
 def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue, total_added_step, global_stats, config, init_complete_counter, total_episodes_counter, training_count_ref, critic_loss_ref, recent_losses_ref, avg_loss_window_size, phase_ref, eval_target_ref, eval_collected_lock, eval_collected_ref, current_buffer_size_ref, check_best_model_ref, round_done_counter, current_round_ref, env_target_dist_list=None):
     """单个环境的数据收集进程 - 真正的并行版本"""
-    collect_log_path = (config.get('collect_log_path') or '').strip()
+    # 公共配置中的每环境日志根目录与时间戳
+    env_logs_dir_cfg = config.get('env_logs_dir')
+    log_timestamp = str(config.get('log_timestamp', '') or '')
+    from pathlib import Path
+    if env_logs_dir_cfg and log_timestamp:
+        # 允许 env_logs_dir 是字符串或 Path
+        env_logs_dir = Path(env_logs_dir_cfg)
+        # 为当前环境构造独立日志目录，例如：.../env_logs/env_7/
+        env_log_dir = env_logs_dir / f"env_{env_id}"
+        # 具体文件名示例：collect_log_7_20260128_154423.log
+        collect_log_path = str(env_log_dir / f"collect_log_{env_id}_{log_timestamp}.log")
+        env_log_path = str(env_log_dir / f"env_log_{env_id}_{log_timestamp}.log")
+        reward_log_path = str(env_log_dir / f"reward_log_{env_id}_{log_timestamp}.log")
+        nodes_log_path = str(env_log_dir / f"nodes_log_{env_id}_{log_timestamp}.log")
+    else:
+        # 兼容旧配置：退回到单一日志文件（不再仅限 env_id=0）
+        collect_log_path = (config.get('collect_log_path') or '').strip()
+        env_log_path = (config.get('env_log_path') or '').strip()
+        reward_log_path = (config.get('reward_log_path') or '').strip()
+        nodes_log_path = (config.get('nodes_log_path') or '').strip()
+
     clog = CollectLogger(collect_log_path) if collect_log_path else None
-    env_log_path = (config.get('env_log_path') or '').strip()
     env_logger = EnvLogger(env_log_path) if env_log_path else None
-    reward_log_path = (config.get('reward_log_path') or '').strip()
     reward_logger = RewardLogger(reward_log_path) if reward_log_path else None
-    nodes_log_path = (config.get('nodes_log_path') or '').strip()
     nodes_logger = NodesLogger(nodes_log_path) if nodes_log_path else None
     try:
         print(f"环境 {env_id} 开始初始化...")
@@ -1648,11 +1665,8 @@ def training_thread(model_manager, env_queues, config, total_added_step, total_e
         print(msg)  # 同时输出到综合日志
     
     def _collect_log(msg):
-        """收集相关日志：写入collect_log"""
-        if collect_logger and collect_logger.log_path:
-            append_timestamped_line(collect_logger.log_path, msg)
-        else:
-            _log(msg)
+        """收集相关日志：现在直接写入训练日志（train_log），不再单独使用collect_log文件。"""
+        _log(msg)
     
     def _train_log(msg):
         """训练相关日志：写入train_log"""
@@ -2207,6 +2221,8 @@ class ParallelMultiEnvTrainer:
         base_log_dir = Path(self._loaded_config.get("multi_env_log_model_dir", "log/multi_env_training"))
         self.log_dir = base_log_dir / f"train_{self.timestamp}"
         self._log_paths = multi_env_log_paths(self.log_dir, self.timestamp)
+        # 每环境日志根目录（例如：train_xxx/env_logs/）
+        self.env_logs_dir = Path(self._log_paths.get("env_logs_dir", self.log_dir / "env_logs"))
         # 实时模型保存目录
         self.model_save_dir = self.log_dir / "model"
         # 最好模型单独保存到 best_model 子目录，便于区分
@@ -2399,11 +2415,16 @@ class ParallelMultiEnvTrainer:
             'stratified_replay': self._loaded_config.get('stratified_replay', {}),
             'min_batches_for_training': self._loaded_config.get('min_batches_for_training', 0),  # 训练开始前需要收集的最少batch数量（0表示只要有数据就训练）
             'model_save_dir': self.model_save_dir,
+            # 公共日志路径（不区分环境）
             'collect_log_path': self._log_paths['collect_log_path'],
             'train_log_path': self._log_paths['train_log_path'],
             'env_log_path': self._log_paths['env_log_path'],
             'reward_log_path': self._log_paths['reward_log_path'],
             'nodes_log_path': self._log_paths['nodes_log_path'],
+            # 每环境日志根目录与时间戳（供采集进程按 env_id 生成独立日志文件）
+            # 注意：这里存成字符串，避免在子进程中被当作 PosixPath 调用 .strip() 出错
+            'env_logs_dir': str(self.env_logs_dir),
+            'log_timestamp': self.timestamp,
             'max_velocity': self.max_velocity,
             'neglect_angle': self.neglect_angle,
             'max_yawrate': self.max_yawrate,
@@ -2501,6 +2522,9 @@ class ParallelMultiEnvTrainer:
             self.best_model_save_dir = self.log_dir / "best_model"
             self.best_model_save_dir.mkdir(parents=True, exist_ok=True)
             print(f"最好模型保存目录已准备: {self.best_model_save_dir}")
+            # 创建每环境日志根目录
+            self.env_logs_dir.mkdir(parents=True, exist_ok=True)
+            print(f"环境日志根目录已准备: {self.env_logs_dir}")
         except PermissionError:
             print(f"错误: 没有权限创建模型保存目录 {self.model_save_dir}")
             raise

@@ -35,11 +35,15 @@ def multi_env_log_paths(log_dir, timestamp):
     d = Path(log_dir) if isinstance(log_dir, str) else log_dir
     ts = str(timestamp)
     return {
+        # 公共日志（不区分环境）
         "collect_log_path": str(d / f"collect_log_{ts}.log"),
         "train_log_path": str(d / f"train_log_{ts}.log"),
         "env_log_path": str(d / f"env_log_{ts}.log"),
         "reward_log_path": str(d / f"reward_log_{ts}.log"),
         "nodes_log_path": str(d / f"nodes_log_{ts}.log"),
+        # 每个环境自己的日志目录（例如：env_logs/env_7/）
+        "env_logs_dir": str(d / "env_logs"),
+        "timestamp": ts,
     }
 
 
@@ -195,9 +199,6 @@ class CollectLogger(TimestampedFileLogger):
         super().__init__(log_path, tag="CollectLogger")
 
     def log(self, env_id, operation, input_data=None, output_data=None):
-        # 只记录0号环境的日志
-        if env_id != 0:
-            return
         if not self.log_path:
             return
         self._ensure_open()
@@ -235,9 +236,6 @@ class EnvLogger(TimestampedFileLogger):
         super().__init__(log_path, tag="EnvLogger")
 
     def log(self, env_id, msg: str):
-        # 只记录0号环境的日志
-        if env_id != 0:
-            return
         if not self.log_path:
             return
         self._ensure_open()
@@ -253,9 +251,6 @@ class RewardLogger(TimestampedFileLogger):
         super().__init__(log_path, tag="RewardLogger")
 
     def log(self, env_id, msg: str):
-        # 只记录0号环境的日志
-        if env_id != 0:
-            return
         if not self.log_path:
             return
         self._ensure_open()
@@ -271,9 +266,6 @@ class NodesLogger(TimestampedFileLogger):
         super().__init__(log_path, tag="NodesLogger")
 
     def log(self, env_id, msg: str):
-        # 只记录0号环境的日志
-        if env_id != 0:
-            return
         if not self.log_path:
             return
         self._ensure_open()

@@ -23,7 +23,7 @@
             <!-- normal定义了平面的朝向, 0 0 1 表示Z轴向上 -->
             <normal>0 0 1</normal>
             <!-- size定义了平面的尺寸(米), 改这里可以把地面变大变小 -->
-            <size>150 150</size> 
+            <size>250 250</size> 
           </plane>
         </geometry>
         <surface>
@@ -54,7 +54,7 @@
           <plane>
             <normal>0 0 1</normal>
             <!-- 视觉尺寸要和物理尺寸保持一致 -->
-            <size>150 150</size>
+            <size>250 250</size>
           </plane>
         </geometry>
         <material>
@@ -113,139 +113,144 @@
     <include>
       <uri>model://turtlebot3_waffle</uri>
       <!-- 显式设置机器人初始位姿，放在围墙外侧的地面上 -->
-      <pose>-55 -55 0.1 0 0 0</pose>
+      <pose>-55 -55 1.0 0 0 0</pose>
     </include>
 
     <include>
       <uri>model://100by100</uri>
     </include>
 
-    <!-- 25 个正方体障碍物（边长5m），基于 obstacle_cube_5m 模型 -->
-    <!-- 这里仅定义模型实例，具体位置在仿真运行时可由 ROS 节点通过 /gazebo/set_entity_state 动态设置 -->
+    <!-- 25 个正方体障碍物（边长5m），全部放在围墙外（围墙边界约±50.075），分布在四个象限 -->
+    <!-- 左下象限 (x < -52, y < -52) -->
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle1</name>
-      <pose>-20 -20 2.5 0 0 0</pose>
+      <pose>-70 -70 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle2</name>
-      <pose>-10 -20 2.5 0 0 0</pose>
+      <pose>-60 -70 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle3</name>
-      <pose>0 -20 2.5 0 0 0</pose>
+      <pose>-70 -60 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle4</name>
-      <pose>10 -20 2.5 0 0 0</pose>
+      <pose>-60 -60 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle5</name>
-      <pose>20 -20 2.5 0 0 0</pose>
+      <pose>-65 -65 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle6</name>
-      <pose>-20 -10 2.5 0 0 0</pose>
+      <pose>-75 -65 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle7</name>
-      <pose>-10 -10 2.5 0 0 0</pose>
+      <pose>-65 -75 2.5 0 0 0</pose>
     </include>
+
+    <!-- 右下象限 (x > 52, y < -52) -->
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle8</name>
-      <pose>0 -10 2.5 0 0 0</pose>
+      <pose>60 -70 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle9</name>
-      <pose>10 -10 2.5 0 0 0</pose>
+      <pose>70 -70 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle10</name>
-      <pose>20 -10 2.5 0 0 0</pose>
+      <pose>60 -60 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle11</name>
-      <pose>-20 0 2.5 0 0 0</pose>
+      <pose>70 -60 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle12</name>
-      <pose>-10 0 2.5 0 0 0</pose>
+      <pose>65 -65 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle13</name>
-      <pose>0 0 2.5 0 0 0</pose>
+      <pose>75 -65 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle14</name>
-      <pose>10 0 2.5 0 0 0</pose>
+      <pose>65 -75 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle15</name>
-      <pose>20 0 2.5 0 0 0</pose>
+      <pose>75 -75 2.5 0 0 0</pose>
     </include>
+
+    <!-- 左上象限 (x < -52, y > 52) -->
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle16</name>
-      <pose>-20 10 2.5 0 0 0</pose>
+      <pose>-70 60 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle17</name>
-      <pose>-10 10 2.5 0 0 0</pose>
+      <pose>-60 60 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle18</name>
-      <pose>0 10 2.5 0 0 0</pose>
+      <pose>-70 70 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle19</name>
-      <pose>10 10 2.5 0 0 0</pose>
+      <pose>-60 70 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle20</name>
-      <pose>20 10 2.5 0 0 0</pose>
+      <pose>-65 65 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle21</name>
-      <pose>-20 20 2.5 0 0 0</pose>
+      <pose>-75 65 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle22</name>
-      <pose>-10 20 2.5 0 0 0</pose>
+      <pose>-65 75 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle23</name>
-      <pose>0 20 2.5 0 0 0</pose>
+      <pose>-75 75 2.5 0 0 0</pose>
     </include>
+    <!-- 右上象限 (x > 52, y > 52) -->
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle24</name>
-      <pose>10 20 2.5 0 0 0</pose>
+      <pose>60 60 2.5 0 0 0</pose>
     </include>
     <include>
       <uri>model://obstacle_cube_5m</uri>
       <name>obstacle25</name>
-      <pose>20 20 2.5 0 0 0</pose>
+      <pose>70 70 2.5 0 0 0</pose>
     </include>
 
     <!-- 目标模型（绿色圆柱体），用于可视化终点位置 -->

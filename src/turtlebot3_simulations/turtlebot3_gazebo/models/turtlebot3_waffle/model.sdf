@@ -141,6 +141,8 @@
               <resolution>1.000000</resolution>
               <min_angle>-3.1415926</min_angle>
               <max_angle>3.1415926</max_angle>
+              <!-- <min_angle>-1.5707963</min_angle>
+              <max_angle>4.7123889</max_angle> -->
             </horizontal>
           </scan>
           <range>
