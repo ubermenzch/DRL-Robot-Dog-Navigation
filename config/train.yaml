@@ -16,7 +16,7 @@ max_action: 1  # 输出动作的最大绝对值
 # base_state_dim: 79
 bin_num: 72  # 将laser_scan按角度分区的数量（bin），用于对scan进行分桶/聚合；需与代码中读取该参数的逻辑一致
 state_history_steps: 20  # 包含历史多少step的state信息（例如：2表示包含当前step和之前2个step，共3个step的状态信息）；当state_history_steps > 0时启用历史state，state_dim = base_state_dim * (1 + state_history_steps)；当为0时不启用历史state，state_dim = base_state_dim
-load_model: true  # 是否加载已有模型
+load_model: false  # 是否加载已有模型
 load_path: "log/baseline/sc97.5/train_20260127_204223/best_model"  # 模型加载路径
 
 # ==================== 训练参数 ====================

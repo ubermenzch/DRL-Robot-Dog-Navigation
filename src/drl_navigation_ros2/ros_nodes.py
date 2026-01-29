@@ -88,6 +88,9 @@ class SensorSubscriber(Node):
         self.scan_count = 0
         self.odom_count = 0
         self.imu_count = 0
+        # 用于计算 odom 加速度的上一时刻数据
+        self.odom_prev_linear_vel = None  # 上一时刻的线速度向量 (vx, vy, vz)
+        self.odom_prev_time = None  # 上一时刻的时间戳
         # 线程安全锁
         self._data_lock = threading.Lock()
         # 启动后台线程自动接收数据
@@ -243,11 +246,30 @@ class SensorSubscriber(Node):
             self.latest_linear_velocity = float(msg.twist.twist.linear.x)
             self.latest_angular_velocity = float(msg.twist.twist.angular.z)
         
+        # 计算加速度（基于线速度的变化率）
+        current_linear_vel = np.array([
+            float(msg.twist.twist.linear.x),
+            float(msg.twist.twist.linear.y),
+            float(msg.twist.twist.linear.z)
+        ])
+        acceleration_magnitude = None
+        if self.odom_prev_linear_vel is not None and self.odom_prev_time is not None:
+            dt = current_time - self.odom_prev_time
+            if dt > 0:
+                acceleration = (current_linear_vel - self.odom_prev_linear_vel) / dt
+                acceleration_magnitude = float(np.linalg.norm(acceleration))
+        
+        # 更新上一时刻的数据（只有实际更新数据时才更新）
+        if should_update:
+            self.odom_prev_linear_vel = current_linear_vel.copy()
+            self.odom_prev_time = current_time
+        
         # 记录日志（只有实际更新数据时才记录，且需要启用该传感器的日志）
         if self.nodes_logger is not None and self.odom_enable_log:
             callback_freq_str = f"{callback_freq:.2f}Hz" if callback_freq > 0 else "0.00Hz"
             update_freq_str = f"{update_freq:.2f}Hz" if update_freq > 0 else "0.00Hz"
             limit_str = f"limit={self.odom_max_freq:.1f}Hz" if self.odom_max_freq > 0 else "no_limit"
+            accel_str = f"accel_magnitude={acceleration_magnitude:.4f}" if acceleration_magnitude is not None else "accel_magnitude=N/A"
             self.nodes_logger.log(
                 self.env_id,
                 f"[SUBSCRIBER] /odom received count={self.odom_count} callback_freq={callback_freq_str} update_freq={update_freq_str} {limit_str} "
@@ -255,7 +277,8 @@ class SensorSubscriber(Node):
                 f"orientation=({msg.pose.pose.orientation.x:.4f},{msg.pose.pose.orientation.y:.4f},"
                 f"{msg.pose.pose.orientation.z:.4f},{msg.pose.pose.orientation.w:.4f}) "
                 f"linear_vel=({msg.twist.twist.linear.x:.4f},{msg.twist.twist.linear.y:.4f},{msg.twist.twist.linear.z:.4f}) "
-                f"angular_vel=({msg.twist.twist.angular.x:.4f},{msg.twist.twist.angular.y:.4f},{msg.twist.twist.angular.z:.4f})"
+                f"angular_vel=({msg.twist.twist.angular.x:.4f},{msg.twist.twist.angular.y:.4f},{msg.twist.twist.angular.z:.4f}) "
+                f"{accel_str}"
             )
         # print(f"latest_linear_velocity: {self.latest_linear_velocity}, latest_angular_velocity: {self.latest_angular_velocity}")
 
@@ -531,6 +554,34 @@ class ResetWorldClient(Node):
             self.get_logger().info("World reset successfully.")
         else:
             self.get_logger().error(f"[ERROR] Failed to reset world: {future.exception()}")
+
+
+class ResetSimulationClient(Node):
+    """调用 Gazebo 的 /reset_simulation 服务，用于在严重异常时整体重置仿真。"""
+
+    def __init__(self, env_id=0):
+        super().__init__(f"reset_simulation_client_env_{env_id}")
+        self.get_logger().set_level(SEVERITY)
+        self.reset_client = self.create_client(Empty, "/reset_simulation")
+        self.wait_for_service(self.reset_client, "reset_simulation")
+
+    def wait_for_service(self, client, service_name, timeout=10.0):
+        self.get_logger().info(f"Waiting for {service_name} service...")
+        if not client.wait_for_service(timeout_sec=timeout):
+            self.get_logger().error(
+                f"Service {service_name} not available after waiting."
+            )
+            raise RuntimeError(f"Service {service_name} not available.")
+
+    def reset_simulation(self):
+        self.get_logger().info("Calling /gazebo/reset_simulation service...")
+        request = Empty.Request()
+        future = self.reset_client.call_async(request)
+        rclpy.spin_until_future_complete(self, future)
+        if future.result() is not None:
+            self.get_logger().info("Simulation reset successfully.")
+        else:
+            self.get_logger().error(f"[ERROR] Failed to reset simulation: {future.exception()}")
 
 
 class PhysicsClient(Node):

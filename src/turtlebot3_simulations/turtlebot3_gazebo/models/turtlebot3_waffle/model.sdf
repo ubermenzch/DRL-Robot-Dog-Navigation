@@ -194,16 +194,16 @@
           <!-- This friction pamareter don't contain reliable data!! -->
           <friction>
             <ode>
-              <mu>100000.0</mu>
-              <mu2>100000.0</mu2>
-              <fdir1>0 0 0</fdir1>
+              <mu>10.0</mu>
+              <mu2>10.0</mu2>
+              <!-- <fdir1>0 0 0</fdir1> -->
               <slip1>0.0</slip1>
               <slip2>0.0</slip2>
             </ode>
           </friction>
           <contact>
             <ode>
-              <soft_cfm>0</soft_cfm>
+              <soft_cfm>1e-4</soft_cfm>
               <soft_erp>0.2</soft_erp>
               <kp>1e+5</kp>
               <kd>1</kd>
@@ -252,16 +252,16 @@
           <!-- This friction pamareter don't contain reliable data!! -->
           <friction>
             <ode>
-              <mu>100000.0</mu>
-              <mu2>100000.0</mu2>
-              <fdir1>0 0 0</fdir1>
+              <mu>10.0</mu>
+              <mu2>10.0</mu2>
+              <!-- <fdir1>0 0 0</fdir1> -->
               <slip1>0.0</slip1>
               <slip2>0.0</slip2>
             </ode>
           </friction>
           <contact>
             <ode>
-              <soft_cfm>0</soft_cfm>
+              <soft_cfm>1e-4</soft_cfm>
               <soft_erp>0.2</soft_erp>
               <kp>1e+5</kp>
               <kd>1</kd>
@@ -305,7 +305,7 @@
         <surface>
           <contact>
             <ode>
-              <soft_cfm>0</soft_cfm>
+              <soft_cfm>1e-4</soft_cfm>
               <soft_erp>0.2</soft_erp>
               <kp>1e+5</kp>
               <kd>1</kd>
@@ -339,7 +339,7 @@
         <surface>
           <contact>
             <ode>
-              <soft_cfm>0</soft_cfm>
+              <soft_cfm>1e-4</soft_cfm>
               <soft_erp>0.2</soft_erp>
               <kp>1e+5</kp>
               <kd>1</kd>
@@ -492,8 +492,8 @@
       <wheel_diameter>0.066</wheel_diameter>
 
       <!-- limits -->
-      <max_wheel_torque>200</max_wheel_torque>
-      <max_wheel_acceleration>4.0</max_wheel_acceleration>
+      <max_wheel_torque>20</max_wheel_torque>
+      <max_wheel_acceleration>10.0</max_wheel_acceleration> <!-- 为了实际加速度能到达4 -->
 
       <command_topic>cmd_vel</command_topic>
 

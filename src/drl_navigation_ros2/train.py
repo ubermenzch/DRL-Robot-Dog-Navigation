@@ -7,7 +7,7 @@ import os
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
 import matplotlib.pyplot as plt
-
+import math
 from SAC.SAC import SAC
 from ros_python import ROS_env
 from replay_buffer import ReplayBuffer, StratifiedReplayBuffer, NumpyReplayBuffer, NumpyStratifiedReplayBuffer
@@ -256,15 +256,6 @@ def main(args=None):
     # 保存实际使用的配置文件路径用于打印
     actual_config_path = Path(args.config_path) if args and hasattr(args, 'config_path') else (Path(__file__).parent.parent.parent / "config" / "train.yaml")
     
-    # ==================== 设置ROS_DOMAIN_ID ====================
-    # 训练脚本以配置文件为准：单环境使用 single_env_ros_domain_id
-    # 为向后兼容，若不存在则尝试旧键 ros_domain_id，最后默认 0
-    ros_domain_id = int(config.get('single_env_ros_domain_id', config.get('ros_domain_id', 0)))
-    # 将值写入环境变量，供后续 ROS 节点使用（rclpy/子进程读取）
-    os.environ['ROS_DOMAIN_ID'] = str(ros_domain_id)
-    print(f"ROS_DOMAIN_ID: {ros_domain_id}")
-    print(f"使用配置文件: {actual_config_path}")
-    
     # ==================== 单环境日志系统（对齐 multi_env_train.py） ====================
     # 单环境默认开启日志：基于 TRAINING_TIMESTAMP + single_env_log_dir（或启动脚本传入的 LOG_DIR）自动生成路径。
     # 若用户显式在 config 中提供 collect/env/reward/nodes_log_path，则优先使用显式配置。
@@ -292,7 +283,30 @@ def main(args=None):
     reward_logger = RewardLogger(reward_log_path)
     nodes_logger = NodesLogger(nodes_log_path)
 
-    clog.log(0, "train_start", {"ros_domain_id": ros_domain_id, "log_dir": str(log_dir)}, "started")
+    # ==================== 设置ROS_DOMAIN_ID ====================
+    # 训练脚本以配置文件为准：单环境使用 single_env_ros_domain_id
+    # 为向后兼容，若不存在则尝试旧键 ros_domain_id，最后默认 0
+    ros_domain_id = int(config.get('single_env_ros_domain_id', config.get('ros_domain_id', 0)))
+    # 将值写入环境变量，供后续 ROS 节点使用（rclpy/子进程读取）
+    os.environ['ROS_DOMAIN_ID'] = str(ros_domain_id)
+    print(f"ROS_DOMAIN_ID: {ros_domain_id}")
+    print(f"使用配置文件: {actual_config_path}")
+    
+    # collect 日志：整体训练启动（对齐多环境风格）
+    if clog:
+        clog.log(
+            0,
+            "train_start",
+            {"ros_domain_id": ros_domain_id, "log_dir": str(log_dir), "config_path": str(actual_config_path)},
+            "started",
+        )
+        # 单环境也补充一条“collect_start”，含 env_id 和 ros_domain_id，方便统一分析
+        clog.log(
+            0,
+            "collect_start",
+            {"env_id": 0, "ros_domain_id": ros_domain_id},
+            "started",
+        )
 
     # ==================== 设置TURTLEBOT3_MODEL ====================
     # 从配置文件读取TURTLEBOT3_MODEL，如果环境变量已设置则优先使用环境变量
@@ -490,6 +504,30 @@ def main(args=None):
         critic_grad_clip_value=critic_grad_clip_value,  # 传递Critic梯度裁剪值
     )  # instantiate a model
     print("Model Loaded")
+    
+    # ==================== 传感器频率限制 & 日志开关（与 multi_env_train 对齐） ====================
+    # 频率限制配置（Hz），0 或负数表示不限制
+    sensor_freq_cfg = config.get('sensor_freq_limit', {}) or {}
+    scan_max_freq = sensor_freq_cfg.get('scan_max_freq', 0.0)
+    odom_max_freq = sensor_freq_cfg.get('odom_max_freq', 0.0)
+    imu_max_freq = sensor_freq_cfg.get('imu_max_freq', 0.0)
+
+    # 传感器日志开关配置（来自 train.yaml 的 sensor_log_enable 段）
+    sensor_log_cfg = config.get('sensor_log_enable', {}) or {}
+
+    def _to_bool(val, default=False):
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.lower() in ('true', '1', 'yes', 'on')
+        return bool(val) if val is not None else default
+
+    scan_enable_log = _to_bool(sensor_log_cfg.get('scan_enable_log', False)) if isinstance(sensor_log_cfg, dict) else False
+    odom_enable_log = _to_bool(sensor_log_cfg.get('odom_enable_log', False)) if isinstance(sensor_log_cfg, dict) else False
+    imu_enable_log = _to_bool(sensor_log_cfg.get('imu_enable_log', False)) if isinstance(sensor_log_cfg, dict) else False
+
+    print(f"单环境传感器日志开关: scan={scan_enable_log}, odom={odom_enable_log}, imu={imu_enable_log}")
+
     ros = ROS_env(
         env_id=0,
         env_logger=env_logger,
@@ -531,6 +569,7 @@ def main(args=None):
         obs_penalty_high_weight=obs_penalty_high_weight,
         obs_penalty_low_weight=obs_penalty_low_weight,
         obs_penalty_middle_ratio=obs_penalty_middle_ratio,
+        # 终点距离惩罚参数
         target_distance_penalty_base=target_distance_penalty_base,
         step_penalty_base=step_penalty_base,
         linear_acceleration_oscillation_penalty_base=linear_acceleration_oscillation_penalty_base,
@@ -542,6 +581,14 @@ def main(args=None):
         reset_step_count=reset_step_count,
         goals_per_map=goals_per_map,
         reward_scale=reward_scale,  # 奖励缩放因子
+        # 传感器频率限制参数
+        scan_max_freq=scan_max_freq,
+        odom_max_freq=odom_max_freq,
+        imu_max_freq=imu_max_freq,
+        # 传感器日志开关（从 train.yaml 的 sensor_log_enable 配置读取）
+        scan_enable_log=scan_enable_log,
+        odom_enable_log=odom_enable_log,
+        imu_enable_log=imu_enable_log,
     )  # instantiate ROS environment
 
     # 只有在预训练开启时，才加载预存经验并进行预训练
@@ -623,7 +670,7 @@ def main(args=None):
         # 重置环境并获取初始状态，循环调用直到成功
         reset_success = False
         while not reset_success:
-            reset_success, latest_scan, distance, distance_raw, cos, sin, collision, goal, last_action, reward, current_v, current_w = ros.reset()
+            reset_success, latest_scan, distance, distance_raw, cos, sin, collision, goal, last_action, reward, current_v, current_w = ros.reset(use_reset_simulation=True)
             if not reset_success:
                 # 只写入 env_log，不再输出到综合训练日志/stdout；标记为 [ERROR]
                 if env_logger is not None:
@@ -654,16 +701,15 @@ def main(args=None):
             # 构造当前输入 x_t（统一从 current_state_with_history 中读取；
             #    当 state_history_steps 为 0 时，current_state_with_history 仅包含当前 state）
             model_action = model.get_action(current_state_with_history, enable_action_noise)  # 使用拼接后的state，根据配置决定是否添加噪声
-            # model_action=[1.0,0.0]
-            ros_action = utils.transfor_action(
-                model_action,
-                max_velocity=max_velocity,
-                max_yawrate=max_yawrate,
-                prev_linear_velocity=last_action[0],
-                max_acceleration=max_acceleration,
-                max_deceleration=max_deceleration,
-                step_time=step_sleep_time,
-            )
+            # model_action=[1.0,1.0]
+            max_velocity = float(config.get('max_velocity', 1.0))
+            lin_velocity = (float(model_action[0]) + 1.0) * (max_velocity / 2.0)
+            lin_velocity = min(max(lin_velocity, 0.0), max_velocity)
+
+            max_yawrate = float(config["max_yawrate"])
+            ang_velocity = float(model_action[1]) * (max_yawrate / 180.0) * math.pi
+
+            ros_action = [lin_velocity, ang_velocity]
             latest_scan, distance, distance_raw, cos, sin, collision, goal, reward, current_v, current_w = ros.step(
                 lin_velocity=ros_action[0], ang_velocity=ros_action[1]
             )  # get data from the environment
@@ -770,9 +816,8 @@ def main(args=None):
                 # print(f"Episode {episode} ended with {ros.step_count} steps")
                 # print(f"Episode {episode} terminal: {terminal}")
                 break  # 跳出内层step循环，进入episode结束处理
-        # Episode结束处理
-        # 过滤步数小于等于1的不合理episode
-        if ros.step_count <= 1:
+        # Episode结束处理 设置为0暂时停用
+        if ros.step_count <= 0:
             # 打印过滤信息
             current_time = datetime.now()
             print(f"{current_time.strftime('%Y-%m-%d %H:%M:%S')} [已过滤] Steps: {ros.step_count} (步数过少，不计入统计)")

@@ -5,6 +5,7 @@ from ros_nodes import (
     ScanSubscriber,
     OdomSubscriber,
     ResetWorldClient,
+    ResetSimulationClient,
     SetModelStateClient,
     CmdVelPublisher,
     MarkerPublisher,
@@ -115,6 +116,14 @@ class ROS_env:
         self.cmd_vel_publisher = CmdVelPublisher(env_id, nodes_logger=nodes_logger)
         self.robot_state_publisher = SetModelStateClient(env_id, nodes_logger=nodes_logger)
         self.world_reset = ResetWorldClient(env_id)
+        # 在极端异常情况下用于整体重置仿真（/reset_simulation）
+        try:
+            self.reset_simulation_client = ResetSimulationClient(env_id)
+        except Exception as e:
+            # 若 /reset_simulation 不可用，不影响正常运行，仅在需要时记录日志
+            if nodes_logger is not None:
+                nodes_logger.log(env_id, f"[ResetSimulationClient] 初始化失败: {e}")
+            self.reset_simulation_client = None
         self.physics_client = PhysicsClient(env_id)
         self.publish_target = MarkerPublisher(env_id, nodes_logger=nodes_logger)
         self.goal_model_client = GoalModelClient(env_id, nodes_logger=nodes_logger)
@@ -472,8 +481,23 @@ class ROS_env:
         
         return True
 
-    def reset(self):
-        self.world_reset.reset_world()
+    def reset(self, force_regenerate_map=False, use_reset_simulation=False):
+        """重置环境
+        
+        Args:
+            force_regenerate_map: 如果为True，强制重新生成地图（将map_count+1，goal_count置为0）
+            use_reset_simulation: 如果为True，则优先调用 /reset_simulation，而不是 /reset_world
+        """
+        # 根据参数选择 reset_simulation 或 reset_world
+        if use_reset_simulation and getattr(self, "reset_simulation_client", None) is not None:
+            self._env_log("[reset] 使用 /reset_simulation 重置仿真（不调用 /reset_world）")
+            try:
+                self.reset_simulation_client.reset_simulation()
+            except Exception as e:
+                self._env_log(f"[reset] 调用 /reset_simulation 失败: {e}，回退到 /reset_world")
+                self.world_reset.reset_world()
+        else:
+            self.world_reset.reset_world()
         # time.sleep(self.step_sleep_time*25)
         # 使用 repeated empty_step + IMU / 里程计数据，确保机器人完全静止且姿态与地面水平
         settle_start_time = time.time()
@@ -516,6 +540,15 @@ class ROS_env:
                     f"lin_vel_ok={last_lin_vel_ok} ang_vel_ok={last_ang_vel_ok} "
                     f"lin_acc_ok={last_lin_acc_ok} attitude_ok={last_attitude_ok}"
                 )
+                # 超时时尝试调用 /reset_simulation，对Gazebo进行整体重置
+                try:
+                    if getattr(self, "reset_simulation_client", None) is not None:
+                        self._env_log("[reset 超时] 调用 /reset_simulation 以强制重置仿真")
+                        self.reset_simulation_client.reset_simulation()
+                    else:
+                        self._env_log("[reset 超时] reset_simulation_client 未初始化，无法调用 /reset_simulation")
+                except Exception as e:
+                    self._env_log(f"[reset 超时] 调用 /reset_simulation 失败: {e}")
                 return (False, None, None, None, None, None, None, None, None, None, None, None)
             
             # 发送零速度指令，让机器人逐渐停稳
@@ -581,6 +614,10 @@ class ROS_env:
         old_obstacle_poses = [p[:] for p in self.obstacle_poses]
 
         # 先完成所有可能失败的操作，全部成功后再统一修改计数器
+        # 如果强制重新生成地图，将goals_count_for_current_map置为goals_per_map，确保触发重新生成
+        if force_regenerate_map:
+            self.goals_count_for_current_map = self.goals_per_map
+            self._env_log(f"[强制重新生成地图] force_regenerate_map=True，将goals_count_for_current_map设置为{self.goals_per_map}")
         should_regenerate_map = (self.goals_count_for_current_map >= self.goals_per_map)
         
         if should_regenerate_map:
@@ -671,6 +708,8 @@ class ROS_env:
         if should_regenerate_map:
             self.generated_map_count += 1
             self.goals_count_for_current_map = 1
+            if force_regenerate_map:
+                self._env_log(f"[强制重新生成地图完成] generated_map_count={self.generated_map_count}, goals_count_for_current_map重置为1")
         else:
             self.goals_count_for_current_map += 1
 

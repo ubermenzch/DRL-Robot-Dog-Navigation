@@ -1158,7 +1158,7 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
                 # 重置环境，循环调用直到成功
                 reset_success = False
                 while not reset_success:
-                    reset_success, latest_scan, distance, distance_raw, cos, sin, collision, goal, last_action, reward, current_v, current_w = ros_env.reset()
+                    reset_success, latest_scan, distance, distance_raw, cos, sin, collision, goal, last_action, reward, current_v, current_w = ros_env.reset(use_reset_simulation=True)
                     if not reset_success:
                         if clog:
                             clog.log(env_id, "reset_failed", None, {"reason": "reset returned False, retrying"})
