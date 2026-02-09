@@ -153,7 +153,7 @@
           <noise>
             <type>gaussian</type>
             <mean>0.0</mean>
-            <stddev>0.15</stddev><!--90%的数值落在 [-0.24675, 0.24675] 范围内-->
+            <stddev>0.05</stddev><!--90%的数值落在 [-0.24675, 0.24675] 范围内-->
           </noise>
         </ray>
         <plugin name="turtlebot3_laserscan" filename="libgazebo_ros_ray_sensor.so">
@@ -194,16 +194,16 @@
           <!-- This friction pamareter don't contain reliable data!! -->
           <friction>
             <ode>
-              <mu>10.0</mu>
-              <mu2>10.0</mu2>
-              <!-- <fdir1>0 0 0</fdir1> -->
+              <mu>1000.0</mu>
+              <mu2>1000.0</mu2>
+              <fdir1>0 0 0</fdir1>
               <slip1>0.0</slip1>
               <slip2>0.0</slip2>
             </ode>
           </friction>
           <contact>
             <ode>
-              <soft_cfm>1e-4</soft_cfm>
+              <soft_cfm>1e-6</soft_cfm>
               <soft_erp>0.2</soft_erp>
               <kp>1e+5</kp>
               <kd>1</kd>
@@ -252,16 +252,16 @@
           <!-- This friction pamareter don't contain reliable data!! -->
           <friction>
             <ode>
-              <mu>10.0</mu>
-              <mu2>10.0</mu2>
-              <!-- <fdir1>0 0 0</fdir1> -->
+              <mu>1000.0</mu>
+              <mu2>1000.0</mu2>
+              <fdir1>0 0 0</fdir1>
               <slip1>0.0</slip1>
               <slip2>0.0</slip2>
             </ode>
           </friction>
           <contact>
             <ode>
-              <soft_cfm>1e-4</soft_cfm>
+              <soft_cfm>1e-6</soft_cfm>
               <soft_erp>0.2</soft_erp>
               <kp>1e+5</kp>
               <kd>1</kd>
@@ -305,7 +305,7 @@
         <surface>
           <contact>
             <ode>
-              <soft_cfm>1e-4</soft_cfm>
+              <soft_cfm>1e-6</soft_cfm>
               <soft_erp>0.2</soft_erp>
               <kp>1e+5</kp>
               <kd>1</kd>
@@ -339,7 +339,7 @@
         <surface>
           <contact>
             <ode>
-              <soft_cfm>1e-4</soft_cfm>
+              <soft_cfm>1e-6</soft_cfm>
               <soft_erp>0.2</soft_erp>
               <kp>1e+5</kp>
               <kd>1</kd>

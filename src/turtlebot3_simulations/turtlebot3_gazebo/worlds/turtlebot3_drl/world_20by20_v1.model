@@ -253,7 +253,7 @@
     </include>
 
     <!-- 右上象限 (x > 12, y > 12) -->
-    <include>
+    <!-- <include>
       <uri>model://cylinder_r0_5m</uri>
       <name>obstacle26</name>
       <pose>15.0 15.0 0.0 0 0 0</pose>
@@ -277,7 +277,7 @@
       <uri>model://cylinder_r0_5m</uri>
       <name>obstacle30</name>
       <pose>20.0 20.0 0.0 0 0 0</pose>
-    </include>
+    </include> -->
 
     <!-- 目标模型（绿色圆柱体），用于可视化终点位置：放在大地面的右上角区域 -->
     <include>

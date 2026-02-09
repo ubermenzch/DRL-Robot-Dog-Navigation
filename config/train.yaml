@@ -9,7 +9,7 @@ start_ros_domain_id: 1  # 起始ROS_DOMAIN_ID，多环境从此ID开始递增（
 enable_weight_consistency_check: false  # 是否进行模型权重一致性详细检验（为true时会在每个环境初始化时打印大量权重信息）
 
 # ==================== 模型参数 ====================
-hidden_layers: [1024,1024,1024,1024,1024]  # 神经网络隐藏层结构
+hidden_layers: [4096,4096,4096,4096,4096]  # 神经网络隐藏层结构
 action_dim: 2  # 模型产生的动作数量
 max_action: 1  # 输出动作的最大绝对值
 # base_state_dim 不再手动配置：由代码按 base_state_dim = bin_num + 7 动态计算
@@ -17,7 +17,7 @@ max_action: 1  # 输出动作的最大绝对值
 bin_num: 72  # 将laser_scan按角度分区的数量（bin），用于对scan进行分桶/聚合；需与代码中读取该参数的逻辑一致
 state_history_steps: 20  # 包含历史多少step的state信息（例如：2表示包含当前step和之前2个step，共3个step的状态信息）；当state_history_steps > 0时启用历史state，state_dim = base_state_dim * (1 + state_history_steps)；当为0时不启用历史state，state_dim = base_state_dim
 load_model: false  # 是否加载已有模型
-load_path: "log/baseline/sc97.5/train_20260127_204223/best_model"  # 模型加载路径
+load_path: "log/multi_env_training/train_20260203_113921/model"  # 模型加载路径
 
 # ==================== 训练参数 ====================
 discount_factor: 0.99  # 折扣因子（gamma），用于计算未来奖励的折扣，范围通常在0.9-0.999之间
@@ -65,10 +65,10 @@ max_target_dist: 10.0  # 最大目标距离
 init_target_distance: 2.0  # 初始目标距离
 target_dist_increase: 0.01  # 目标距离增加量
 target_reached_delta: 1.0  # 判定到达目标的阈值
-collision_delta: 0.5  # 碰撞检测阈值
+collision_delta: 0.4  # 碰撞检测阈值
 world_size: 20  # 世界尺寸（米）
 goals_per_map: 4  # 每张地图的目标点数量（即一张地图可以用来产生多少个episode）；当机器人完成一个episode后，如果不达到此数量，则不重新生成地图（障碍物），只将机器人重置到最近的空格子中心并重新生成目标点；达到此数量后才重新生成新地图
-obs_num: 30  # 障碍物数量
+obs_num: 25  # 障碍物数量
 obs_distribution_mode: "random"  # 障碍物生成方式："uniform"=均匀分布（默认），"random"=随机分布
 #costmap中地图左下角的那一格的坐标为(0,0)，右上角那一格的坐标为(world_size/costmap_resolution-1,world_size/costmap_resolution-1)
 #世界坐标系中，地图左下角的坐标为(-world_size/2,-world_size/2)，右上角那一格的坐标为(world_size/2,world_size/2)

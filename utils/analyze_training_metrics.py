@@ -51,6 +51,9 @@ REWARD_COLORS = {
     'yawrate': 'pink'
 }
 
+# 计入成功率/碰撞率/超时率的 end 类型；ForceStop 不统计，忽略
+COUNTED_END_STATUSES = ('Goal', 'Collision', 'Timeout')
+
 # Reward Detail各项的标签配置
 REWARD_LABELS = {
     'goal': 'Goal Reward',
@@ -170,10 +173,10 @@ class TrainingMetricsAnalyzer:
         # 时间戳格式：2026-01-07 11:49:47
         self.regex_timestamp = re.compile(r'^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})')
         
-        # Episode相关
-        self.regex_episode_env = re.compile(r'环境\s+(\d+)\s+Episode:\s+(\d+)')
+        # Episode相关：end= 后仅 Goal / Timeout / Collision / ForceStop；ForceStop 不参与三率统计
+        self.regex_episode_env = re.compile(r'环境\s+(\d+)\s+.*?Episode:\s+(\d+)')
         self.regex_episode_steps = re.compile(r'Steps:\s+(\d+)')
-        self.regex_end_status = re.compile(r'end=(Goal|Collision|Timeout)')
+        self.regex_end_status = re.compile(r'end=(Goal|Collision|Timeout|ForceStop)')
         self.regex_episode_old = re.compile(r'环境\s+(\d+)\s+Episode:\s+(\d+).*?End:\s+(Goal|Collision|Timeout)')
         
         # Reward Detail相关
@@ -879,36 +882,37 @@ class TrainingMetricsAnalyzer:
                family='monospace')
     
     def calculate_episode_rates(self, window_size: int) -> Tuple[List[int], List[float], List[float], List[float]]:
-        """计算episode的成功率、碰撞率、超时率（滑动窗口，使用numpy优化）"""
+        """计算episode的成功率、碰撞率、超时率（滑动窗口）。仅统计 end=Goal/Collision/Timeout，ForceStop 忽略。"""
         if not self.episodes:
             return [], [], [], []
-        
-        # 使用numpy数组和向量化操作
-        episodes = np.array([ep[0] for ep in self.episodes], dtype=np.int32)
-        successes = np.array([1 if ep[2] == 'Goal' else 0 for ep in self.episodes], dtype=np.float64)
-        collisions = np.array([1 if ep[2] == 'Collision' else 0 for ep in self.episodes], dtype=np.float64)
-        timeouts = np.array([1 if ep[2] == 'Timeout' else 0 for ep in self.episodes], dtype=np.float64)
-        
-        # 并行计算三个率（虽然这里计算很快，但保持一致性）
+
+        counted = [ep for ep in self.episodes if ep[2] in COUNTED_END_STATUSES]
+        if not counted:
+            return [], [], [], []
+
+        episodes = np.array([ep[0] for ep in counted], dtype=np.int32)
+        successes = np.array([1 if ep[2] == 'Goal' else 0 for ep in counted], dtype=np.float64)
+        collisions = np.array([1 if ep[2] == 'Collision' else 0 for ep in counted], dtype=np.float64)
+        timeouts = np.array([1 if ep[2] == 'Timeout' else 0 for ep in counted], dtype=np.float64)
+
         success_rates = self.calculate_sliding_window(successes.tolist(), window_size)
         collision_rates = self.calculate_sliding_window(collisions.tolist(), window_size)
         timeout_rates = self.calculate_sliding_window(timeouts.tolist(), window_size)
-        
+
         return episodes.tolist(), success_rates, collision_rates, timeout_rates
     
     def calculate_reward_detail_curves(self, window_size: int) -> Tuple[List[int], Dict[str, List[float]]]:
-        """计算reward detail各项的滑动窗口平均值"""
-        if not self.episodes:
+        """计算reward detail各项的滑动窗口平均值。ForceStop 不参与。"""
+        counted = [ep for ep in self.episodes if ep[2] in COUNTED_END_STATUSES]
+        if not counted:
             return [], {}
-        
-        episodes = [ep[0] for ep in self.episodes]
+
+        episodes = [ep[0] for ep in counted]
         reward_keys = ['goal', 'collision', 'angle', 'linear', 'target_distance', 'obs', 'yawrate']
-        
         reward_curves = {}
         for key in reward_keys:
-            values = [ep[3].get(key, 0.0) for ep in self.episodes]
+            values = [ep[3].get(key, 0.0) for ep in counted]
             reward_curves[key] = self.calculate_sliding_window(values, window_size)
-        
         return episodes, reward_curves
     
     def calculate_per_step_reward_stats(self) -> Dict[str, float]:
@@ -926,11 +930,12 @@ class TrainingMetricsAnalyzer:
         
         for ep in self.episodes:
             episode_num, env_id, end_status, reward_detail, steps, timestamp = ep
-            
-            # 跳过steps为0的episode（可能是旧格式或解析失败）
+
+            if end_status == 'ForceStop':
+                continue
             if steps <= 0:
                 continue
-            
+
             valid_episodes += 1
             total_steps += steps
             
@@ -966,7 +971,8 @@ class TrainingMetricsAnalyzer:
         num_plots = 0
         has_training = len(self.training_records) > 0
         has_episodes = len(self.episodes) > 0
-        has_reward_details = has_episodes and any(ep[3] for ep in self.episodes if any(ep[3].values()))
+        counted_eps = [ep for ep in self.episodes if ep[2] in COUNTED_END_STATUSES]
+        has_reward_details = bool(counted_eps) and any(ep[3] for ep in counted_eps if any(ep[3].values()))
         
         # 检查是否有梯度数据
         has_gradients = False
@@ -1480,15 +1486,23 @@ class TrainingMetricsAnalyzer:
             print("【Episode统计】")
             print("="*80)
             total = len(self.episodes)
-            # 使用numpy向量化操作优化计数
             end_statuses = np.array([ep[2] for ep in self.episodes])
-            goal_count = np.sum(end_statuses == 'Goal')
-            collision_count = np.sum(end_statuses == 'Collision')
-            timeout_count = np.sum(end_statuses == 'Timeout')
+            goal_count = int(np.sum(end_statuses == 'Goal'))
+            collision_count = int(np.sum(end_statuses == 'Collision'))
+            timeout_count = int(np.sum(end_statuses == 'Timeout'))
+            force_stop_count = int(np.sum(end_statuses == 'ForceStop'))
+            denom = goal_count + collision_count + timeout_count
             print(f"总episode数: {total}")
-            print(f"到达终点: {goal_count} ({goal_count/total*100:.1f}%)")
-            print(f"发生碰撞: {collision_count} ({collision_count/total*100:.1f}%)")
-            print(f"超时结束: {timeout_count} ({timeout_count/total*100:.1f}%)")
+            if denom > 0:
+                print(f"到达终点: {goal_count} ({goal_count/denom*100:.1f}% 占统计样本)")
+                print(f"发生碰撞: {collision_count} ({collision_count/denom*100:.1f}% 占统计样本)")
+                print(f"超时结束: {timeout_count} ({timeout_count/denom*100:.1f}% 占统计样本)")
+            else:
+                print(f"到达终点: {goal_count}")
+                print(f"发生碰撞: {collision_count}")
+                print(f"超时结束: {timeout_count}")
+            if force_stop_count > 0:
+                print(f"ForceStop (忽略，不参与三率): {force_stop_count} ({force_stop_count/total*100:.1f}% 占全部)")
             
             # 统计每秒产生的平均样本数（总样本数/从第一条episode数据产生时间开始，到日志中最后一条episode数据产生结束的总时间）
             episode_timestamps = [ep[5] for ep in self.episodes if ep[5] is not None]  # timestamp是第6个元素（索引5）
@@ -1522,19 +1536,17 @@ class TrainingMetricsAnalyzer:
                     if key in per_step_stats:
                         print(f"  {REWARD_LABELS.get(key, key)}: {per_step_stats[key]:.4f}")
             
-            # Reward Detail统计
-            if any(ep[3] for ep in self.episodes if any(ep[3].values())):
+            # Reward Detail统计（不含 ForceStop）
+            reward_eps = [ep for ep in self.episodes if ep[2] in COUNTED_END_STATUSES]
+            if reward_eps and any(ep[3] for ep in reward_eps if any(ep[3].values())):
                 print("\n" + "="*80)
-                print("【Reward Detail统计】")
+                print("【Reward Detail统计】（仅 Goal/Collision/Timeout，不含 ForceStop）")
                 print("="*80)
                 reward_keys = ['goal', 'collision', 'angle', 'linear', 'target_distance', 'obs', 'yawrate']
-                
-                # 统计所有episode的平均值
-                print("所有Episode的平均值:")
-                # 使用numpy向量化操作优化统计计算
+
+                print("所有统计Episode的平均值:")
                 for key in reward_keys:
-                    # 获取所有值（包括0值），使用numpy数组
-                    all_values = np.array([ep[3].get(key, 0.0) for ep in self.episodes], dtype=np.float64)
+                    all_values = np.array([ep[3].get(key, 0.0) for ep in reward_eps], dtype=np.float64)
                     non_zero_mask = np.abs(all_values) > 1e-6
                     non_zero_values = all_values[non_zero_mask]
                     
@@ -1556,13 +1568,13 @@ class TrainingMetricsAnalyzer:
                     else:
                         print(f"  {REWARD_LABELS.get(key, key)}: 0.00 (未出现)")
                 
-                # 按episode类型分组统计
+                # 按episode类型分组统计（Goal/Collision/Timeout 有明细；ForceStop 仅计数、忽略）
                 print("\n按Episode类型分组的平均值:")
                 for end_status in ['Goal', 'Collision', 'Timeout']:
                     status_episodes = [ep for ep in self.episodes if ep[2] == end_status]
                     if not status_episodes:
                         continue
-                    
+
                     print(f"\n  {end_status} ({len(status_episodes)}个episode):")
                     for key in reward_keys:
                         # 使用numpy向量化操作
@@ -1578,7 +1590,11 @@ class TrainingMetricsAnalyzer:
                             else:
                                 print(f"    {REWARD_LABELS.get(key, key)}: 平均值={avg_val:.2f}, "
                                       f"范围=[{np.min(non_zero_values):.2f}, {np.max(non_zero_values):.2f}]")
-    
+
+                force_stop_eps = [ep for ep in self.episodes if ep[2] == 'ForceStop']
+                if force_stop_eps:
+                    print(f"\n  ForceStop ({len(force_stop_eps)}个episode): 忽略，不参与三率与 Reward 统计")
+
     def run(self, plot: bool = True, output_dir: Optional[str] = None, window_size: int = 100):
         """运行分析"""
         self.parse_log()
