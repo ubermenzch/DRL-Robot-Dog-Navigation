@@ -105,8 +105,6 @@ trap cleanup_all SIGINT SIGTERM EXIT
 
 # ===================== 清理共享内存 =====================
 # 重新挂载共享内存为2GB，避免共享内存不够
-echo "重新挂载共享内存为2GB..."
-sudo mount -o remount,size=2G /dev/shm
 echo "共享内存重新挂载完成"
 
 echo "清理ROS2共享内存段..."
