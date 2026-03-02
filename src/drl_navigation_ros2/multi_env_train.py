@@ -923,7 +923,6 @@ def collect_episode_data(env_id, shared_model_dict, model_lock, experience_queue
             # 时间控制
             sim_time=config.get('sim_time', 0.1),
             step_sleep_time=config.get('step_sleep_time', 0.1),
-            reset_step_count=config.get('reset_step_count', 3),
             # 连通区域选择偏好
             region_select_bias=config.get('region_select_bias', 1.0),
             # 奖励归一化参数
@@ -2118,7 +2117,6 @@ class ParallelMultiEnvTrainer:
         # 时间控制参数
         self.sim_time = cfg.get('sim_time', 0.1)
         self.step_sleep_time = cfg.get('step_sleep_time', 0.1)
-        self.reset_step_count = cfg.get('reset_step_count', 3)
 
         # 动作噪声
         self.action_noise_std = cfg.get('action_noise_std', 0.2)
@@ -2489,7 +2487,6 @@ class ParallelMultiEnvTrainer:
             # 时间控制参数
             'sim_time': self.sim_time,
             'step_sleep_time': self.step_sleep_time,
-            'reset_step_count': self.reset_step_count,
             # 动作噪声参数
             'action_noise_std': self.action_noise_std,
             # 连通区域选择参数（从 train.yaml 读取）
@@ -2781,7 +2778,6 @@ def parse_args():
     
     # 时间控制参数（命令行参数可以覆盖配置文件）
     parser.add_argument('--step_sleep_time', type=float, default=None, help='step方法中的sleep时间（覆盖配置文件）')
-    parser.add_argument('--reset_step_count', type=int, default=None, help='reset方法中调用step的次数（覆盖配置文件）')
     
     # 动作噪声参数（命令行参数可以覆盖配置文件）
     parser.add_argument('--action_noise_std', type=float, default=None, help='动作噪声标准差（覆盖配置文件）')
@@ -2936,7 +2932,6 @@ def main():
     # 时间控制参数
     sim_time = config.get('sim_time', 0.1)
     step_sleep_time = config.get('step_sleep_time', 0.1)
-    reset_step_count = config.get('reset_step_count', 3)
     
     # 动作噪声参数
     action_noise_std = config.get('action_noise_std', 0.2)

@@ -57,7 +57,7 @@ eval_every_rounds: 200
 eval_episodes_per_round: 200
 
 # ==================== 仿真环境数据收集参数 ====================
-turtlebot3_model: "world_20by20_v1" #"base_world_100by100"  # TurtleBot3模型名称，用于指定Gazebo世界文件（例如：base_world_100by100、base_world_50by50、waffle等）
+turtlebot3_model: "world_100by100" #"base_world_100by100"  # TurtleBot3模型名称，用于指定Gazebo世界文件（例如：base_world_100by100、base_world_50by50、waffle等）
 max_steps: 300  # 限制每个回合最多执行max_steps步操作，超过会强制结束回合（当max_steps_ratio=0时使用此固定值）
 max_steps_ratio: 0  # 每Episode最大步数比例 (max_steps = target_distance * max_steps_ratio)，当为0时使用固定值max_steps
 max_steps_min: 50  # 每Episode最小步数 (max_steps不会小于此值)
@@ -66,7 +66,7 @@ init_target_distance: 2.0  # 初始目标距离
 target_dist_increase: 0.01  # 目标距离增加量
 target_reached_delta: 1.0  # 判定到达目标的阈值
 collision_delta: 0.4  # 碰撞检测阈值
-world_size: 20  # 世界尺寸（米）
+world_size: 100  # 世界尺寸（米）
 goals_per_map: 4  # 每张地图的目标点数量（即一张地图可以用来产生多少个episode）；当机器人完成一个episode后，如果不达到此数量，则不重新生成地图（障碍物），只将机器人重置到最近的空格子中心并重新生成目标点；达到此数量后才重新生成新地图
 obs_num: 25  # 障碍物数量
 obs_distribution_mode: "random"  # 障碍物生成方式："uniform"=均匀分布（默认），"random"=随机分布
@@ -84,13 +84,13 @@ max_velocity: 2.5  # 最大速度
 max_acceleration: 4.0  # 最大加速度（m/s^2）
 max_deceleration: -4.0  # 最大减速度（m/s^2，建议填负值表示减速幅度，代码会取绝对值）
 max_yawrate: 30  # 最大偏航率（单位：度/秒）
-neglect_angle: 0  # 前方视野左右两边忽略的角度（单位：度）(90度则由全向变为前向)
+neglect_angle: 90  # 前方视野左右两边忽略的角度（单位：度）(90度则由全向变为前向)
 scan_range: 10  # 激光雷达扫描范围
 localization_noise_stddev: 0.304  # 0.304约等于90%的取值的绝对值分布在0.5内；对odom的x,y添加 N(0, stddev) 高斯噪声；0表示不加噪声
 sensor_freq_limit:
   scan_max_freq: 15.0   # 激光雷达最大处理频率（Hz），0表示不限制；建议值：5-20
-  odom_max_freq: 30.0   # 里程计最大处理频率（Hz），0表示不限制；建议值：20-50
-  imu_max_freq: 30.0   # IMU最大处理频率（Hz），0表示不限制；建议值：50-200
+  odom_max_freq: 15.0   # 里程计最大处理频率（Hz），0表示不限制；建议值：20-50
+  imu_max_freq: 15.0   # IMU最大处理频率（Hz），0表示不限制；建议值：50-200
 
 # ==================== 传感器日志开关 ====================
 # 控制是否记录各传感器的详细日志（只有实际更新数据时才记录，被频率限制跳过的callback不记录）
@@ -162,4 +162,3 @@ save_every_single_env: 300  # 单环境训练：每多少次训练后保存一�
 gazebo_port: 19999  # 单环境训练：Gazebo Master端口地址（默认11345，避免与多环境训练端口冲突）
 # ==================== 不太重要的参数 ====================
 step_sleep_time: 0.2  # step方法中的sleep时间（秒）
-reset_step_count: 25  # reset方法中调用step的次数

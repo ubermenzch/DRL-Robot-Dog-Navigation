@@ -474,7 +474,6 @@ def main(args=None):
     # ==================== 时间控制参数 ====================
     sim_time = config.get('sim_time', 0.1)
     step_sleep_time = config.get('step_sleep_time', 0.1)
-    reset_step_count = config.get('reset_step_count', 3)
     
     # ==================== 动作噪声参数 ====================
     action_noise_std = config.get('action_noise_std', 0.2)
@@ -578,7 +577,6 @@ def main(args=None):
         region_select_bias=region_select_bias,
         sim_time=sim_time,
         step_sleep_time=step_sleep_time,
-        reset_step_count=reset_step_count,
         goals_per_map=goals_per_map,
         reward_scale=reward_scale,  # 奖励缩放因子
         # 传感器频率限制参数

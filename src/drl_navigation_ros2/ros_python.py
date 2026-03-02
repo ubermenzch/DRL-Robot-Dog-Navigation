@@ -83,7 +83,6 @@ class ROS_env:
         # 时间控制参数
         sim_time=0.1,  # 仿真步长，用于基于速度的动态阈值等
         step_sleep_time=0.1,  # step方法中的sleep时间（秒）
-        reset_step_count=3,  # reset方法中调用step的次数
         # 地图复用参数
         goals_per_map=1,  # 每张地图的目标点数量（即一张地图可以用来产生多少个episode）
         # 传感器频率限制参数（Hz），0或负数表示不限制
@@ -214,7 +213,6 @@ class ROS_env:
         # 时间控制参数
         self.sim_time = sim_time
         self.step_sleep_time = step_sleep_time
-        self.reset_step_count = reset_step_count
         # 地图复用参数
         self.goals_per_map = goals_per_map
         # 为了避免首次 reset 时 obstacle_poses 为空导致 apply_obstacle_poses n=0，
